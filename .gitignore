@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+
+# Ordo runtime data. Never versioned: it holds real project paths, briefs and
+# reports produced by executor sessions. Lives in ORDO_HOME, which defaults to
+# ~/.claude/ordo and is outside this repository, unless someone runs a campaign
+# on this very repo with the recommended ORDO_HOME=$PWD/.ordo.
+/.ordo/
+state.json
+state.json.lock
+/briefs/
+/reports/
+/journal/
+/archives/
+/capteurs/
+/runs/
+*.bak

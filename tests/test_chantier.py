@@ -1,0 +1,782 @@
+"""Tests unitaires de ordo/chantier.py.
+
+Isoles par ORDO_HOME, comme test_store.py. propagate_failures() opere sur un dict
+construit a la main : ces cas-la n'ont pas besoin de filesystem.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from ordo import chantier, store
+
+
+class ChantierTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="ordo-chantier-test-")
+        self._prev_home = os.environ.get("ORDO_HOME")
+        os.environ["ORDO_HOME"] = self._tmp
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("ORDO_HOME", None)
+        else:
+            os.environ["ORDO_HOME"] = self._prev_home
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _projet(self, nom: str = "p") -> Path:
+        p = Path(self._tmp) / nom
+        p.mkdir(exist_ok=True)
+        return p
+
+
+class TestStartRefuseUnProjetFantome(ChantierTestCase):
+    """start() refuse un repertoire inexistant, quel que soit le detour par canon().
+
+    canon() d'un chemin relatif inexistant rend un absolu plausible mais faux, et le
+    chantier s'ouvrait alors en silence sur un dossier fantome : toute executante lancee
+    dessus aurait echoue au demarrage, loin de la cause. Trouve par une vraie session en
+    recette du skill, pas par une suite unitaire.
+    """
+
+    def test_refuse_un_nom_relatif_qui_nest_pas_un_repertoire(self):
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.start("nom-qui-nexiste-pas", "objectif")
+        self.assertIn("existing directory", str(ctx.exception))
+
+    def test_refuse_un_chemin_absolu_inexistant(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.start(str(Path(self._tmp) / "absent"), "objectif")
+
+    def test_refuse_un_fichier_qui_nest_pas_un_repertoire(self):
+        fichier = Path(self._tmp) / "fichier.txt"
+        fichier.write_text("pas un répertoire", encoding="utf-8")
+        with self.assertRaises(chantier.ChantierError):
+            chantier.start(str(fichier), "objectif")
+
+    def test_refuse_un_chemin_vide(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.start("", "objectif")
+
+    def test_aucun_chantier_nest_cree_par_un_refus(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.start("nom-qui-nexiste-pas", "objectif")
+        self.assertEqual(store.load()["chantiers"], {})
+        self.assertEqual(store.load()["seq"]["chantier"], 0)
+
+
+class TestStart(ChantierTestCase):
+    def test_start_creates_chantier_with_expected_fields(self):
+        projet = self._projet("mon-projet")
+        c = chantier.start(str(projet), "objectif clair", perimetre="tout", hors_scope="rien")
+        self.assertEqual(c["id"], "c-01")
+        self.assertEqual(c["slug"], "mon-projet")
+        self.assertEqual(c["project"], store.canon(projet))
+        self.assertEqual(c["objectif"], "objectif clair")
+        self.assertEqual(c["perimetre"], "tout")
+        self.assertEqual(c["horsScope"], "rien")
+        self.assertEqual(c["state"], "open")
+        self.assertEqual(c["tmuxSession"], "ordo-mon-projet")
+        self.assertIsNone(c["tmuxWindow"])
+        self.assertEqual(c["permissions"], "skip")
+        self.assertIsNone(c["closedAt"])
+        self.assertFalse(c["capteur"]["adopted"])
+        self.assertEqual(c["capteur"]["runs"], [])
+
+    def test_start_persists_the_chantier(self):
+        projet = self._projet()
+        c = chantier.start(str(projet), "obj")
+        reloaded = store.load()
+        self.assertIn(c["id"], reloaded["chantiers"])
+
+    def test_start_canonicalizes_project_path(self):
+        projet = self._projet()
+        c = chantier.start(f"{projet}/../{projet.name}", "obj")
+        self.assertEqual(c["project"], store.canon(projet))
+
+
+class TestStartSessionUniqueness(ChantierTestCase):
+    """Point A : tmuxSession unique par construction.
+
+    Deux projets de meme basename (/a/api et /b/api) ne doivent jamais recevoir la meme
+    session tmux, sans quoi leurs executantes atterrissent dans la meme fenetre.
+    """
+
+    def _projet_sous(self, sous_dossier: str, nom: str) -> Path:
+        p = Path(self._tmp) / sous_dossier / nom
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def test_deux_projets_meme_basename_recoivent_des_sessions_differentes(self):
+        proj_a = self._projet_sous("a", "api")
+        proj_b = self._projet_sous("b", "api")
+        c1 = chantier.start(str(proj_a), "obj")
+        c2 = chantier.start(str(proj_b), "obj", home_partage=True)
+        self.assertEqual(c1["tmuxSession"], "ordo-api")
+        self.assertEqual(c2["tmuxSession"], f"ordo-api-{c2['id']}")
+        self.assertNotEqual(c1["tmuxSession"], c2["tmuxSession"])
+
+    def test_le_nom_de_session_est_fige_a_la_creation(self):
+        # Ferme le premier chantier "api" : le nom fige du deuxieme ne doit pas se
+        # recalculer vers "ordo-api" a la relecture.
+        proj_a = self._projet_sous("a", "api")
+        proj_b = self._projet_sous("b", "api")
+        chantier.start(str(proj_a), "obj")
+        c2 = chantier.start(str(proj_b), "obj", home_partage=True)
+        reloaded = store.load()["chantiers"][c2["id"]]
+        self.assertEqual(reloaded["tmuxSession"], c2["tmuxSession"])
+
+    def test_considere_les_chantiers_fermes_aussi(self):
+        # "quel que soit son etat" : un chantier ferme portant deja "ordo-api" compte
+        # toujours pour la collision, pas seulement les chantiers ouverts.
+        proj_a = self._projet_sous("a", "api")
+        proj_b = self._projet_sous("b", "api")
+        c1 = chantier.start(str(proj_a), "obj")
+        chantier.close(c1["id"])
+        c2 = chantier.start(str(proj_b), "obj")
+        self.assertEqual(c2["tmuxSession"], f"ordo-api-{c2['id']}")
+
+
+class TestStartHomeUnique(ChantierTestCase):
+    """Point D : un home par projet. I8, aucun refus silencieux."""
+
+    def test_refuse_un_second_projet_different_dans_le_meme_home(self):
+        proj_a = self._projet("a")
+        proj_b = self._projet("b")
+        c1 = chantier.start(str(proj_a), "obj")
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.start(str(proj_b), "obj")
+        message = str(ctx.exception)
+        self.assertIn(c1["id"], message)
+        self.assertIn(store.canon(proj_a), message)
+        self.assertIn("ORDO_HOME", message)
+
+    def test_aucun_chantier_nest_cree_par_le_refus(self):
+        proj_a = self._projet("a")
+        proj_b = self._projet("b")
+        chantier.start(str(proj_a), "obj")
+        with self.assertRaises(chantier.ChantierError):
+            chantier.start(str(proj_b), "obj")
+        self.assertEqual(len(store.load()["chantiers"]), 1)
+
+    def test_home_partage_leve_le_refus(self):
+        proj_a = self._projet("a")
+        proj_b = self._projet("b")
+        chantier.start(str(proj_a), "obj")
+        c2 = chantier.start(str(proj_b), "obj", home_partage=True)
+        self.assertEqual(c2["project"], store.canon(proj_b))
+
+    def test_second_projet_autorise_une_fois_le_premier_ferme(self):
+        proj_a = self._projet("a")
+        proj_b = self._projet("b")
+        c1 = chantier.start(str(proj_a), "obj")
+        chantier.close(c1["id"])
+        c2 = chantier.start(str(proj_b), "obj")
+        self.assertEqual(c2["project"], store.canon(proj_b))
+
+    def test_meme_projet_reouvert_nest_pas_un_conflit(self):
+        proj_a = self._projet("a")
+        chantier.start(str(proj_a), "obj")
+        c2 = chantier.start(str(proj_a), "obj second")
+        self.assertEqual(c2["project"], store.canon(proj_a))
+
+
+class TestStartPermissions(ChantierTestCase):
+    """Point G : permissions "skip" (defaut) ou "normal", validees a la creation."""
+
+    def test_defaut_est_skip(self):
+        c = chantier.start(str(self._projet()), "obj")
+        self.assertEqual(c["permissions"], "skip")
+
+    def test_accepte_normal(self):
+        c = chantier.start(str(self._projet()), "obj", permissions="normal")
+        self.assertEqual(c["permissions"], "normal")
+
+    def test_refuse_une_valeur_invalide(self):
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.start(str(self._projet()), "obj", permissions="yolo")
+        self.assertIn("yolo", str(ctx.exception))
+
+    def test_valeur_invalide_ne_cree_aucun_chantier(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.start(str(self._projet()), "obj", permissions="yolo")
+        self.assertEqual(store.load()["chantiers"], {})
+
+
+class TestAddTask(ChantierTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+
+    def test_add_task_normalizes_string_checklist(self):
+        t = chantier.add_task(self.chantier_id, "titre", "prompt", checklist=["tests verts"])
+        self.assertEqual(t["checklist"], [{"id": "c1", "label": "tests verts", "done": False}])
+        self.assertEqual(t["state"], "queued")
+        self.assertEqual(t["chantier"], self.chantier_id)
+        self.assertEqual(t["priority"], 0)
+        self.assertEqual(t["attempts"], 0)
+
+    def test_add_task_unknown_chantier_raises(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.add_task("c-99", "t", "p")
+
+    def test_add_task_unknown_dependency_raises(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.add_task(self.chantier_id, "t", "p", depends_on=("t-99",))
+
+    def test_add_task_accepts_valid_dependency(self):
+        a = chantier.add_task(self.chantier_id, "a", "prompt")["id"]
+        b = chantier.add_task(self.chantier_id, "b", "prompt", depends_on=(a,))
+        self.assertEqual(b["dependsOn"], [a])
+
+
+class TestDependConfinedToChantier(ChantierTestCase):
+    """Point F : une dependance ne peut jamais traverser deux chantiers.
+
+    Aujourd'hui _get_task() cherche dans le dict global des taches : un `dep t-04 --on
+    t-09` entre deux projets sans rapport est accepte en silence. Ce n'est plus le cas.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.c1 = chantier.start(str(self._projet("p1")), "obj1")["id"]
+        self.c2 = chantier.start(str(self._projet("p2")), "obj2", home_partage=True)["id"]
+
+    def test_add_task_refuse_une_dependance_dun_autre_chantier(self):
+        t1 = chantier.add_task(self.c1, "a", "prompt")["id"]
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.add_task(self.c2, "b", "prompt", depends_on=(t1,))
+        message = str(ctx.exception)
+        self.assertIn(self.c1, message)
+        self.assertIn(self.c2, message)
+
+    def test_add_task_refuse_ne_cree_pas_la_tache(self):
+        t1 = chantier.add_task(self.c1, "a", "prompt")["id"]
+        with self.assertRaises(chantier.ChantierError):
+            chantier.add_task(self.c2, "b", "prompt", depends_on=(t1,))
+        taches_c2 = [t for t in store.load()["taches"].values() if t["chantier"] == self.c2]
+        self.assertEqual(taches_c2, [])
+
+    def test_depend_refuse_une_dependance_dun_autre_chantier(self):
+        t1 = chantier.add_task(self.c1, "a", "prompt")["id"]
+        t2 = chantier.add_task(self.c2, "b", "prompt")["id"]
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.depend(t2, t1)
+        message = str(ctx.exception)
+        self.assertIn(self.c1, message)
+        self.assertIn(self.c2, message)
+        state = store.load()
+        self.assertNotIn(t1, state["taches"][t2]["dependsOn"])
+
+
+class TestDependAndCycle(ChantierTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+
+    def _task(self, titre: str = "t") -> str:
+        return chantier.add_task(self.chantier_id, titre, "prompt")["id"]
+
+    def test_depend_adds_dependency(self):
+        a, b = self._task("a"), self._task("b")
+        updated = chantier.depend(b, a)
+        self.assertIn(a, updated["dependsOn"])
+
+    def test_depend_refuses_self_dependency(self):
+        a = self._task("a")
+        with self.assertRaises(chantier.ChantierError):
+            chantier.depend(a, a)
+
+    def test_depend_unknown_task_raises(self):
+        a = self._task("a")
+        with self.assertRaises(chantier.ChantierError):
+            chantier.depend(a, "t-99")
+
+    def test_has_cycle_none_on_acyclic_graph(self):
+        tasks = {
+            "t-01": {"id": "t-01", "dependsOn": []},
+            "t-02": {"id": "t-02", "dependsOn": ["t-01"]},
+        }
+        self.assertIsNone(chantier.has_cycle(tasks))
+
+    def test_has_cycle_finds_the_loop(self):
+        tasks = {
+            "t-01": {"id": "t-01", "dependsOn": ["t-03"]},
+            "t-02": {"id": "t-02", "dependsOn": ["t-01"]},
+            "t-03": {"id": "t-03", "dependsOn": ["t-02"]},
+        }
+        cycle = chantier.has_cycle(tasks)
+        self.assertIsNotNone(cycle)
+        self.assertEqual(set(cycle), {"t-01", "t-02", "t-03"})
+
+    def test_i7_cycle_abandonne_le_graphe(self):
+        # I7 : un cycle abandonne le graphe entier. L'aplatir produirait un plan valide
+        # en apparence qui s'execute dans le mauvais ordre.
+        a = self._task("a")
+        b = chantier.add_task(self.chantier_id, "b", "prompt", depends_on=(a,))["id"]
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.depend(a, b)  # fermerait a -> b -> a
+        message = str(ctx.exception)
+        self.assertIn(a, message)
+        self.assertIn(b, message)
+        # le refus doit etre total : aucune dependance partielle n'est restee en place
+        state = store.load()
+        self.assertNotIn(b, state["taches"][a]["dependsOn"])
+
+
+class TestReady(ChantierTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+
+    def _mark_done(self, task_id: str) -> None:
+        with store.locked() as state:
+            state["taches"][task_id]["state"] = "done"
+
+    def test_i1_checklist_est_une_post_condition(self):
+        # I1 : la checklist d'une tache conditionne le lancement de ses DEPENDANTS,
+        # jamais le sien. L'inverse interbloque : le seul acteur capable de cocher est la
+        # session que la checklist empecherait de demarrer.
+        a = chantier.add_task(self.chantier_id, "a", "prompt", checklist=["tests verts"])["id"]
+        b = chantier.add_task(self.chantier_id, "b", "prompt", depends_on=(a,))["id"]
+
+        # A n'a pas de dependance : sa propre checklist non cochee ne doit jamais
+        # l'empecher d'etre prete.
+        ready_ids = {t["id"] for t in chantier.ready(self.chantier_id)}
+        self.assertIn(a, ready_ids)
+
+        # A est termine mais sa checklist reste non cochee : B ne doit pas etre pret.
+        self._mark_done(a)
+        ready_ids = {t["id"] for t in chantier.ready(self.chantier_id)}
+        self.assertNotIn(b, ready_ids)
+
+        # la case cochee : B devient pret.
+        chantier.check(a, "c1")
+        ready_ids = {t["id"] for t in chantier.ready(self.chantier_id)}
+        self.assertIn(b, ready_ids)
+
+    def test_ready_ignores_non_queued_tasks(self):
+        a = chantier.add_task(self.chantier_id, "a", "prompt")["id"]
+        self._mark_done(a)
+        ready_ids = {t["id"] for t in chantier.ready(self.chantier_id)}
+        self.assertNotIn(a, ready_ids)
+
+    def test_ready_unknown_chantier_raises(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.ready("c-99")
+
+
+class TestTaskEdits(ChantierTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(self.chantier_id, "t", "prompt", checklist=["c"])["id"]
+
+    def test_cancel_sets_state_and_finished_at(self):
+        t = chantier.cancel(self.task_id)
+        self.assertEqual(t["state"], "cancelled")
+        self.assertIsNotNone(t["finishedAt"])
+
+    def test_cancel_already_terminal_raises(self):
+        chantier.cancel(self.task_id)
+        with self.assertRaises(chantier.ChantierError):
+            chantier.cancel(self.task_id)
+
+    def test_prioritize_sets_priority(self):
+        t = chantier.prioritize(self.task_id, 5)
+        self.assertEqual(t["priority"], 5)
+
+    def test_check_marks_item_done(self):
+        t = chantier.check(self.task_id, "c1")
+        self.assertTrue(t["checklist"][0]["done"])
+
+    def test_check_unknown_item_raises(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.check(self.task_id, "c-inconnu")
+
+    def test_amend_updates_prompt_when_not_running(self):
+        t = chantier.amend(self.task_id, "nouveau prompt")
+        self.assertEqual(t["prompt"], "nouveau prompt")
+
+    def test_i8_aucun_refus_silencieux(self):
+        # I8 : toute operation refusee dit laquelle et pourquoi. amend() refuse une tache
+        # en cours d'execution : le seul acteur capable d'amender ne doit jamais court-
+        # circuiter silencieusement l'exécutante en train de travailler sur l'ancien texte.
+        with store.locked() as state:
+            state["taches"][self.task_id]["state"] = "running"
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.amend(self.task_id, "tentative pendant l'execution")
+        message = str(ctx.exception)
+        self.assertIn(self.task_id, message)
+        # le refus est reel, pas cosmetique : le prompt original n'a pas bouge
+        state = store.load()
+        self.assertEqual(state["taches"][self.task_id]["prompt"], "prompt")
+
+
+class TestPropagateFailures(unittest.TestCase):
+    def test_cascades_transitively(self):
+        state = {
+            "taches": {
+                "t-01": {"id": "t-01", "chantier": "c-01", "state": "failed", "dependsOn": []},
+                "t-02": {
+                    "id": "t-02",
+                    "chantier": "c-01",
+                    "state": "queued",
+                    "dependsOn": ["t-01"],
+                },
+                "t-03": {
+                    "id": "t-03",
+                    "chantier": "c-01",
+                    "state": "queued",
+                    "dependsOn": ["t-02"],
+                },
+            }
+        }
+        changed = chantier.propagate_failures(state, "c-01")
+        self.assertEqual(set(changed), {"t-02", "t-03"})
+        self.assertEqual(state["taches"]["t-02"]["state"], "blocked")
+        self.assertEqual(state["taches"]["t-03"]["state"], "blocked")
+        self.assertTrue(state["taches"]["t-02"]["error"])
+
+    def test_does_not_touch_unrelated_tasks(self):
+        state = {
+            "taches": {
+                "t-01": {"id": "t-01", "chantier": "c-01", "state": "failed", "dependsOn": []},
+                "t-02": {"id": "t-02", "chantier": "c-01", "state": "queued", "dependsOn": []},
+            }
+        }
+        changed = chantier.propagate_failures(state, "c-01")
+        self.assertEqual(changed, [])
+        self.assertEqual(state["taches"]["t-02"]["state"], "queued")
+
+    def test_marks_blocked_cause_as_propagation(self):
+        # La marque structuree qu'unblock_propagated() relit : sans elle, la levee de
+        # blocage n'a aucun moyen fiable de distinguer ce blocage-ci d'un blocage pour
+        # raison propre (voir TestUnblockPropagated).
+        state = {
+            "taches": {
+                "t-01": {"id": "t-01", "chantier": "c-01", "state": "failed", "dependsOn": []},
+                "t-02": {"id": "t-02", "chantier": "c-01", "state": "queued", "dependsOn": ["t-01"]},
+            }
+        }
+        chantier.propagate_failures(state, "c-01")
+        self.assertEqual(
+            state["taches"]["t-02"]["blockedCause"], chantier.BLOCKED_CAUSE_PROPAGATION
+        )
+
+    def test_ignore_les_taches_dun_autre_chantier(self):
+        # Point F : propagate_failures() ne parcourt que les taches du chantier vise.
+        state = {
+            "taches": {
+                "t-01": {"id": "t-01", "chantier": "c-01", "state": "failed", "dependsOn": []},
+                "t-02": {
+                    "id": "t-02",
+                    "chantier": "c-02",
+                    "state": "queued",
+                    "dependsOn": ["t-01"],
+                },
+            }
+        }
+        changed = chantier.propagate_failures(state, "c-01")
+        self.assertEqual(changed, [])
+        self.assertEqual(state["taches"]["t-02"]["state"], "queued")
+
+    def test_ignore_une_dependance_illegitime_dun_autre_chantier(self):
+        # Scenario exact du contrat : "dep t-04 --on t-09" entre deux projets sans
+        # rapport, accepte en silence par une ancienne version. t-04 (chantier c-02)
+        # depend illegitimement de t-09 (chantier c-01, mort). Meme cible sur c-02 (le
+        # chantier de t-04 lui-meme), l'echec de c-01 ne doit jamais le bloquer.
+        state = {
+            "taches": {
+                "t-09": {"id": "t-09", "chantier": "c-01", "state": "failed", "dependsOn": []},
+                "t-04": {
+                    "id": "t-04",
+                    "chantier": "c-02",
+                    "state": "queued",
+                    "dependsOn": ["t-09"],
+                },
+            }
+        }
+        changed = chantier.propagate_failures(state, "c-02")
+        self.assertEqual(changed, [])
+        self.assertEqual(state["taches"]["t-04"]["state"], "queued")
+
+
+class TestUnblockPropagated(unittest.TestCase):
+    """Lieve le blocage pose par propagate_failures() une fois la dependance saine.
+
+    Bug reel corrige ici, observe sur le socle ~/.claude/ordo : t-01 meurt, t-02 (qui en
+    depend) est bloquee en cascade ; t-01 est relancee et reussit vraiment, coche sa
+    checklist ; sans unblock_propagated(), t-02 restait bloquee pour toujours alors que
+    sa seule dependance etait terminee.
+    """
+
+    def _state(self, tache_a: dict | None = None, tache_b: dict | None = None) -> dict:
+        a = {
+            "id": "t-01",
+            "chantier": "c-01",
+            "state": "done",
+            "dependsOn": [],
+            "checklist": [{"id": "c1", "label": "x", "done": True}],
+            "error": None,
+        }
+        a.update(tache_a or {})
+        b = {
+            "id": "t-02",
+            "chantier": "c-01",
+            "state": "blocked",
+            "dependsOn": ["t-01"],
+            "checklist": [],
+            "error": "dependency t-01 dead (blocked)",
+            "blockedCause": chantier.BLOCKED_CAUSE_PROPAGATION,
+        }
+        b.update(tache_b or {})
+        return {"taches": {"t-01": a, "t-02": b}}
+
+    def test_unblocks_when_dependency_is_healthy_again(self):
+        state = self._state()
+        unblocked = chantier.unblock_propagated(state)
+        self.assertEqual(unblocked, ["t-02"])
+        t2 = state["taches"]["t-02"]
+        self.assertEqual(t2["state"], "queued")
+        self.assertIsNone(t2["error"])
+        self.assertIsNone(t2["blockedCause"])
+
+    def test_reuses_dependencies_satisfied_predicate_checklist_incomplete(self):
+        # Meme predicat que ready() (I1) : une dependance "done" mais dont la checklist
+        # n'est pas entierement cochee n'est pas saine. Deux definitions concurrentes de
+        # "dependance satisfaite" divergeraient forcement avec le temps.
+        state = self._state(tache_a={"checklist": [{"id": "c1", "label": "x", "done": False}]})
+        unblocked = chantier.unblock_propagated(state)
+        self.assertEqual(unblocked, [])
+        self.assertEqual(state["taches"]["t-02"]["state"], "blocked")
+
+    def test_stays_blocked_when_dependency_still_dead(self):
+        state = self._state(tache_a={"state": "failed"})
+        unblocked = chantier.unblock_propagated(state)
+        self.assertEqual(unblocked, [])
+        self.assertEqual(state["taches"]["t-02"]["state"], "blocked")
+
+    def test_never_unblocks_a_task_blocked_for_its_own_reason(self):
+        # LE point sur lequel la levee est jugee : une tache bloquee pour sa propre
+        # raison (ici, un pane mort simule) ne doit JAMAIS etre relancee automatiquement,
+        # meme quand le predicat de dependances est trivialement vrai (aucune dependance
+        # du tout : le cas le plus favorable a un faux positif). Seule la marque
+        # blockedCause == "propagation" autorise la levee, jamais le texte de error.
+        state = {
+            "taches": {
+                "t-01": {
+                    "id": "t-01",
+                    "chantier": "c-01",
+                    "state": "blocked",
+                    "dependsOn": [],
+                    "checklist": [],
+                    "error": "dead pane, no report received (99 s after launch)",
+                    "blockedCause": None,
+                },
+            }
+        }
+        unblocked = chantier.unblock_propagated(state)
+        self.assertEqual(unblocked, [])
+        self.assertEqual(state["taches"]["t-01"]["state"], "blocked")
+
+    def test_legacy_blocked_task_without_marker_is_left_alone(self):
+        # Decision : une tache bloquee par propagate_failures AVANT l'introduction de
+        # blockedCause n'a pas la marque (cle absente du dict). On ne la debloque jamais
+        # automatiquement sur la seule foi du texte de error, fragile par construction ;
+        # une reprise manuelle est preferee a un deblocage fonde sur un texte reformulable.
+        state = {
+            "taches": {
+                "t-01": {
+                    "id": "t-01", "chantier": "c-01", "state": "done",
+                    "dependsOn": [], "checklist": [], "error": None,
+                },
+                "t-02": {
+                    "id": "t-02",
+                    "chantier": "c-01",
+                    "state": "blocked",
+                    "dependsOn": ["t-01"],
+                    "checklist": [],
+                    "error": "dependency t-01 dead (blocked)",
+                    # pas de cle "blockedCause" : simule une tache bloquee avant ce
+                    # correctif, quand seul le texte de error portait la cause.
+                },
+            }
+        }
+        unblocked = chantier.unblock_propagated(state)
+        self.assertEqual(unblocked, [])
+        self.assertEqual(state["taches"]["t-02"]["state"], "blocked")
+
+    def test_ignores_tasks_not_currently_blocked(self):
+        state = {
+            "taches": {
+                "t-01": {
+                    "id": "t-01", "chantier": "c-01", "state": "queued", "dependsOn": [],
+                    "checklist": [], "blockedCause": chantier.BLOCKED_CAUSE_PROPAGATION,
+                },
+            }
+        }
+        self.assertEqual(chantier.unblock_propagated(state), [])
+
+
+class TestClose(ChantierTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(self.chantier_id, "t", "prompt")["id"]
+
+    def _mark_running(self, pane_id: str = "%12") -> None:
+        with store.locked() as state:
+            state["taches"][self.task_id]["state"] = "running"
+            state["taches"][self.task_id]["paneId"] = pane_id
+
+    def test_close_refuses_when_task_running_default_alive_check(self):
+        self._mark_running()
+        with self.assertRaises(chantier.ChantierError) as ctx:
+            chantier.close(self.chantier_id)
+        self.assertIn(self.task_id, str(ctx.exception))
+
+    def test_close_succeeds_when_no_running_task(self):
+        c, info = chantier.close(self.chantier_id)
+        self.assertEqual(c["state"], "closed")
+        self.assertIsNotNone(c["closedAt"])
+        self.assertEqual(info["panes"], [])
+        self.assertEqual(info["session"], c["tmuxSession"])
+        self.assertEqual(info["archives"], [])
+
+    def test_close_force_ignores_alive_tasks(self):
+        self._mark_running()
+        c, info = chantier.close(self.chantier_id, force=True)
+        self.assertEqual(c["state"], "closed")
+
+    def test_close_alive_check_injection_point_can_unblock(self):
+        # point d'injection documente dans chantier.close() : sans panes.py disponible ici,
+        # un alive_check(pane_id) -> bool permet a l'appelant de verifier la vivacite reelle
+        # du pane plutot que de se fier au seul champ state de la tache.
+        self._mark_running()
+        c, info = chantier.close(self.chantier_id, alive_check=lambda pane_id: False)
+        self.assertEqual(c["state"], "closed")
+
+    def test_close_alive_check_can_still_block(self):
+        self._mark_running()
+        with self.assertRaises(chantier.ChantierError):
+            chantier.close(self.chantier_id, alive_check=lambda pane_id: True)
+
+    def test_close_unknown_chantier_raises(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.close("c-99")
+
+    def test_close_lists_panes_of_tasks_that_carry_one(self):
+        # Deuxieme tache, sans pane : ne doit pas apparaitre dans la liste.
+        chantier.add_task(self.chantier_id, "sans pane", "prompt")
+        self._mark_running(pane_id="%7")
+        c, info = chantier.close(self.chantier_id, force=True)
+        self.assertEqual(info["panes"], ["%7"])
+
+
+class TestCloseArchive(ChantierTestCase):
+    """Point E : close() archive dans tous les cas, ne tue rien elle-meme.
+
+    chantier.py n'importe jamais panes.py : c'est cli.py qui fera le geste tmux avec la
+    liste de panes rendue par close(). Ici on ne teste que le deplacement de fichiers.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(self.chantier_id, "t", "prompt")["id"]
+        self.home = store.home()
+
+    def _write(self, relatif: str, contenu: str = "x") -> Path:
+        chemin = self.home / relatif
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+        chemin.write_text(contenu, encoding="utf-8")
+        return chemin
+
+    def test_deplace_brief_report_journal_capteur_sous_archives(self):
+        brief = self._write(f"briefs/{self.chantier_id}/{self.task_id}.md", "brief")
+        report = self._write(f"reports/{self.chantier_id}/{self.task_id}.json", "{}")
+        journal = self._write(f"journal/{self.chantier_id}.md", "14:00  ORDO  x")
+        capteur_script = self._write(f"sensors/{self.chantier_id}.py", "#!/usr/bin/env python3")
+
+        c, info = chantier.close(self.chantier_id)
+
+        dest_dir = self.home / "archives" / self.chantier_id
+        self.assertTrue(dest_dir.is_dir())
+        self.assertFalse(brief.exists())
+        self.assertFalse(report.exists())
+        self.assertFalse(journal.exists())
+        self.assertFalse(capteur_script.exists())
+        self.assertTrue((dest_dir / f"{self.task_id}.md").exists())
+        self.assertTrue((dest_dir / f"{self.task_id}.json").exists())
+        self.assertTrue((dest_dir / f"{self.chantier_id}.md").exists())
+        self.assertTrue((dest_dir / f"{self.chantier_id}.py").exists())
+        self.assertEqual((dest_dir / f"{self.task_id}.md").read_text(encoding="utf-8"), "brief")
+        self.assertEqual(len(info["archives"]), 4)
+        for chemin_archive in info["archives"]:
+            self.assertTrue(Path(chemin_archive).exists())
+
+    def test_fichier_absent_nest_pas_une_erreur(self):
+        # Aucun fichier ecrit sur disque pour cette tache : close() ne doit pas lever.
+        c, info = chantier.close(self.chantier_id)
+        self.assertEqual(c["state"], "closed")
+        self.assertEqual(info["archives"], [])
+
+    def test_archive_partielle_quand_seuls_certains_fichiers_existent(self):
+        brief = self._write(f"briefs/{self.chantier_id}/{self.task_id}.md", "brief")
+        c, info = chantier.close(self.chantier_id)
+        dest_dir = self.home / "archives" / self.chantier_id
+        self.assertTrue((dest_dir / f"{self.task_id}.md").exists())
+        self.assertEqual(len(info["archives"]), 1)
+
+    def test_ne_confond_pas_deux_chantiers_dont_lid_est_prefixe_de_lautre(self):
+        # Glob "c-1*" matcherait a tort "c-10.py" en fermant "c-1" : impossible avec le
+        # format next_id() (toujours 2 chiffres mini), mais reste un piege si le compteur
+        # depasse 99 ("c-1" n'existe jamais, mais "c-10" est prefixe de "c-100"). On force
+        # la limite ici en fabriquant directement les fichiers pour deux id voisins.
+        proche = f"{self.chantier_id}0"  # ex. "c-010" si self.chantier_id == "c-01"
+        garde = self._write(f"sensors/{proche}.py", "ne doit pas bouger")
+
+        c, info = chantier.close(self.chantier_id)
+
+        self.assertTrue(garde.exists())
+        dest_dir = self.home / "archives" / self.chantier_id
+        self.assertFalse((dest_dir / f"{proche}.py").exists())
+
+    def test_narchive_pas_les_fichiers_dun_autre_chantier(self):
+        autre = chantier.start(str(self._projet("autre")), "obj2", home_partage=True)["id"]
+        autre_task = chantier.add_task(autre, "t", "prompt")["id"]
+        garde = self._write(f"briefs/{autre}/{autre_task}.md", "ne doit pas bouger")
+
+        chantier.close(self.chantier_id)
+
+        self.assertTrue(garde.exists())
+        self.assertFalse((self.home / "archives" / self.chantier_id / f"{autre_task}.md").exists())
+
+
+class TestGraphAscii(ChantierTestCase):
+    def test_graph_ascii_lists_tasks_and_dependencies(self):
+        cid = chantier.start(str(self._projet()), "obj")["id"]
+        a = chantier.add_task(cid, "premiere", "prompt")["id"]
+        b = chantier.add_task(cid, "seconde", "prompt", depends_on=(a,))["id"]
+        rendu = chantier.graph_ascii(cid)
+        self.assertIn(a, rendu)
+        self.assertIn(b, rendu)
+        self.assertIn("premiere", rendu)
+        self.assertIn("seconde", rendu)
+
+    def test_graph_ascii_empty_chantier(self):
+        cid = chantier.start(str(self._projet("p2")), "obj")["id"]
+        rendu = chantier.graph_ascii(cid)
+        self.assertTrue(rendu)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,18 @@
+{
+  "name": "ordo",
+  "displayName": "Ordo",
+  "version": "0.1.0",
+  "description": "Run long engineering work as an orchestrator driving real Claude Code executor sessions in tmux panes, with a task graph, dependencies and evidence-based reconciliation.",
+  "author": {
+    "name": "Luis Parra"
+  },
+  "homepage": "https://github.com/tutozz/ordo",
+  "repository": "https://github.com/tutozz/ordo",
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "tmux",
+    "multi-agent",
+    "task-graph"
+  ]
+}

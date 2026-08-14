@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Point d'entree du CLI ordo.
+
+Resout le paquet ordo/ par rapport a l'emplacement de CE script, jamais par rapport au
+repertoire courant : une orchestratrice tourne dans le repertoire du projet pilote,
+jamais dans le dossier d'Ordo. C'est le tout premier defaut qu'une vraie session a
+signale ("je ne peux executer aucune commande Ordo") ; sys.path doit etre corrige avant
+le moindre import du paquet ordo.
+
+Le controle de version de python vit ICI et pas dans le paquet : ordo/panes.py utilise des
+unions PEP 604 evaluees a l'execution, donc un import sur python 3.9 leve un TypeError
+illisible avant qu'aucun message d'aide ait pu s'afficher. Le controle doit donc preceder
+le premier import du paquet, et n'utiliser que de la syntaxe comprise partout.
+"""
+
+import sys
+from pathlib import Path
+
+_MIN_PYTHON = (3, 10)
+if sys.version_info < _MIN_PYTHON:
+    sys.stderr.write(
+        "ordo requires Python %d.%d or later, found %d.%d at %s\n"
+        % (
+            _MIN_PYTHON[0],
+            _MIN_PYTHON[1],
+            sys.version_info[0],
+            sys.version_info[1],
+            sys.executable,
+        )
+    )
+    raise SystemExit(1)
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from ordo.cli import main  # noqa: E402  (import apres correction de sys.path, volontaire)
+
+if __name__ == "__main__":
+    sys.exit(main())

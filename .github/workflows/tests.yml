@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The suite drives a real tmux server: several tests create panes and read
+      # them back. Without tmux they do not degrade, they error out.
+      - name: install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: tmux version
+        run: tmux -V
+
+      # ORDO_HOME is what keeps the suite away from a real ~/.claude/ordo.
+      - name: unit suite
+        run: ORDO_HOME=$(mktemp -d) python3 -m unittest discover tests/
+
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      # Mutates the package, expects a test to fail for each mutation, restores.
+      # This is the only check that proves the suite is not decor.
+      - name: mutation check
+        run: bash tests/mutation_check.sh

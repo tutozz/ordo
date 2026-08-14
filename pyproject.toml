@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ordo"
+version = "0.1.0"
+description = "Orchestrate long engineering work with real Claude Code executor sessions in tmux panes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Luis Parra" }]
+urls = { Homepage = "https://github.com/tutozz/ordo", Changelog = "https://github.com/tutozz/ordo/blob/main/CHANGELOG.md" }
+keywords = ["claude-code", "tmux", "orchestration", "agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.scripts]
+ordo = "ordo.cli:main"
+
+[tool.setuptools]
+packages = ["ordo"]
+
+# Installing the package gives you the ordo command, not the skill. The skill has to
+# land in ~/.claude/skills/ordo for Claude Code to load it; install.sh does both.

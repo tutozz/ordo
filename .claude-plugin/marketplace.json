@@ -1,0 +1,17 @@
+{
+  "name": "ordo",
+  "owner": {
+    "name": "Luis Parra",
+    "url": "https://github.com/tutozz"
+  },
+  "metadata": {
+    "description": "Ordo, orchestration of real Claude Code executor sessions in tmux panes."
+  },
+  "plugins": [
+    {
+      "name": "ordo",
+      "source": "./",
+      "description": "Run long engineering work as an orchestrator driving real Claude Code executor sessions in tmux panes, with a task graph, dependencies and evidence-based reconciliation."
+    }
+  ]
+}

@@ -28,7 +28,7 @@ jobs:
         run: tmux -V
 
       - name: stub the claude binary
-        run: .github/scripts/stub-claude.sh
+        run: bash .github/scripts/stub-claude.sh
 
       # ORDO_HOME is what keeps the suite away from a real ~/.claude/ordo.
       - name: unit suite
@@ -45,7 +45,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
 
       - name: stub the claude binary
-        run: .github/scripts/stub-claude.sh
+        run: bash .github/scripts/stub-claude.sh
 
       # Mutates the package, expects a test to fail for each mutation, restores.
       # This is the only check that proves the suite is not decor.

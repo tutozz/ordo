@@ -34,6 +34,22 @@ HOME = os.path.expanduser("~")
 TEST_SHELL = "bash --noprofile --norc"
 
 
+def _tmux_version() -> tuple[int, int] | None:
+    """(major, minor) of the tmux on PATH, or None if it cannot be determined.
+
+    Reuses panes._parse_tmux_version so a test never disagrees with the package
+    about what version is installed. None means "do not gate anything on this":
+    an unreadable version must never silently skip a test.
+    """
+    try:
+        raw = subprocess.run(
+            ["tmux", "-V"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return panes._parse_tmux_version(raw)
+
+
 def _unique_session() -> str:
     return f"{SESSION_PREFIX}{uuid.uuid4().hex[:8]}"
 
@@ -405,6 +421,13 @@ class AttachDetachHooksTests(PanesTestCase):
             "la fenetre doit retrouver sa geometrie large au detachement",
         )
 
+    @unittest.skipIf(
+        _tmux_version() is not None and _tmux_version() < (3, 5),
+        "resize-window -A ne retient pas le plus grand des clients attaches sur "
+        "tmux < 3.5 : mesure 3.4 (fenetre a 80x23 au lieu de 100x29, la taille du "
+        "plus PETIT client). Le cas a un seul client, teste juste au-dessus, est "
+        "correct sur 3.4 ; seul le cas a deux clients diverge.",
+    )
     def test_detach_ne_restaure_pas_tant_quun_autre_client_reste_attache(self):
         _, window = panes.ensure_session(self.session)
         panes.spawn(window, HOME, TEST_SHELL)

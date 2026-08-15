@@ -45,7 +45,8 @@ is removed from the code** - and `tests/mutation_check.sh` proves that it actual
 for each invariant it applies one exact, unique textual mutation to the file that carries
 it, runs that invariant's test, and requires the test to go red. It does the same for
 three prohibitions written into every executor's brief (no `AskUserQuestion`, no
-self-validation, nothing irreversible without asking). 16 cases in total, currently.
+self-validation, nothing irreversible without asking), and for the token reader's two
+(`USAGE1`, `USAGE2`). 18 cases in total, currently.
 
 When you add a behaviour worth protecting:
 

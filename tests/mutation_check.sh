@@ -408,6 +408,46 @@ run_case "I13" "briefs et rapports ranges par chantier, jamais a plat" \
     "tests.test_report.TestPath.test_deux_chantiers_ne_partagent_jamais_un_fichier_de_rapport" \
     "$LIB_DIR/report.py" "$S" "$R"
 
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# USAGE1 -- un transcript introuvable se dit inconnu, jamais zero. Mutation : on
+# rend des compteurs a zero. Une executante qui tourne depuis vingt minutes
+# afficherait alors "0 jeton", ce qui est un chiffre faux presente comme une mesure.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/su1"; R="$WORKDIR/ru1"
+cat >"$S" <<'ORDO_EOF'
+        chemin = _trouver(session_id)
+        if chemin is None:
+            return None
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+        chemin = _trouver(session_id)
+        if chemin is None:
+            return _vide()
+ORDO_EOF
+run_case "USAGE1" "un transcript introuvable ne devient pas zero jeton" \
+    "tests.test_usage.TestLecture.test_un_transcript_absent_rend_rien_plutot_qu_un_zero" \
+    "$LIB_DIR/usage.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# USAGE2 -- un transcript qui a retreci est relu en entier. Mutation : le decalage
+# de lecture est garde tel quel. Il pointerait au milieu d'une ligne d'un fichier
+# remplace, et le total resterait faux pour toujours sans que rien ne le signale.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/su2"; R="$WORKDIR/ru2"
+cat >"$S" <<'ORDO_EOF'
+    if taille < entree["offset"]:
+        entree["offset"] = 0
+        entree["totaux"] = _vide()
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    if False:
+        pass
+ORDO_EOF
+run_case "USAGE2" "un transcript remplace est relu en entier" \
+    "tests.test_usage.TestLectureIncrementale.test_un_fichier_qui_retrecit_est_relu_en_entier" \
+    "$LIB_DIR/usage.py" "$S" "$R"
+
 echo ""
 echo "Interdits du brief d'executante (SPEC.md section 5, ordo/prompt.py) :"
 echo ""

@@ -21,6 +21,7 @@ directory per project.
 | `capteur.py` | the sensor contract: install, bounded run (hard timeout, 256 KiB output cap), filtered status, adoption (3 concordant runs plus an explicit human call) | serve any measurement before adoption (I12); fill a missing output key with a default instead of raising (I10); invoke the script through a shell instead of respecting its own shebang |
 | `controle.py` | the reconciliation loop: `scope_drift`, `fausse_completion`, `wake_reasons`/`wake_new`, `tick()` | let an exception raised while reconciling one campaign stop `tick()` for the others - each campaign is wrapped in its own try/except |
 | `journal.py` | the per-campaign journal file, three authors only, the regenerated `brief()` | accept a fourth author (I11: `write()` raises on anything outside `ORDO`/`ORCH`/`USER`) |
+| `usage.py` | tokens an executor actually spent, summed from its own Claude Code transcript (`~/.claude/projects/*/<claudeSessionId>.jsonl`), read incrementally | report zero for a transcript it cannot find - absent is absent, and a `running` task showing 0 tokens is a false measurement; re-read a multi-megabyte transcript from the start on every poll; derive the transcript's directory name from the project path - that encoding is not ours, the session id is unique, so it searches |
 | `prompt.py` | executor brief composition (`brief_executante`), the orchestrator role-contract text (`contrat_role`) | import `report.py` or `capteur.py` - the report path is derived directly from `store.home()`, not from `report.py`'s own logic |
 | `cli.py` | argparse dispatch, `--json` on every read verb (I12), the question registry (`state["questions"]`), task-to-campaign resolution | carry business rules that belong to another module - by its own docstring, this file has none of its own |
 
@@ -38,6 +39,7 @@ Verified from the actual `from . import ...` lines, not assumed:
 | `plan.py` | `chantier`, `store` |
 | `journal.py` | `chantier`, `store` |
 | `prompt.py` | `chantier`, `store` |
+| `usage.py` | none - stdlib only |
 | `controle.py` | `capteur`, `chantier`, `journal`, `panes`, `plan`, `report`, `store` |
 | `cli.py` | `capteur`, `chantier`, `journal`, `panes`, `plan`, `prompt`, `report`, `store`, plus `controle` imported lazily inside `cmd_tick` only, so the rest of the CLI keeps working if `controle.py` is broken or absent |
 

@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ordo poll` reports the tokens an executor actually spent, summed from its own Claude Code
+  transcript and read incrementally rather than from the start on every poll. A
+  transcript that cannot be found reports unknown, never zero: a `running` task showing zero
+  tokens is a false measurement, and the difference is the whole point.
+
 ## [0.1.0] - 2026-08-15
 
 First public release. Ordo ran privately before this; nothing below is an upgrade path from

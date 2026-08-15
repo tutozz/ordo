@@ -47,6 +47,7 @@ from . import (
     plan,
     prompt,
     report,
+    routage,
     situation,
     store,
 )
@@ -367,7 +368,11 @@ def _do_launch(
     report.clear(task_id, task["chantier"])
 
     brief_path = prompt.brief_executante(task_id)
-    resolved_model = model or task.get("model")
+    # Sans --model, le modele se deduit de la tache plutot que d'etre laisse au defaut de
+    # Claude Code, qui est le plus cher pour tout le monde y compris pour appliquer un
+    # brief deja arbitre. routage.pour_lancement respecte toute decision deja prise, et
+    # `--model herite` restaure le comportement d'avant.
+    resolved_model, model_reason = routage.pour_lancement(model, task)
     resolved_permissions = permissions or ch.get("permissions") or DEFAULT_PERMISSIONS
     cwd = task.get("cwd") or ch["project"]
 
@@ -434,6 +439,10 @@ def _do_launch(
         "attach": _attach_command(session),
         "permissions": resolved_permissions,
         "title": title,
+        # Extras internes, jamais servis en --json : le contrat de publication fige les
+        # six cles ci-dessus, et l'elargir serait un changement de contrat.
+        "model": resolved_model,
+        "modelReason": model_reason,
     }
 
 
@@ -466,6 +475,10 @@ def _print_launch_result(task_id: str, participe: str, result: dict, as_json: bo
     ligne("pane", f"{result['paneId']}   (title: {result['title']})")
     ligne("brief", result["brief"])
     ligne("permissions", _PERMISSIONS_LABEL.get(result["permissions"], result["permissions"]))
+    # Le modele sort TOUJOURS avec son motif. Un choix automatique qu'on ne voit pas
+    # passer est un choix qu'on ne peut pas contester, et celui-ci se conteste en une
+    # commande : relancer avec --model.
+    ligne("model", f"{result['model'] or 'defaut de claude'}   ({result['modelReason']})")
     return 0
 
 
@@ -2107,7 +2120,12 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
         help="launch a real claude session in a tmux pane (see 'ordo attach' next)",
     )
     p.add_argument("task")
-    p.add_argument("--model", default=None)
+    p.add_argument(
+        "--model",
+        default=None,
+        help="modele de l'executante ; par defaut deduit de la tache "
+        "(haiku/sonnet/opus), 'herite' pour n'en imposer aucun",
+    )
     p.add_argument(
         "--permissions",
         choices=PERMISSIONS_CHOICES,
@@ -2183,7 +2201,12 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
 
     p = verbs.add_parser("relaunch", parents=[json_parent], help="relaunch a blocked task")
     p.add_argument("task")
-    p.add_argument("--model", default=None)
+    p.add_argument(
+        "--model",
+        default=None,
+        help="modele de l'executante ; par defaut deduit de la tache "
+        "(haiku/sonnet/opus), 'herite' pour n'en imposer aucun",
+    )
     p.add_argument(
         "--permissions",
         choices=PERMISSIONS_CHOICES,

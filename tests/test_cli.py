@@ -593,6 +593,75 @@ class TestExecutionVerbs(CliTestCase):
         ch_state = state["chantiers"][cid]
         self.assertEqual(ch_state.get("tmuxWindow"), "@1")
 
+    def _cmd_de_spawn(self, spawn) -> str:
+        """La commande shell reellement passee a tmux par le dernier spawn()."""
+        appel = spawn.call_args
+        if appel.args:
+            for a in appel.args:
+                if isinstance(a, str) and "claude" in a:
+                    return a
+        for v in appel.kwargs.values():
+            if isinstance(v, str) and "claude" in v:
+                return v
+        raise AssertionError(f"aucune commande claude dans spawn{appel}")
+
+    def test_launch_sans_model_route_la_tache_et_passe_le_modele_a_claude(self):
+        """Le defaut n'est plus "rien imposer" : sans --model, le modele se deduit."""
+        cid = self._chantier()
+        t1 = self._tache(
+            cid,
+            titre="CTRL-DOC 01 Les decisions figees",
+            prompt="Verifier docs/03-DECISIONS.md contre index.js.",
+            checklist=["a", "b", "c"],
+        )
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2 as spawn, m3, m4, m5:
+            code, out, _ = self._run(["launch", t1])
+        self.assertEqual(code, 0)
+        self.assertIn("--model sonnet", self._cmd_de_spawn(spawn))
+        # Le motif sort avec le modele : un choix invisible ne se conteste pas.
+        self.assertIn("sonnet", out)
+        self.assertIn("perimetre nomme", out)
+
+    def test_launch_avec_model_explicite_prime_sur_le_routage(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, titre="Concevoir le schema", checklist=["a"])
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2 as spawn, m3, m4, m5:
+            code, _, _ = self._run(["launch", t1, "--model", "haiku"])
+        self.assertEqual(code, 0)
+        self.assertIn("--model haiku", self._cmd_de_spawn(spawn))
+
+    def test_launch_model_herite_n_impose_aucun_modele(self):
+        """Porte de sortie : la commande d'avant le routage, joignable en un mot."""
+        cid = self._chantier()
+        t1 = self._tache(cid, titre="CTRL-DOC 01", prompt="Voir a.py.", checklist=["a"])
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2 as spawn, m3, m4, m5:
+            code, _, _ = self._run(["launch", t1, "--model", "herite"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("--model", self._cmd_de_spawn(spawn))
+
+    def test_relaunch_escalade_le_modele_apres_une_tentative(self):
+        """Relancer a l'identique referait le meme echec : la seconde tentative monte."""
+        cid = self._chantier()
+        t1 = self._tache(
+            cid,
+            titre="CTRL-DOC 01 Les decisions figees",
+            prompt="Verifier docs/03-DECISIONS.md contre index.js.",
+            checklist=["a", "b", "c"],
+        )
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2 as spawn, m3, m4, m5:
+            self._run(["launch", t1])
+            self.assertIn("--model sonnet", self._cmd_de_spawn(spawn))
+            with store.locked() as state:
+                state["taches"][t1]["state"] = "blocked"
+            code, out, _ = self._run(["relaunch", t1])
+        self.assertEqual(code, 0)
+        self.assertIn("--model opus", self._cmd_de_spawn(spawn))
+        self.assertIn("tentative", out.lower())
+
     def test_launch_json_contient_toutes_les_cles_du_contrat(self):
         cid = self._chantier()
         t1 = self._tache(cid)

@@ -103,6 +103,7 @@ ordo add c-01 --title "fix the stock reducer" \
 
 ordo ready c-01          # what can start now
 ordo launch t-01         # creates the pane, starts claude, injects the brief
+                         # picks the model from the task and prints why; --model overrides
 ordo attach c-01         # prints the exact command to watch it work
 ordo watch c-01          # read-only event stream, one line per new fact
 ordo tick                # reconcile: reports, dependencies, drift, wake-ups

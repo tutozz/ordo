@@ -7,6 +7,20 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- `ordo/routage.py` picks each executor's model from the task itself, instead of letting
+  every session inherit whatever Claude Code defaults to - which is the most expensive
+  model, for applying a brief that has already been written and arbitrated. Ordered rules,
+  first match wins, and every launch prints the model **with the reason it was chosen**:
+  a choice nobody sees go by is a choice nobody can contest. `haiku` for a mechanical
+  gesture bounded to one or two named files, `sonnet` for a task with a checklist and a
+  named perimeter, `opus` for anything that decides, designs, or delivers a final verdict -
+  and for anything the rules cannot vouch for. `ordo launch --model <name>` still wins over
+  the routing, and `--model herite` restores the previous behaviour of imposing nothing.
+- The routing escalates one rung per past attempt, so a task misrouted downward repairs
+  itself on the first `relaunch` instead of failing again identically. Getting a call wrong
+  is the accepted risk of routing; persisting in it, and billing the same failure twice, is
+  not.
+
 - `ordo digest <campaign>` prints where a campaign stands in a form a human can read cold:
   the live phase and its progress, every live task with its title and its `why`, what is
   waiting on the human, what is launchable next. It never emits a task id without its title

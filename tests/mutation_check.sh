@@ -579,6 +579,42 @@ run_case "USAGE2" "un transcript remplace est relu en entier" \
     "$LIB_DIR/usage.py" "$S" "$R"
 
 # ---------------------------------------------------------------------------
+# ROUT1 -- le vocabulaire du routage ne se cherche que dans le titre. Mutation :
+# la fenetre est elargie au corps du brief. C'est le defaut mesure sur un chantier
+# reel de 69 taches : les verbes de conception vivent dans les INTERDICTIONS du
+# brief ("ne propose aucune tache de deploiement") et dans la methode ("va voir le
+# code"), si bien que 24 taches d'execution sur 24 partaient sur le modele le plus
+# cher. Le critere punissait alors les briefs les mieux rediges.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sr1"; R="$WORKDIR/rr1"
+cat >"$S" <<'ORDO_EOF'
+    demande = _plat(titre)
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    demande = _plat(f"{titre}\n{prompt}")
+ORDO_EOF
+run_case "ROUT1" "le vocabulaire du routage se lit dans le titre, pas dans le brief" \
+    "tests.test_routage.TestLeCorpsDuBriefNestPasLaDemande" \
+    "$LIB_DIR/routage.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# ROUT2 -- une tache relancee monte d'un cran. Mutation : l'escalade est retiree.
+# Une tache mal classee vers le bas se relancerait alors a l'identique, referait
+# exactement le meme echec, et le facturerait une seconde fois sans que rien ne
+# signale que le modele etait en cause.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sr2"; R="$WORKDIR/rr2"
+cat >"$S" <<'ORDO_EOF'
+    rang = min(MODELES.index(modele) + essais, len(MODELES) - 1)
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    rang = MODELES.index(modele)
+ORDO_EOF
+run_case "ROUT2" "une tache relancee ne repart pas sur le modele qui vient d'echouer" \
+    "tests.test_routage.TestEscaladeSurRelance" \
+    "$LIB_DIR/routage.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
 # DIGEST1 -- un identifiant de tache ne sort jamais sans son titre. Mutation :
 # le titre disparait du rendu. L'humain relit alors "t-33" sans savoir de quoi
 # il s'agit, ce qui est exactement le defaut que le module existe pour fermer.

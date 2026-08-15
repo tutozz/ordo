@@ -26,6 +26,7 @@ directory per project.
 | `usage.py` | tokens an executor actually spent, summed from its own Claude Code transcript (`~/.claude/projects/*/<claudeSessionId>.jsonl`), read incrementally | report zero for a transcript it cannot find - absent is absent, and a `running` task showing 0 tokens is a false measurement; re-read a multi-megabyte transcript from the start on every poll; derive the transcript's directory name from the project path - that encoding is not ours, the session id is unique, so it searches |
 | `serveur.py` | the single local map server on port 9123: the registry of known `ORDO_HOME`s, liveness by signature, detached start, and the read-only HTTP routes (`/`, `/api/state`, `/api/map`, `/health`) | write anything - there is no POST and no route mutates state; listen anywhere but `127.0.0.1`; trust the `home` query parameter (it is checked against the registry) or the `Host` header (checked against loopback names, which is what closes DNS rebinding); let its own failure break the watch that started it |
 | `prompt.py` | executor brief composition (`brief_executante`), the orchestrator role-contract text (`contrat_role`) | import `report.py` or `capteur.py` - the report path is derived directly from `store.home()`, not from `report.py`'s own logic |
+| `routage.py` | which model an executor gets, deduced from the task itself: ordered rules over the **title**, structural signals from checklist and touched files, plus one-rung escalation per past attempt | search the vocabulary anywhere but the title - measured on a real 69-task campaign, scanning the whole brief classified 24 execution tasks out of 24 as "conception", because the words live there in prohibitions ("ne propose aucune tache de deploiement") and in method ("va voir le code"), so the criterion punished the best-written briefs; score instead of ordered rules - a score that misfires cannot be pointed at; default to anything but `opus` - a task nothing proves is defined is not a cheap task; read `tache["model"]` as a human decision - only `_mark_running` writes it, so it is the last tour's trace, and reading it back would freeze the first routing forever and make escalation dead code |
 | `cli.py` | argparse dispatch, `--json` on every read verb (I12), the question registry (`state["questions"]`), task-to-campaign resolution | carry business rules that belong to another module - by its own docstring, this file has none of its own |
 
 ## Dependency direction
@@ -43,6 +44,7 @@ Verified from the actual `from . import ...` lines, not assumed:
 | `journal.py` | `chantier`, `store` |
 | `prompt.py` | `chantier`, `store` |
 | `usage.py` | none - stdlib only |
+| `routage.py` | none - stdlib only, and a pure function of a task |
 | `carte.py` | `chantier`, `journal`, `store`, `usage` |
 | `situation.py` | `carte`, `store` |
 | `serveur.py` | `carte`, `chantier`, `panes`, `store`, `usage` |

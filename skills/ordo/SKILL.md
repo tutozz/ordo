@@ -115,6 +115,7 @@ Do it while you are cutting, not afterwards: nobody ever comes back to explain a
 ```bash
 ordo ready <campaign>      # what can start right now
 ordo launch <task>         # creates the pane, starts claude, injects the brief
+ordo launch <task> --model sonnet   # override the routing for this launch ('herite' = impose nothing)
 ordo watch <campaign>      # read-only event stream; arm it under Monitor, see below
 ordo digest <campaign>     # where the campaign stands, in words; read it before you write
 ordo map <campaign>        # the graph as an HTML page for the human, read-only
@@ -125,8 +126,24 @@ ordo capture <task>        # the last lines of its pane
 ordo tick                  # reconcile: reports, deps, sensor, drift
 ```
 
-`launch` prints the tmux session, the attach command, the pane and its title, the brief path
-and the permission mode. **Relay that to the human**, do not swallow it.
+`launch` prints the tmux session, the attach command, the pane and its title, the brief path,
+the permission mode, and the model it picked with the reason. **Relay that to the human**,
+do not swallow it.
+
+The model is deduced from the task, not inherited from whatever Claude Code defaults to:
+`haiku` for a mechanical gesture bounded to one or two named files, `sonnet` for a task
+carrying a checklist and a named perimeter, `opus` for anything that designs, decides, or
+delivers a final verdict - and for anything the rules cannot vouch for, which includes any
+task with no checklist. The vocabulary is read in the **title**, so write titles that say
+what the task does. A task you title vaguely will be routed to the most expensive model,
+and that is the intended incentive.
+
+Two consequences for you. Sonnet does not rescue an ambiguous brief the way Opus does, so
+the routing moves the demand onto your briefs - that is the trade you are making. And a task
+that failed climbs one rung per attempt on its own, so **never diagnose a failure as a model
+problem and relaunch with `--model opus` by hand**: `relaunch` already does it. Reach for
+`--model` when you know something the title does not say, and `--model herite` to impose
+nothing at all.
 
 ---
 

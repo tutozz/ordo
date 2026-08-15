@@ -300,10 +300,19 @@ def add_task(
     depends_on: Sequence[str] = (),
     touches: Sequence[str] = (),
     checklist: Sequence = (),
+    why: str = "",
 ) -> dict:
     """Cree une tache. Chaque dependance declaree doit deja exister ET appartenir au meme
     chantier (I8, point F) : sans ce garde-fou, un `add t --depend-on t-09` entre deux
     projets sans rapport etait accepte en silence.
+
+    `why` est la raison d'etre de la tache, en clair : pourquoi elle existe, pourquoi ici
+    dans le decoupage, pas ce qu'elle fait. Ce n'est pas un doublon du titre ni du prompt.
+    Le titre nomme la tache, le prompt dit comment la faire, et personne, pas meme l'humain
+    qui a lance le chantier, ne peut deduire de l'un ou de l'autre pourquoi
+    l'orchestratrice a decoupe ainsi. Facultatif dans la signature parce qu'un etat ecrit
+    avant ce champ reste lisible ; ce qui l'exige est le brief d'orchestratrice, et
+    carte.model() liste sous "missingWhy" toute tache vivante qui s'en passe.
     """
     with store.locked() as state:
         _get_chantier(state, chantier_id)
@@ -320,6 +329,7 @@ def add_task(
             "chantier": chantier_id,
             "titre": titre,
             "prompt": prompt,
+            "why": why,
             "state": "queued",
             "dependsOn": list(depends_on),
             "touches": list(touches),
@@ -415,6 +425,48 @@ def check(task_id: str, item_id: str, done: bool = True) -> dict:
             raise ChantierError(
                 f"item not found: {item_id} does not exist in the checklist of {task_id}"
             )
+    return task
+
+
+def set_group(chantier_id: str, key: str, label: str, why: str = "") -> dict:
+    """Nomme une phase du chantier, ex. "0" -> "Socle sequentiel", et dit a quoi elle sert.
+
+    L'appartenance d'une tache a une phase se LIT de son titre (prefixe "0.3", "1.4") et ne
+    se stocke nulle part : c'est deja la convention que les orchestratrices suivent, et la
+    dupliquer dans l'etat ferait deux verites pour un seul fait. Seuls le LIBELLE et le
+    POURQUOI se stockent, parce qu'eux n'existent nulle part ailleurs : "0" ne dit a
+    personne ce que la phase 0 sert.
+
+    Nommer une phase qui n'a encore AUCUNE tache est le geste normal, pas un cas limite :
+    c'est ce qui permet d'annoncer les six phases d'un chantier des le depart et de
+    montrer, sur la carte, que la phase 3 existe et reste a decouper. carte.model() les
+    rend avec planned=True.
+
+    why absent ne remplace jamais un why deja ecrit : corriger un libelle est frequent,
+    reecrire l'explication ne l'est pas, et l'ecraser en silence la ferait disparaitre au
+    moment ou on croit juste corriger une faute de frappe.
+    """
+    with store.locked() as state:
+        ch = _get_chantier(state, chantier_id)
+        groupes = ch.setdefault("groupes", {})
+        ancien = groupes.get(key)
+        ancien_why = ancien.get("why", "") if isinstance(ancien, dict) else ""
+        groupes[key] = {"label": label, "why": why or ancien_why}
+    return ch
+
+
+def explain(task_id: str, why: str) -> dict:
+    """Pose ou remplace la raison d'etre d'une tache, apres coup.
+
+    Existe parce qu'un chantier deja lance ne peut pas revenir en arriere : sans ce verbe,
+    les taches creees avant que quiconque pense au pourquoi resteraient muettes pour
+    toujours, et la carte n'aurait rien a montrer la ou elle en a le plus besoin. Autorise
+    sur une tache en cours, contrairement a amend() : expliquer ne change pas le contrat
+    deja envoye a l'executante, donc rien ne se desaligne sous ses pieds.
+    """
+    with store.locked() as state:
+        task = _get_task(state, task_id)
+        task["why"] = why
     return task
 
 

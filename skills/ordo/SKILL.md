@@ -93,7 +93,8 @@ Then the graph. Two ways:
 
 ```bash
 # you write it yourself, task by task
-ordo add <campaign> --title "..." --prompt "..." --depends t-01 --touches db --check "tests green"
+ordo add <campaign> --title "..." --prompt "..." --depends t-01 --touches db \
+                    --check "tests green" --why "why this task exists, and why here"
 
 # or you start from a raw plan dictated by the human
 ordo plan <campaign> < plan.txt
@@ -103,6 +104,10 @@ ordo accept <proposal>
 An undecided proposal is **accepted automatically after 45 s**. Say it at the moment you
 propose, otherwise the human thinks you are waiting.
 
+Number your titles by phase (`0.1`, `0.2`, `1.1`): that prefix is what groups the graph.
+Then name the phases and say why each task exists, see "Making your split readable" below.
+Do it while you are cutting, not afterwards: nobody ever comes back to explain a split.
+
 ---
 
 ## Launching and watching
@@ -111,6 +116,7 @@ propose, otherwise the human thinks you are waiting.
 ordo ready <campaign>      # what can start right now
 ordo launch <task>         # creates the pane, starts claude, injects the brief
 ordo watch <campaign>      # read-only event stream; arm it under Monitor, see below
+ordo map <campaign>        # the graph as an HTML page for the human, read-only
 ordo attach <campaign>     # the exact command for a human to watch
 ordo poll --json           # state of every live executor
 ordo say <task> "redirect"
@@ -120,6 +126,63 @@ ordo tick                  # reconcile: reports, deps, sensor, drift
 
 `launch` prints the tmux session, the attach command, the pane and its title, the brief path
 and the permission mode. **Relay that to the human**, do not swallow it.
+
+---
+
+## Making your split readable, which is not optional
+
+Your transcript is a stream of task ids. The human reading it cannot see what you decided,
+why you decided it that way, or what you are still waiting on. Three commands close that
+gap, and the first two are part of planning, not of reporting.
+
+**1. Announce every phase up front, even the ones you have not cut yet.**
+
+```bash
+ordo group c-01 0 "Foundation"  --why "nothing can be right on top of a wrong base: local
+                                       rehearsal on real data, plus the four debts that
+                                       would make everything after it false"
+ordo group c-01 1 "Data model"  --why "the collections of 03-DATA.md in diagram order,
+                                       each with its guarded backfill"
+ordo group c-01 2 "Server"      --why "repository, queue, scheduler; sequential, each one
+                                       consumes the previous"
+```
+
+A phase with no task yet is not an error, it is the point: the map draws it dashed and says
+"announced, not cut yet". Without it, a six-phase campaign looks like a one-phase campaign,
+and nobody, you included after a restart, can tell how much is left.
+
+**2. Say why each task exists, at the moment you create it.**
+
+```bash
+ordo add c-01 --title "0.5 D25: stable role identifiers" --prompt "..." \
+              --why "role indexes shift on every migration, so every route that names a
+                     role by index is a silent bug waiting for the next insert"
+ordo why t-05 "..."     # same thing, after the fact, on a task already created
+```
+
+The title names the task. The prompt says how to do it. **Neither says why it exists, and
+that is the one thing nobody can reconstruct afterwards.** A human who reads "0.5 D25:
+stable role identifiers" with no `--why` learns nothing they did not already know. The map
+counts the tasks you left unexplained and shows the count in its header; treat that count as
+a defect, not as a style preference.
+**3. Give them the page.**
+
+```bash
+ordo serve            # http://127.0.0.1:9123/ , every campaign, live
+```
+
+You rarely need to run even that: `ordo watch` starts the server on its own. **Give the
+human the address once**, at the first launch of a campaign, and they stop asking you where
+things stand. `ordo map <campaign>` still writes a standalone file if they want one.
+
+`ordo map` reads only, like `watch`. `--pane` opens a dedicated tmux window in the campaign
+session, never a split, so no executor pane is resized. Relay the file path once; they keep
+the page open and stop asking you where things stand.
+
+**Number your task titles by phase** (`0.1`, `0.2`, `1.1`). That prefix is the ONLY thing
+that puts a task in a phase. A title without it lands in a "hors phase" bucket at the bottom
+of the page, and there is no verb to rename a task afterwards, so a missing prefix is
+permanent.
 
 ---
 

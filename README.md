@@ -106,6 +106,7 @@ ordo launch t-01         # creates the pane, starts claude, injects the brief
 ordo attach c-01         # prints the exact command to watch it work
 ordo watch c-01          # read-only event stream, one line per new fact
 ordo tick                # reconcile: reports, dependencies, drift, wake-ups
+ordo map c-01 --open     # the graph as a page you can look at
 ```
 
 When a task reaches `done`, its pane is closed and the tail of its screen is kept in the
@@ -152,6 +153,64 @@ A **sensor** (`ordo sensor`) is the optional counterweight to the graph: the gra
 executors *declare*, the sensor says what is *measured*. Confusing the two manufactures
 false completion. A sensor needs three concordant runs and a human validation before its
 signal counts for anything.
+
+## Seeing the split
+
+A transcript full of task ids tells you nothing about the shape of a campaign. `ordo map`
+writes one self-contained HTML file, no server and no third-party asset, and never
+touches the state:
+
+```bash
+ordo serve --open               # one page for every campaign, at a fixed address
+ordo map c-01 --open            # or a standalone file, no server involved
+```
+
+**You do not start that server by hand.** `ordo watch`, the watch an orchestrator arms
+anyway, starts it if it does not answer on `127.0.0.1:9123`. The first campaign of the day
+lights it up, the following ones find it standing and only register themselves, and if it
+dies the next watch brings it back. A picker at the top switches between campaigns, across
+projects. `--no-serve` on the watch, or `ORDO_NO_SERVE` in the environment, turns it off.
+
+The served page **updates without reloading**: it polls its own server and redraws only when
+the content actually changed, so scroll position, open task, folded phases and search all
+survive. The standalone file cannot do that; it refreshes wholesale and sends you back to
+the top of the page.
+
+The server is read-only by construction: no POST, nothing writes. It listens on loopback
+only, refuses any `ORDO_HOME` that is not in its registry, and rejects any `Host` header
+that is not a loopback name, which is what closes DNS rebinding from a page open in your
+browser.
+
+One section per phase, phases read from the numeric prefix of task titles (`0.3`, `1.4`).
+A finished phase folds itself away and shows only its bar, so what is left to do is what
+fills the screen. Inside a phase, tasks are laid out by dependency depth: a prerequisite is
+always to the left of, or above, what it unblocks, and oriented arcs say which way.
+
+Every card shows how long the task took and how many tokens it spent, read from the
+executor's own transcript; a card whose transcript cannot be found shows nothing rather
+than a zero it did not measure. Hovering a task marks its whole transitive chain, green
+upstream and blue downstream, and dims everything else. Clicking it opens, in place, what it waits on, what it unblocks, why
+it exists, what blocks it right now, its facts, its checklist, and its prompt and report as
+foldable blocks. There is a search box, a `reste`/`tout` filter, and a `graphe`/`liste`
+toggle; `reste` never hides a task, it folds finished phases and dims settled work, because
+a task that disappears is a position that moves and a bearing that is lost.
+
+Two commands make that page worth reading, and both belong to planning, not to reporting:
+
+```bash
+ordo group c-01 0 "Foundation" --why "nothing can be right on top of a wrong base"
+ordo group c-01 2 "Server"     --why "repository, queue, scheduler, each consumes the previous"
+ordo why t-05 "role indexes shift on every migration"
+```
+
+**A phase named with no task yet is the point, not an oversight**: it is drawn dashed and
+labelled "announced, not cut yet", which is what tells you a six-phase campaign has cut one.
+And a title says what a task is, a prompt says how to do it; **neither says why it exists**,
+which is the one thing nobody can reconstruct later. The map counts the tasks left
+unexplained and puts that count in its header.
+
+`--pane` opens a dedicated tmux *window* in the campaign session, never a split: a split
+would resize every executor pane and force each running `claude` TUI to redraw.
 
 ## Watching an executor
 

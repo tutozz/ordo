@@ -7,10 +7,60 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- `ordo map <campaign>` writes a self-contained HTML page of the campaign: one band per
+  phase, every phase on screen at once, tiles ordered by dependency depth inside each band.
+  Clicking a task opens its prompt, checklist, blocking dependencies, report and the
+  orchestrator journal lines that name it. No server, no third-party asset, no write to
+  `state.json`. `--watch` refreshes it in a loop, `--pane` runs that loop in a dedicated
+  tmux window of the campaign session, `--open` opens it in the browser, `--json` serves the
+  same model as data (I12).
+- Hovering a task marks its whole transitive chain, green upstream and blue downstream, and
+  dims the rest; clicking opens the detail in place. Arc coordinates are computed by the
+  browser from the real position of the rows, since the layout reflows with the window.
+  Search box, `reste`/`tout` filter and `graphe`/`liste` toggle; `reste` folds finished
+  phases and dims settled work rather than hiding anything, because a task that disappears
+  is a bearing lost.
+- The page carries the campaign as JSON and puts it in the DOM through `textContent` only.
+  A task title is text a model wrote; concatenating it into markup is how it ends up
+  executing.
+- `ordo group <campaign> <key> <label> --why "..."` names a phase and says what it serves.
+  A phase named with no task yet is drawn as announced-but-not-cut, which is what shows that
+  a six-phase campaign has only cut one. Membership stays derived from the numeric prefix of
+  task titles; only the label and the why are stored, under a `groupes` key that older
+  states simply do not have. Renaming a phase never erases its why.
+- `ordo add --why` and `ordo why <task> "..."` record why a task exists and why there in the
+  split. The title says what, the prompt says how, and neither says why - the one thing
+  nobody can reconstruct afterwards. The map counts what nobody explained and never fills it
+  in from the title.
+- The map header answers what a graph alone cannot: which tasks exhaust the graph as it
+  stands, which phases are announced but not cut, and which phases the goal names that
+  nobody has even announced.
+- The map calls out what makes a graph lie: a `done` task whose checklist is not ticked and
+  which therefore still blocks its dependants (I1), a `running` task whose pane is gone, two
+  same-depth tasks sharing a declared zone, a dangling dependency id, a cycle, and a closed
+  campaign that still holds unfinished tasks.
+- `ordo serve` runs one local map server on `127.0.0.1:9123` for every campaign of every
+  project, registered through `~/.claude/ordo-serve.json`. `ordo watch` starts it if nothing
+  answers, so the first campaign of the day lights it up and the next ones only register;
+  `--no-serve` and `ORDO_NO_SERVE` turn that off. The page polls its own server and redraws
+  only what changed, so scroll position, open task and filters survive a refresh. Read-only:
+  there is no POST, the `home` parameter is checked against the registry and the `Host`
+  header against loopback names, which is what closes DNS rebinding.
 - `ordo poll` reports the tokens an executor actually spent, summed from its own Claude Code
   transcript and read incrementally rather than from the start on every poll. A
   transcript that cannot be found reports unknown, never zero: a `running` task showing zero
   tokens is a false measurement, and the difference is the whole point.
+
+### Fixed
+
+- `launch` targeted the campaign's tmux **session** where it meant its **window**, so it
+  acted on whichever window was current. Harmless while a campaign session had exactly one
+  window; `ordo map --pane` adds a second, and an executor could then be spawned into the
+  map's window, recycle the refresher's pane, and leave `relayout` resizing the wrong
+  window while the executors kept a stale geometry. `spawn`/`relayout` now take the
+  window id, as `resume` already did. A service window is also skipped when resolving a
+  campaign's window, and the work window is recreated if reaping left the session holding
+  nothing but the map.
 
 ## [0.1.0] - 2026-08-15
 

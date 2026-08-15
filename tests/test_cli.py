@@ -50,14 +50,23 @@ class CliTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.mkdtemp(prefix="ordo-cli-test-")
-        self._prev_home = os.environ.get("ORDO_HOME")
+        self._prev_env = {
+            cle: os.environ.get(cle)
+            for cle in ("ORDO_HOME", "ORDO_REGISTRY", "ORDO_NO_SERVE")
+        }
         os.environ["ORDO_HOME"] = self._tmp
+        # Le registre du serveur de cartes est global a la machine, et `watch` demarre ce
+        # serveur : sans ces deux lignes la suite ecrivait dans le vrai fichier de
+        # l'utilisateur et allumait un daemon sur le port de production.
+        os.environ["ORDO_REGISTRY"] = str(Path(self._tmp) / "registre.json")
+        os.environ["ORDO_NO_SERVE"] = "1"
 
     def tearDown(self) -> None:
-        if self._prev_home is None:
-            os.environ.pop("ORDO_HOME", None)
-        else:
-            os.environ["ORDO_HOME"] = self._prev_home
+        for cle, valeur in self._prev_env.items():
+            if valeur is None:
+                os.environ.pop(cle, None)
+            else:
+                os.environ[cle] = valeur
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _projet(self, nom: str = "p") -> Path:
@@ -1831,3 +1840,193 @@ class TestWatchVerb(CliTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Carte, phases et pourquoi
+# ---------------------------------------------------------------------------
+
+
+class TestMapVerb(CliTestCase):
+    """cmd_map. Aucun test ici ne cree de session tmux : panes.live_ids est mocke.
+
+    La branche --pane est couverte en mockant panes.side_window : ce qui doit etre prouve
+    ici est la COMMANDE construite pour la fenetre, pas le comportement de tmux, deja
+    couvert par tests/test_panes.py contre un vrai serveur.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = self._chantier()
+        self._live = mock.patch.object(cli.panes, "live_ids", return_value=set())
+        self._live.start()
+        self.addCleanup(self._live.stop)
+
+    def _sortie(self) -> Path:
+        return Path(self._tmp) / "carte.html"
+
+    def test_ecrit_la_page_au_chemin_demande(self):
+        self._tache(self.chantier_id, titre="0.1 a")
+        chemin = self._sortie()
+        code, out, _ = self._run(
+            ["map", self.chantier_id, "--out", str(chemin), "--interval", "0"]
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(chemin.exists())
+        self.assertIn("0.1 a", chemin.read_text(encoding="utf-8"))
+        self.assertIn(str(chemin), out)
+
+    def test_le_chemin_par_defaut_vit_sous_ORDO_HOME(self):
+        self._tache(self.chantier_id, titre="0.1 a")
+        code, out, _ = self._run(["map", self.chantier_id, "--interval", "0"])
+        self.assertEqual(code, 0)
+        attendu = store.home() / "map" / f"{self.chantier_id}.html"
+        self.assertTrue(attendu.exists())
+        self.assertIn(str(attendu), out)
+
+    def test_un_chemin_relatif_devient_absolu(self):
+        # --pane relance cette commande dans un process dont le repertoire courant n'est
+        # pas garanti etre le notre : deux cwd differents ecriraient deux fichiers.
+        self._tache(self.chantier_id, titre="0.1 a")
+        args = mock.Mock(out="carte.html", campaign=self.chantier_id)
+        self.assertTrue(cli._map_path(args).is_absolute())
+
+    def test_json_sert_le_modele(self):
+        self._tache(self.chantier_id, titre="0.1 a")
+        data = self._run_json(
+            ["map", self.chantier_id, "--out", str(self._sortie()),
+             "--interval", "0", "--json"]
+        )
+        self.assertEqual(data["counts"]["total"], 1)
+        self.assertEqual([g["key"] for g in data["groups"]], ["0"])
+
+    def test_json_et_watch_sont_refuses_ensemble(self):
+        # Une boucle qui rend du texte humain la ou l'appelant attend du JSON casse son
+        # parseur sans un mot ; le refus est explicite (I8).
+        code, _, err = self._run(
+            ["map", self.chantier_id, "--json", "--watch", "--interval", "1", "--passes", "1"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("--json", err)
+
+    def test_watch_reecrit_la_page_a_chaque_passe(self):
+        self._tache(self.chantier_id, titre="0.1 a")
+        chemin = self._sortie()
+        code, out, _ = self._run(
+            ["map", self.chantier_id, "--out", str(chemin),
+             "--watch", "--interval", "1", "--passes", "2"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out.strip().splitlines()), 2)
+        self.assertIn('http-equiv="refresh"', chemin.read_text(encoding="utf-8"))
+
+    def test_sans_watch_la_page_ne_se_rafraichit_pas_toute_seule(self):
+        self._tache(self.chantier_id, titre="0.1 a")
+        chemin = self._sortie()
+        self._run(["map", self.chantier_id, "--out", str(chemin), "--interval", "0"])
+        self.assertNotIn('http-equiv="refresh"', chemin.read_text(encoding="utf-8"))
+
+    def test_watch_refuse_un_intervalle_nul(self):
+        code, _, err = self._run(["map", self.chantier_id, "--watch", "--interval", "0"])
+        self.assertEqual(code, 1)
+        self.assertIn("--interval", err)
+
+    def test_un_chantier_inconnu_est_refuse(self):
+        code, _, err = self._run(["map", "c-99", "--interval", "0"])
+        self.assertEqual(code, 1)
+        self.assertIn("c-99", err)
+
+    def test_pane_passe_ORDO_HOME_a_la_fenetre(self):
+        # tmux ne transmet pas l'environnement du client a new-window : sans ce passage
+        # explicite, la boucle resoudrait ~/.claude/ordo, mourrait sur "campaign not
+        # found", et la fenetre se fermerait sans que rien a l'ecran ne le dise.
+        self._tache(self.chantier_id, titre="0.1 a")
+        with mock.patch.object(cli.panes, "side_window", return_value="@9") as ouvre:
+            code, out, _ = self._run(
+                ["map", self.chantier_id, "--out", str(self._sortie()), "--pane"]
+            )
+        self.assertEqual(code, 0)
+        session, nom, commande = ouvre.call_args[0]
+        self.assertEqual(nom, cli.panes.MAP_WINDOW_NAME)
+        self.assertIn(f"ORDO_HOME={store.home()}", commande)
+        self.assertIn("--watch", commande)
+        self.assertIn(str(self._sortie()), commande)
+        self.assertIn("@9", out)
+
+    def test_pane_refuse_un_chantier_sans_session_tmux(self):
+        with store.locked() as state:
+            state["chantiers"][self.chantier_id]["tmuxSession"] = None
+        with mock.patch.object(cli.panes, "side_window") as ouvre:
+            code, _, err = self._run([
+                "map", self.chantier_id, "--out", str(self._sortie()), "--pane"
+            ])
+        self.assertEqual(code, 1)
+        self.assertIn("tmux", err)
+        ouvre.assert_not_called()
+
+    def test_tmux_absent_ne_fait_pas_echouer_la_carte(self):
+        # La carte se lit sans serveur tmux ; ce qui devient inconnu, c'est la vivacite des
+        # panes, et elle est alors annoncee inconnue plutot que devinee.
+        self._tache(self.chantier_id, titre="0.1 a")
+        with mock.patch.object(
+            cli.panes, "live_ids", side_effect=RuntimeError("tmux introuvable")
+        ):
+            code, _, _ = self._run(
+                ["map", self.chantier_id, "--out", str(self._sortie()), "--interval", "0"]
+            )
+        self.assertEqual(code, 0)
+        self.assertTrue(self._sortie().exists())
+
+    def test_la_carte_n_ecrit_jamais_dans_l_etat(self):
+        self._tache(self.chantier_id, titre="0.1 a")
+        avant = (store.home() / "state.json").read_text(encoding="utf-8")
+        self._run(["map", self.chantier_id, "--out", str(self._sortie()), "--interval", "0"])
+        self.assertEqual((store.home() / "state.json").read_text(encoding="utf-8"), avant)
+
+
+class TestGroupAndWhyVerbs(CliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = self._chantier()
+
+    def test_group_nomme_une_phase_et_dit_a_quoi_elle_sert(self):
+        data = self._run_json(
+            ["group", self.chantier_id, "0", "Socle", "--why", "base fausse, tout est faux",
+             "--json"]
+        )
+        self.assertEqual(data["groups"]["0"]["label"], "Socle")
+        self.assertEqual(data["groups"]["0"]["why"], "base fausse, tout est faux")
+
+    def test_group_sans_why_le_signale_au_lieu_de_se_taire(self):
+        code, out, _ = self._run(["group", self.chantier_id, "0", "Socle"])
+        self.assertEqual(code, 0)
+        self.assertIn("--why", out)
+
+    def test_group_refuse_un_chantier_inconnu(self):
+        code, _, err = self._run(["group", "c-99", "0", "Socle"])
+        self.assertEqual(code, 1)
+        self.assertIn("c-99", err)
+
+    def test_add_accepte_le_pourquoi(self):
+        data = self._run_json(
+            ["add", self.chantier_id, "--title", "0.1 a", "--prompt", "p",
+             "--why", "sans ca la suite est fausse", "--json"]
+        )
+        self.assertEqual(data["why"], "sans ca la suite est fausse")
+
+    def test_add_sans_pourquoi_le_dit_a_la_creation(self):
+        code, out, _ = self._run(
+            ["add", self.chantier_id, "--title", "0.1 a", "--prompt", "p"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("ordo why t-01", out)
+
+    def test_why_pose_la_raison_apres_coup(self):
+        task_id = self._tache(self.chantier_id, titre="0.1 a")
+        data = self._run_json(["why", task_id, "les index de role bougent", "--json"])
+        self.assertEqual(data["why"], "les index de role bougent")
+
+    def test_why_refuse_une_tache_inconnue(self):
+        code, _, err = self._run(["why", "t-99", "x"])
+        self.assertEqual(code, 1)
+        self.assertIn("t-99", err)

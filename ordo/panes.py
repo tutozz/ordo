@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 # Window size floor, and the unit each added pane grows the window by.
@@ -287,14 +288,47 @@ def _window_id_of(session: str) -> str:
     _session_exists() -- list-windows suffers the identical prefix-matching
     risk for the same reason.
     """
-    output = _run(["list-windows", "-t", f"={session}", "-F", "#{window_id}"])
-    lines = [line for line in output.splitlines() if line.strip()]
+    output = _run(
+        ["list-windows", "-t", f"={session}", "-F", "#{window_id} #{window_name}"]
+    )
+    lines = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        window_id, _, window_name = line.partition(" ")
+        # Les fenetres de service (side_window) sont ecartees, jamais rendues comme
+        # fenetre du chantier. Sans ce filtre, il suffit que la derniere pane
+        # d'executante soit moissonnee pour que la fenetre du chantier disparaisse en
+        # laissant la session vivante par la seule fenetre de la carte : ensure_session()
+        # adopterait alors celle-ci, la renommerait au slug du chantier, y poserait ses
+        # hooks, et l'executante suivante naitrait a cote du rafraichisseur de la carte.
+        if window_name == MAP_WINDOW_NAME:
+            continue
+        lines.append(window_id)
     if not lines:
         raise RuntimeError(
             f"no window found for session {session}: cannot determine its "
             "stable identifier"
         )
     return lines[0]
+
+
+def _work_window(session: str) -> str:
+    """La fenetre de travail de la session, creee si toutes ses panes ont ete moissonnees.
+
+    Une session ne survit normalement pas a la mort de sa derniere fenetre : moissonner la
+    derniere executante emporte la session, et l'appel suivant a ensure_session() en
+    recree une propre. Une fenetre de service (side_window) casse cette mecanique en
+    maintenant la session en vie ; _window_id_of() ecarte cette fenetre-la, donc il ne
+    reste plus RIEN a rendre, et le chantier se retrouverait bloque par le seul fait qu'on
+    regardait sa carte. On refabrique donc la fenetre de travail au lieu d'echouer.
+    """
+    try:
+        return _window_id_of(session)
+    except RuntimeError:
+        return _run(
+            ["new-window", "-P", "-F", "#{window_id}", "-t", f"={session}:"]
+        ).strip()
 
 
 def _resolve_target(window: str) -> str:
@@ -507,7 +541,7 @@ def ensure_session(session: str, label: str | None = None) -> tuple[str, str]:
                 str(WINDOW_BASE_ROWS),
             ]
         )
-    window_id = _window_id_of(session)
+    window_id = _work_window(session)
     _run(["set-window-option", "-t", window_id, "window-size", "manual"])
     if label:
         _run(["rename-window", "-t", window_id, label])
@@ -929,6 +963,83 @@ def alive(pane_id: str) -> bool:
         if pid == pane_id:
             return dead == "0"
     return False
+
+
+def live_ids() -> set[str]:
+    """Identifiants de TOUS les panes vivants du serveur, en un seul appel tmux.
+
+    alive() repond la meme question pour un pane a la fois, et fait un list-panes complet
+    a chaque appel. Une carte rafraichie toutes les cinq secondes sur un chantier de
+    quarante taches paierait quarante appels par cycle pour la meme information. Absence
+    de serveur tmux : ensemble vide, pas d'exception, exactement comme alive() -- pour
+    cette question, l'absence de pane EST la reponse.
+    """
+    result = _tmux(["list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"])
+    if result.returncode != 0:
+        return set()
+    vivants = set()
+    for line in result.stdout.splitlines():
+        pane_id, _, dead = line.partition(" ")
+        if pane_id and dead == "0":
+            vivants.add(pane_id)
+    return vivants
+
+
+# Nom de la fenetre de service qu'ouvre side_window(). Fixe, et volontairement improbable
+# pour une fenetre ouverte a la main : side_window() respawn ce qui porte deja ce nom.
+MAP_WINDOW_NAME = "ordo-map"
+
+
+def side_window(session: str, name: str, cmd: str) -> str:
+    """Fenetre de service dans la session d'un chantier, sans toucher a ses exécutantes.
+
+    new-window et non split-window : un split redimensionne toutes les panes de la fenetre
+    des exécutantes, ce qui force le TUI de chaque `claude` en cours a se redessiner. Une
+    fenetre a part n'en touche aucune. -d pour ne pas voler la fenetre courante d'un humain
+    deja attache.
+
+    Les hooks client-attached / client-detached poses par ensure_session() visent un
+    window_id explicite (Point B) et non "la fenetre courante" : c'est precisement ce qui
+    rend cette seconde fenetre inoffensive pour la geometrie de la premiere.
+
+    Une fenetre portant deja `name` est respawnee plutot que dupliquee, sinon chaque appel
+    empilerait une fenetre morte de plus. Le nom doit donc rester un nom de service, jamais
+    un nom qu'un humain donnerait a sa propre fenetre.
+
+    L'index de la nouvelle fenetre est calcule et impose, jamais laisse a tmux. Ce que la
+    fenetre de service ne doit JAMAIS faire, c'est passer devant celle des exécutantes :
+    _window_id_of() rend la PREMIERE fenetre listee, ensure_session() la rappelle a chaque
+    launch et _record_window() la persiste, donc une fenetre de carte arrivee en tete ferait
+    prendre au chantier la carte pour sa propre fenetre, et l'executante suivante serait
+    splittee dedans.
+
+    Mesure du 15 aout 2026 sur tmux 3.x : `new-window -t =session:` place bien la fenetre a
+    max(index) + 1, meme avec base-index a 0 et la seule fenetre existante a l'index 1. La
+    forme paresseuse serait donc correcte aujourd'hui. max(index) + 1 est ecrit quand meme
+    parce que la garantie ci-dessus ne doit dependre ni de base-index ni de la version de
+    tmux, et parce que le cout de l'ecrire est une ligne.
+    """
+    if not _session_exists(session):
+        raise RuntimeError(f"tmux session {session} does not exist")
+    listing = _run(
+        ["list-windows", "-t", f"={session}", "-F", "#{window_index} #{window_id} #{window_name}"]
+    )
+    indices = []
+    for line in listing.splitlines():
+        index, _, reste = line.partition(" ")
+        window_id, _, window_name = reste.partition(" ")
+        if window_name == name:
+            _run(["respawn-window", "-k", "-t", window_id, cmd])
+            return window_id
+        with suppress(ValueError):
+            indices.append(int(index))
+    cible = (max(indices) + 1) if indices else 1
+    return _run(
+        [
+            "new-window", "-d", "-P", "-F", "#{window_id}",
+            "-n", name, "-t", f"={session}:{cible}", cmd,
+        ]
+    ).strip()
 
 
 def busy(pane_id: str) -> bool:

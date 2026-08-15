@@ -38,7 +38,17 @@ import uuid
 from contextlib import suppress
 from pathlib import Path
 
-from . import __version__, capteur, chantier, journal, panes, plan, prompt, report, store
+from . import (
+    __version__,
+    capteur,
+    chantier,
+    journal,
+    panes,
+    plan,
+    prompt,
+    report,
+    store,
+)
 
 
 class CliError(Exception):
@@ -372,8 +382,16 @@ def _do_launch(
     # splitte un nouveau : c'est ce qui empeche un pane recycle de garder le nom de
     # l'ancienne tache (voir spawn() dans panes.py).
     title = _pane_title(task)
-    pane_id = panes.spawn(session, cwd, cmd, title=title)
-    panes.relayout(session)
+    # window_id et non session (Point B, voir panes._resolve_target) : `-t <session>` vise
+    # la fenetre COURANTE de la session, celle qui derive des qu'une seconde fenetre existe
+    # et qu'un humain attache bascule dessus. Tant que la session d'un chantier n'avait
+    # qu'une fenetre, la distinction etait invisible ; `ordo map --pane` en ouvre une
+    # seconde, et alors une executante pouvait naitre dans la fenetre de la carte, y
+    # recycler la pane du rafraichisseur, et relayout redimensionner la mauvaise fenetre
+    # pendant que les executantes gardaient une geometrie perimee. cmd_resume() passait
+    # deja window_id ; ces deux lignes s'alignent dessus.
+    pane_id = panes.spawn(window_id, cwd, cmd, title=title)
+    panes.relayout(window_id)
 
     etat_pane = panes.wait_ready(pane_id)
 
@@ -592,11 +610,16 @@ def cmd_add(args: argparse.Namespace) -> int:
         depends_on=args.depends or [],
         touches=args.touches or [],
         checklist=args.check or [],
+        why=args.why or "",
     )
     if args.json:
         _print_json(t)
         return 0
     print(f"{t['id']}  {t['titre']}  (depends on: {', '.join(t['dependsOn']) or '-'})")
+    if not t["why"]:
+        # Dit une fois, au moment ou la reponse est encore fraiche dans la tete de qui
+        # decoupe. Personne ne remonte expliquer un decoupage trois heures plus tard.
+        print(f"           no why: ordo why {t['id']} \"...\" says why this task exists")
     return 0
 
 
@@ -984,6 +1007,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
     state = store.load()
     if args.campaign not in state["chantiers"]:
         raise CliError(f"unknown campaign: {args.campaign}")
+
+    # C'est ici que le tableau de bord s'allume, et nulle part ailleurs. Une veille est
+    # armee au premier lancement de chaque chantier et vit aussi longtemps que lui : c'est
+    # le seul point du systeme dont la duree coincide avec celle d'un chantier en cours.
+    # Le premier l'allume, les suivants le trouvent debout et s'inscrivent seulement ;
+    # s'il est tombe, la veille suivante le rallume. Un echec ici ne fait jamais echouer la
+    # veille : un tableau de bord absent est un desagrement, une veille morte est un
+    # chantier a l'arret.
+    if not getattr(args, "no_serve", False):
+        try:
+            from . import serveur
+
+            port = args.port or serveur.PORT
+            etat = serveur.ensure(port)
+            # Sur stderr, jamais sur stdout : la sortie de watch est un CANAL MACHINE, une
+            # ligne par fait nouveau, que le surveillant de l'orchestratrice lit pour la
+            # reveiller. Y glisser une ligne de confort la reveillerait pour un fait qui
+            # n'en est pas un, au tout premier tour de chaque chantier.
+            print(f"map http://127.0.0.1:{port}/ ({etat})", file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001 - voir le commentaire ci-dessus
+            print(f"map unavailable: {exc}", file=sys.stderr, flush=True)
 
     vus: dict[str, dict] = {}
     questions_vues: set[str] = set()
@@ -1598,6 +1642,221 @@ def cmd_journal_show(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Carte
+# ---------------------------------------------------------------------------
+
+
+# Intervalle par defaut du rafraichissement de la carte, en secondes. Cinq secondes est
+# l'ordre de grandeur d'un tick : plus court ne montrerait rien de nouveau et ferait juste
+# clignoter la page sous les yeux de celui qui la lit.
+MAP_INTERVAL_S = 5
+
+
+def _map_path(args: argparse.Namespace) -> Path:
+    """Chemin absolu de la page. Absolu et pas relatif : --pane relance cette commande dans
+    un process tmux dont le repertoire courant n'est pas garanti etre le notre, et deux cwd
+    differents ecriraient deux fichiers differents en croyant en tenir un seul.
+    """
+    if getattr(args, "out", None):
+        return Path(args.out).expanduser().resolve()
+    dossier = store.home() / "map"
+    dossier.mkdir(exist_ok=True)
+    return dossier / f"{args.campaign}.html"
+
+
+def _map_write(campaign: str, chemin: Path, interval: int) -> dict:
+    """Recalcule le modele et reecrit la page. Rend le modele, pour l'affichage.
+
+    La vivacite des panes est lue en UN appel tmux pour toute la carte (panes.live_ids),
+    pas un par tache : cette fonction est rappelee en boucle par --watch.
+
+    tmux absent ou trop ancien ne fait pas echouer la carte : la vivacite devient inconnue
+    et la carte le dit, au lieu de refuser de dessiner un graphe qui n'a pourtant besoin
+    d'aucun serveur pour etre lu. _ensure_tmux_ready() LEVE dans ce cas, avant meme de
+    regarder le code de retour, d'ou ce filet ici plutot que dans live_ids(), dont tous les
+    autres appelants, eux, ont bel et bien besoin de tmux.
+
+    carte.py est importe ICI et pas en tete de fichier, pour la meme raison que controle.py
+    (voir le docstring du module) : un defaut dans le module de dessin ne doit pas rendre
+    inutilisable un CLI dont depend une orchestration en cours. Dessiner la carte est un
+    confort, lancer et reconcilier ne l'est pas.
+    """
+    from . import carte, usage
+
+    try:
+        vivants = panes.live_ids()
+        verificateur = lambda pane_id: pane_id in vivants  # noqa: E731
+    except RuntimeError:
+        verificateur = None
+    model = carte.model(campaign, alive=verificateur, usage_de=usage.pour)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    chemin.write_text(carte.html(model, interval=interval), encoding="utf-8")
+    return model
+
+
+def _map_open(chemin: Path) -> None:
+    """Ouvre la page dans le navigateur du systeme, sans jamais faire echouer la commande.
+
+    Un poste sans "open" ni "xdg-open" reste un poste ou la carte a bien ete ecrite ; le
+    chemin est deja affiche, l'ouverture n'est qu'un confort.
+    """
+    for lanceur in ("open", "xdg-open"):
+        if shutil.which(lanceur):
+            subprocess.run([lanceur, str(chemin)], capture_output=True)
+            return
+    print(f"note: neither open nor xdg-open found, open {chemin} by hand", file=sys.stderr)
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    """Ecrit la carte HTML du chantier, une fois ou en boucle.
+
+    LECTURE SEULE sur l'etat du chantier : cette commande n'ecrit que son propre fichier
+    HTML. Elle peut donc tourner en permanence a cote d'un chantier en cours sans jamais
+    consommer un motif de reveil ni prendre le verrou de state.json en ecriture.
+    """
+    interval = max(0, int(args.interval))
+    chemin = _map_path(args)
+
+    if args.pane:
+        state = store.load()
+        ch = state["chantiers"].get(args.campaign)
+        if ch is None:
+            raise CliError(f"campaign not found: {args.campaign}")
+        session = ch.get("tmuxSession")
+        if not session:
+            raise CliError(f"{args.campaign} has no tmux session yet")
+        # ORDO_HOME est repasse explicitement. tmux ne transmet PAS l'environnement du
+        # client a new-window : le process fils herite de l'environnement global du
+        # serveur tmux, fige au demarrage de celui-ci, plus celui de la session. Un
+        # serveur tmux plus vieux que le premier `ordo start` -- le cas normal des qu'un
+        # humain a deja ses propres sessions -- ferait donc resoudre ORDO_HOME vers
+        # ~/.claude/ordo, et la boucle mourrait sur "campaign not found" a la premiere
+        # iteration. Le pire est le silence : la page a deja ete ecrite ici, avec le bon
+        # ORDO_HOME, et rien a l'ecran ne dirait que la fenetre est morte. `env` en tete
+        # plutot que new-window -e, pour valoir aussi sur la branche respawn-window.
+        commande = shlex.join([
+            "env", f"ORDO_HOME={store.home()}",
+            str(Path(sys.argv[0]).resolve()), "map", args.campaign,
+            "--watch", "--interval", str(interval or MAP_INTERVAL_S),
+            "--out", str(chemin),
+        ])
+        window_id = panes.side_window(session, panes.MAP_WINDOW_NAME, commande)
+        model = _map_write(args.campaign, chemin, interval or MAP_INTERVAL_S)
+        if args.open:
+            _map_open(chemin)
+        if args.json:
+            _print_json({"path": str(chemin), "window": window_id, "session": session})
+            return 0
+        print(f"map        {chemin}")
+        print(f"window     {window_id} ({panes.MAP_WINDOW_NAME}) in session {session}")
+        print(f"refresh    every {interval or MAP_INTERVAL_S}s")
+        print(f"tasks      {model['counts']['total']}")
+        print(f"attach     {_attach_command(session)}")
+        return 0
+
+    if args.json and args.watch:
+        # Refus explicite plutot que --json ignore en silence (I8) : une boucle qui rend du
+        # texte humain la ou l'appelant attend du JSON casse son parseur sans un mot.
+        raise CliError("--json and --watch cannot be combined; use one or the other")
+
+    if args.json:
+        _print_json(_map_write(args.campaign, chemin, interval))
+        return 0
+
+    if not args.watch:
+        model = _map_write(args.campaign, chemin, interval)
+        if args.open:
+            _map_open(chemin)
+        counts = model["counts"]
+        resume = "  ".join(
+            f"{etat} {n}" for etat, n in sorted(counts.items()) if etat != "total"
+        )
+        print(f"{chemin}")
+        print(f"{counts['total']} tasks   {resume}")
+        for w in model["warnings"]:
+            print(f"warning    {w['detail']}")
+        return 0
+
+    if interval == 0:
+        raise CliError("--watch needs a non-zero --interval")
+    if args.open:
+        _map_write(args.campaign, chemin, interval)
+        _map_open(chemin)
+    passe = 0
+    while True:
+        model = _map_write(args.campaign, chemin, interval)
+        counts = model["counts"]
+        print(
+            f"{store.now()}  {chemin}  {counts.get('done', 0)}/{counts['total']} done  "
+            f"{counts.get('running', 0)} running  {len(model['warnings'])} warnings",
+            flush=True,
+        )
+        passe += 1
+        if args.passes and passe >= args.passes:
+            return 0
+        time.sleep(interval)
+
+
+def cmd_group(args: argparse.Namespace) -> int:
+    ch = chantier.set_group(args.campaign, args.key, args.label, why=args.why or "")
+    if args.json:
+        _print_json({"campaign": ch["id"], "groups": ch.get("groupes", {})})
+        return 0
+    print(f"{ch['id']}  phase {args.key} named {args.label!r}")
+    pose = (ch.get("groupes") or {}).get(args.key) or {}
+    raison = pose.get("why") if isinstance(pose, dict) else ""
+    if raison:
+        print(f"           why: {raison}")
+    else:
+        # Le libelle seul ne dit toujours pas a quoi la phase sert : le taire ferait croire
+        # que le decoupage est explique alors qu'il ne l'est pas.
+        print("           no why yet: rerun with --why to say what this phase serves")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Demarre, arrete ou interroge le serveur de cartes local.
+
+    serveur.py est importe ICI, pas en tete de fichier, pour la meme raison que carte.py et
+    controle.py : un defaut dans le tableau de bord ne doit pas rendre inutilisable le CLI
+    dont depend une orchestration en cours.
+    """
+    from . import serveur
+
+    args.port = args.port or serveur.PORT
+    if args.stop:
+        arrete = serveur.stop(args.port)
+        print(f"server on {args.port}: " + ("stopped" if arrete else "was not running"))
+        return 0
+    if args.foreground:
+        serveur.register(store.home())
+        serveur.serve(args.port)
+        return 0
+
+    etat = serveur.ensure(args.port)
+    url = f"http://127.0.0.1:{args.port}/"
+    if args.json:
+        _print_json({"port": args.port, "url": url, "state": etat,
+                     "homes": serveur.homes()})
+        return 0
+    print(f"server     {url}  ({etat})")
+    for home in serveur.homes():
+        print(f"home       {home}")
+    if args.open:
+        _map_open(url)
+    return 0
+
+
+def cmd_why(args: argparse.Namespace) -> int:
+    t = chantier.explain(args.task, args.why)
+    if args.json:
+        _print_json({"id": t["id"], "why": t["why"]})
+        return 0
+    print(f"{t['id']}  why: {t['why']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Construction du parseur
 # ---------------------------------------------------------------------------
 
@@ -1697,6 +1956,11 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p.add_argument("--depends", action="append", metavar="TASK")
     p.add_argument("--touches", action="append", metavar="ZONE")
     p.add_argument("--check", action="append", metavar="LABEL")
+    p.add_argument(
+        "--why",
+        default="",
+        help="why this task exists and why here in the split, not what it does",
+    )
     p.set_defaults(func=cmd_add)
 
     p = verbs.add_parser("dep", parents=[json_parent], help="add a dependency")
@@ -1707,6 +1971,60 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p = verbs.add_parser("graph", parents=[json_parent], help="render the task graph")
     p.add_argument("campaign")
     p.set_defaults(func=cmd_graph)
+
+    p = verbs.add_parser(
+        "map",
+        parents=[json_parent],
+        help="write a standalone HTML map of the graph (read only)",
+    )
+    p.add_argument("campaign")
+    p.add_argument("--out", default=None, help="target file, default ORDO_HOME/map/<campaign>.html")
+    p.add_argument(
+        "--interval",
+        type=int,
+        default=MAP_INTERVAL_S,
+        help=f"seconds between refreshes, 0 for a static page (default {MAP_INTERVAL_S})",
+    )
+    p.add_argument("--watch", action="store_true", help="rewrite the page in a loop")
+    p.add_argument(
+        "--pane",
+        action="store_true",
+        help="run the loop in a dedicated tmux window of the campaign session",
+    )
+    p.add_argument("--open", action="store_true", help="open the page in the browser")
+    p.add_argument("--passes", type=int, default=0, help="stop after N refreshes (tests)")
+    p.set_defaults(func=cmd_map)
+
+    p = verbs.add_parser("group", parents=[json_parent], help="name a phase of the graph")
+    p.add_argument("campaign")
+    p.add_argument("key", help='phase prefix read from task titles, e.g. "0"')
+    p.add_argument("label", help="the phase's name, in plain words")
+    p.add_argument(
+        "--why",
+        default="",
+        help="what this phase serves and why it comes here; kept if omitted on a rename",
+    )
+    p.set_defaults(func=cmd_group)
+
+    p = verbs.add_parser(
+        "serve", parents=[json_parent], help="local map server for every live campaign"
+    )
+    p.add_argument("--port", type=int, default=None, help="default 9123")
+    p.add_argument("--stop", action="store_true", help="stop whatever listens on the port")
+    p.add_argument(
+        "--foreground",
+        action="store_true",
+        help="run the loop here instead of detaching it (used by the auto-start)",
+    )
+    p.add_argument("--open", action="store_true", help="open the page in the browser")
+    p.set_defaults(func=cmd_serve)
+
+    p = verbs.add_parser(
+        "why", parents=[json_parent], help="say why a task exists, after the fact"
+    )
+    p.add_argument("task")
+    p.add_argument("why", help="why this task exists and why here, not what it does")
+    p.set_defaults(func=cmd_why)
 
     p = verbs.add_parser("ready", parents=[json_parent], help="tasks launchable now")
     p.add_argument("campaign")
@@ -1822,6 +2140,12 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
         default=0,
         help="stop after N scans; 0 (default) watches until nothing is alive",
     )
+    p.add_argument(
+        "--no-serve",
+        action="store_true",
+        help="do not start the local map server (it starts by default with the watch)",
+    )
+    p.add_argument("--port", type=int, default=None, help="map server port, default 9123")
     p.set_defaults(func=cmd_watch)
 
     p = verbs.add_parser(

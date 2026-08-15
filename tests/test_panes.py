@@ -1219,5 +1219,133 @@ class TmuxAvailabilityTests(unittest.TestCase):
         self.assertTrue(panes._tmux_verified)
 
 
+class LiveIdsTests(PanesTestCase):
+    def test_lists_a_live_pane_and_not_a_killed_one(self):
+        _, window = panes.ensure_session(self.session)
+        pane = panes.spawn(window, HOME, TEST_SHELL)
+        self.assertIn(pane, panes.live_ids())
+        panes.kill(pane)
+        self.assertNotIn(pane, panes.live_ids())
+
+    def test_agrees_with_alive_on_every_pane_it_reports(self):
+        # Deux verites sur la meme question rendraient la carte incoherente avec le reste
+        # du CLI, et le desaccord ne se verrait nulle part.
+        _, window = panes.ensure_session(self.session)
+        pane = panes.spawn(window, HOME, TEST_SHELL)
+        for pane_id in panes.live_ids():
+            self.assertTrue(panes.alive(pane_id), pane_id)
+        self.assertTrue(panes.alive(pane))
+
+
+class SideWindowTests(PanesTestCase):
+    def _windows(self) -> list[tuple[int, str, str]]:
+        out = subprocess.run(
+            ["tmux", "list-windows", "-t", f"={self.session}", "-F",
+             "#{window_index}\t#{window_id}\t#{window_name}"],
+            capture_output=True, text=True,
+        ).stdout
+        rows = []
+        for line in out.splitlines():
+            index, window_id, name = line.split("\t")
+            rows.append((int(index), window_id, name))
+        return rows
+
+    def test_creates_a_named_window_without_touching_the_existing_one(self):
+        _, window = panes.ensure_session(self.session)
+        pane = panes.spawn(window, HOME, TEST_SHELL)
+        avant = panes.panes(window)
+
+        created = panes.side_window(self.session, "ordo-map", "sleep 30")
+
+        self.assertNotEqual(created, window)
+        self.assertIn("ordo-map", [n for _, _, n in self._windows()])
+        # Ce qui compte vraiment : la fenetre des exécutantes n'a ni gagne, ni perdu, ni
+        # vu redimensionner une seule pane. Un split-window aurait casse les trois.
+        apres = panes.panes(window)
+        self.assertEqual(
+            [(p["pane_id"], p["largeur"], p["hauteur"]) for p in avant],
+            [(p["pane_id"], p["largeur"], p["hauteur"]) for p in apres],
+        )
+        self.assertTrue(panes.alive(pane))
+
+    def test_never_takes_an_index_before_the_executor_window(self):
+        # Le defaut que ce controle existe pour attraper : tmux pose une fenetre au premier
+        # index LIBRE. base-index est force a 0 ICI, sur cette session seulement, parce que
+        # c'est la configuration ou le defaut se produit, et que la machine qui fait tourner
+        # la suite peut parfaitement etre a 1, auquel cas le test ne prouverait rien --
+        # verifie : sans cette ligne, le controle de mutation le declare decor.
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", self.session, "-x", "80", "-y", "24"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "set-option", "-t", f"={self.session}", "base-index", "0"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "move-window", "-s", f"={self.session}:", "-t", f"={self.session}:1"],
+            capture_output=True,
+        )
+        executante = self._windows()[0][1]
+        self.assertEqual(self._windows()[0][0], 1, "la fenetre temoin doit etre a l'index 1")
+
+        panes.side_window(self.session, "ordo-map", "sleep 30")
+
+        indices = [i for i, _, _ in self._windows()]
+        self.assertEqual(min(indices), 1, indices)
+        self.assertEqual(self._windows()[0][1], executante)
+        self.assertEqual(panes._window_id_of(self.session), executante)
+
+    def test_a_second_call_respawns_instead_of_stacking_windows(self):
+        panes.ensure_session(self.session)
+        premier = panes.side_window(self.session, "ordo-map", "sleep 30")
+        second = panes.side_window(self.session, "ordo-map", "sleep 30")
+        self.assertEqual(premier, second)
+        noms = [n for _, _, n in self._windows()]
+        self.assertEqual(noms.count("ordo-map"), 1)
+
+    def test_refuses_a_session_that_does_not_exist(self):
+        with self.assertRaises(RuntimeError):
+            panes.side_window(self.session, "ordo-map", "sleep 30")
+
+    def test_a_service_window_is_never_taken_for_the_campaign_window(self):
+        # Le defaut: moissonner la derniere executante fait disparaitre la fenetre de
+        # travail. Sans fenetre de service, la session mourait avec elle et le prochain
+        # ensure_session() en recreait une propre. Avec la carte ouverte, la session
+        # survit, et rendre SA fenetre comme fenetre du chantier y ferait naitre
+        # l'executante suivante, a cote du rafraichisseur de la carte.
+        _, travail = panes.ensure_session(self.session)
+        panes.side_window(self.session, panes.MAP_WINDOW_NAME, "sleep 30")
+        self.assertEqual(panes._window_id_of(self.session), travail)
+
+        subprocess.run(["tmux", "kill-window", "-t", travail], capture_output=True)
+        noms = [n for _, _, n in self._windows()]
+        self.assertEqual(noms, [panes.MAP_WINDOW_NAME])
+
+        _, apres = panes.ensure_session(self.session)
+        self.assertNotEqual(apres, travail)
+        self.assertIn(apres, [w for _, w, _ in self._windows()])
+        carte_id = [w for _, w, n in self._windows() if n == panes.MAP_WINDOW_NAME]
+        self.assertEqual(len(carte_id), 1)
+        self.assertNotEqual(apres, carte_id[0])
+
+    def test_launching_targets_the_window_not_the_session_current_window(self):
+        # Point B, rendu atteignable par la fenetre de service : `-t <session>` vise la
+        # fenetre COURANTE. Un humain qui bascule sur la carte ferait naitre l'executante
+        # suivante dedans. spawn() doit recevoir le window_id, pas le nom de session.
+        _, travail = panes.ensure_session(self.session)
+        panes.spawn(travail, HOME, TEST_SHELL)
+        carte_id = panes.side_window(self.session, panes.MAP_WINDOW_NAME, "sleep 30")
+        subprocess.run(
+            ["tmux", "select-window", "-t", carte_id], capture_output=True
+        )
+
+        nouveau = panes.spawn(travail, HOME, TEST_SHELL)
+
+        self.assertIn(nouveau, [p["pane_id"] for p in panes.panes(travail)])
+        self.assertNotIn(nouveau, [p["pane_id"] for p in panes.panes(carte_id)])
+        self.assertEqual(len(panes.panes(carte_id)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

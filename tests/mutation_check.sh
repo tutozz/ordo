@@ -409,6 +409,136 @@ run_case "I13" "briefs et rapports ranges par chantier, jamais a plat" \
     "$LIB_DIR/report.py" "$S" "$R"
 
 # ---------------------------------------------------------------------------
+# CARTE1 -- la carte n'invente jamais un pane mort. Mutation : sans verificateur
+# fourni, la vivacite est devinee "morte" au lieu de rester inconnue. Le graphe
+# affiche alors des incidents qui n'ont jamais ete mesures.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sc1"; R="$WORKDIR/rc1"
+cat >"$S" <<'ORDO_EOF'
+            "paneAlive": None if (alive is None or not pane_id) else bool(alive(pane_id)),
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+            "paneAlive": False if (alive is None or not pane_id) else bool(alive(pane_id)),
+ORDO_EOF
+run_case "CARTE1" "la carte n'invente jamais un pane mort" \
+    "tests.test_carte.TestNoeud.test_la_vivacite_du_pane_est_injectee_jamais_devinee" \
+    "$LIB_DIR/carte.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# CARTE2 -- aucune donnee de l'etat ne peut fermer le script qui la porte.
+# Mutation : le JSON part sans encoder "<". Un prompt de tache est du texte qu'un
+# modele a ecrit ; qu'il contienne "</script>" n'a rien d'improbable, et il suffit
+# a fermer la balise, casser la page, et faire interpreter la suite comme du balisage.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sc2"; R="$WORKDIR/rc2"
+cat >"$S" <<'ORDO_EOF'
+    return brut.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    return brut
+ORDO_EOF
+run_case "CARTE2" "aucune donnee ne peut fermer le script qui la porte" \
+    "tests.test_carte.TestPageDeRendu.test_aucune_donnee_ne_peut_fermer_le_script_qui_la_porte" \
+    "$LIB_DIR/carte.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# CARTE3 -- une fenetre de service ne passe jamais devant celle des exécutantes.
+# Mutation : un index plausible mais pose en tete. _window_id_of() rend alors la
+# fenetre de la carte, et l'executante suivante y est splittee.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sc3"; R="$WORKDIR/rc3"
+cat >"$S" <<'ORDO_EOF'
+    cible = (max(indices) + 1) if indices else 1
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    cible = 0
+ORDO_EOF
+run_case "CARTE3" "la fenetre de carte ne passe jamais devant les exécutantes" \
+    "tests.test_panes.SideWindowTests.test_never_takes_an_index_before_the_executor_window" \
+    "$LIB_DIR/panes.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# CARTE4 -- un pourquoi absent est signale, jamais comble. Mutation : le titre
+# fait office d'explication. Un decoupage muet passerait alors pour explique, ce
+# qui est pire que muet : plus personne ne verrait qu'il manque quelque chose.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sc4"; R="$WORKDIR/rc4"
+cat >"$S" <<'ORDO_EOF'
+            "why": t.get("why") or "",
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+            "why": t.get("why") or t["titre"],
+ORDO_EOF
+run_case "CARTE4" "un pourquoi absent est signale, jamais comble" \
+    "tests.test_carte.TestPourquoi.test_une_tache_sans_pourquoi_le_dit_au_lieu_de_faire_semblant" \
+    "$LIB_DIR/carte.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# CARTE5 -- corriger le libelle d'une phase n'efface pas son explication.
+# Mutation : why ecrase systematiquement. La seule chose que personne ne
+# reecrira disparaitrait au moment ou on croit corriger une faute de frappe.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sc5"; R="$WORKDIR/rc5"
+cat >"$S" <<'ORDO_EOF'
+        groupes[key] = {"label": label, "why": why or ancien_why}
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+        groupes[key] = {"label": label, "why": why}
+ORDO_EOF
+run_case "CARTE5" "renommer une phase n'efface pas son explication" \
+    "tests.test_carte.TestGroupes.test_renommer_une_phase_sans_pourquoi_ne_l_efface_pas" \
+    "$LIB_DIR/chantier.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# SERV1 -- un port ouvert ne suffit pas a conclure qu'Ordo tourne. Mutation : la
+# reponse n'est plus lue, seule la connexion compte. Un port pris par un autre
+# programme ferait alors renoncer a demarrer le serveur, et la page ne s'ouvrirait
+# jamais sans que rien ne dise pourquoi.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/ss1"; R="$WORKDIR/rs1"
+cat >"$S" <<'ORDO_EOF'
+            return json.loads(reponse.read()).get("service") == SIGNATURE
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+            return reponse is not None
+ORDO_EOF
+run_case "SERV1" "un port occupe n'est pas pris pour le serveur d'Ordo" \
+    "tests.test_serveur.TestVivacite.test_un_port_pris_par_autre_chose_n_est_pas_pris_pour_ordo" \
+    "$LIB_DIR/serveur.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# SERV2 -- le parametre home est confronte au registre. Mutation : il est cru sur
+# parole, et n'importe quel state.json de la machine devient lisible par qui sait
+# former une URL, y compris depuis une page ouverte dans le navigateur.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/ss2"; R="$WORKDIR/rs2"
+cat >"$S" <<'ORDO_EOF'
+    if store.canon(home) not in homes():
+        raise PermissionError(f"home not registered: {home}")
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    pass
+ORDO_EOF
+run_case "SERV2" "un ORDO_HOME hors registre ne se lit pas par URL" \
+    "tests.test_serveur.TestServeurVivant.test_un_home_hors_registre_est_refuse" \
+    "$LIB_DIR/serveur.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# SERV3 -- l'en-tete Host est controle. Mutation : il est accepte tel quel, et le
+# rebinding DNS rouvre la porte : un site visite dans le navigateur fait resoudre
+# son propre nom vers 127.0.0.1 et lit l'etat des chantiers.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/ss3"; R="$WORKDIR/rs3"
+cat >"$S" <<'ORDO_EOF'
+        return hote in ("127.0.0.1", "localhost", "::1")
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+        return True
+ORDO_EOF
+run_case "SERV3" "un en-tete Host etranger est refuse" \
+    "tests.test_serveur.TestServeurVivant.test_un_en_tete_host_etranger_est_refuse" \
+    "$LIB_DIR/serveur.py" "$S" "$R"
+
 # ---------------------------------------------------------------------------
 # USAGE1 -- un transcript introuvable se dit inconnu, jamais zero. Mutation : on
 # rend des compteurs a zero. Une executante qui tourne depuis vingt minutes

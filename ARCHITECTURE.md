@@ -21,7 +21,9 @@ directory per project.
 | `capteur.py` | the sensor contract: install, bounded run (hard timeout, 256 KiB output cap), filtered status, adoption (3 concordant runs plus an explicit human call) | serve any measurement before adoption (I12); fill a missing output key with a default instead of raising (I10); invoke the script through a shell instead of respecting its own shebang |
 | `controle.py` | the reconciliation loop: `scope_drift`, `fausse_completion`, `wake_reasons`/`wake_new`, `tick()` | let an exception raised while reconciling one campaign stop `tick()` for the others - each campaign is wrapped in its own try/except |
 | `journal.py` | the per-campaign journal file, three authors only, the regenerated `brief()` | accept a fourth author (I11: `write()` raises on anything outside `ORDO`/`ORCH`/`USER`) |
+| `carte.py` | the read-only picture of a campaign: dependency levels, phases read from title prefixes, blocking reasons, warnings, plus `vue()` (the flat shape the page consumes) and `html()` (a self-contained page carrying that shape as JSON) | write anything, to `state.json` or elsewhere (`cmd_map` owns the file write, this module only returns strings); talk to tmux - pane liveness is injected through `alive`, so a map can be drawn with no tmux server at all; invent a missing `why` - what nobody explained is reported as unexplained, never filled in; compute layout - positions do not exist before the browser reflows the rows, so Python serves data and the page places it; concatenate campaign content into markup - it travels as JSON and reaches the DOM only through textContent |
 | `usage.py` | tokens an executor actually spent, summed from its own Claude Code transcript (`~/.claude/projects/*/<claudeSessionId>.jsonl`), read incrementally | report zero for a transcript it cannot find - absent is absent, and a `running` task showing 0 tokens is a false measurement; re-read a multi-megabyte transcript from the start on every poll; derive the transcript's directory name from the project path - that encoding is not ours, the session id is unique, so it searches |
+| `serveur.py` | the single local map server on port 9123: the registry of known `ORDO_HOME`s, liveness by signature, detached start, and the read-only HTTP routes (`/`, `/api/state`, `/api/map`, `/health`) | write anything - there is no POST and no route mutates state; listen anywhere but `127.0.0.1`; trust the `home` query parameter (it is checked against the registry) or the `Host` header (checked against loopback names, which is what closes DNS rebinding); let its own failure break the watch that started it |
 | `prompt.py` | executor brief composition (`brief_executante`), the orchestrator role-contract text (`contrat_role`) | import `report.py` or `capteur.py` - the report path is derived directly from `store.home()`, not from `report.py`'s own logic |
 | `cli.py` | argparse dispatch, `--json` on every read verb (I12), the question registry (`state["questions"]`), task-to-campaign resolution | carry business rules that belong to another module - by its own docstring, this file has none of its own |
 
@@ -40,8 +42,10 @@ Verified from the actual `from . import ...` lines, not assumed:
 | `journal.py` | `chantier`, `store` |
 | `prompt.py` | `chantier`, `store` |
 | `usage.py` | none - stdlib only |
+| `carte.py` | `chantier`, `journal`, `store`, `usage` |
+| `serveur.py` | `carte`, `chantier`, `panes`, `store`, `usage` |
 | `controle.py` | `capteur`, `chantier`, `journal`, `panes`, `plan`, `report`, `store` |
-| `cli.py` | `capteur`, `chantier`, `journal`, `panes`, `plan`, `prompt`, `report`, `store`, plus `controle` imported lazily inside `cmd_tick` only, so the rest of the CLI keeps working if `controle.py` is broken or absent |
+| `cli.py` | `capteur`, `chantier`, `journal`, `panes`, `plan`, `prompt`, `report`, `store`, plus `controle`, `carte` and `serveur` imported lazily, inside `cmd_tick`, `_map_write` and `cmd_serve`/`cmd_watch` only, so the rest of the CLI keeps working if any of them is broken or absent |
 
 `store.py` is the only module that knows the on-disk format of `state.json`; every mutation
 in every other module goes through `store.locked()` or `store.load()`/`store.save()`.
@@ -59,7 +63,14 @@ ORDO_HOME/
   journal/<campaign>.md             # one journal file per campaign
   sensors/<campaign>.*              # the sensor script, outside the audited repo
   archives/<campaign>/              # a closed campaign's briefs, reports, journal, sensor
+  map/<campaign>.html               # the map page, rewritten by `ordo map`, never read back
 ```
+
+One file lives outside every `ORDO_HOME`, and has to: `~/.claude/ordo-serve.json`, the
+registry of homes the map server knows about. A registry kept inside a home would be
+invisible to the others, and navigating between campaigns of different projects is the
+whole point of the server. `ORDO_REGISTRY` overrides its path; `ORDO_NO_SERVE` stops the
+server from ever being started, which is what the test suite sets.
 
 Briefs and reports are scoped by campaign (I13), never flat: `reports/<campaign>/<task>.json`,
 not `reports/<task>.json`. Task ids are unique within one `ORDO_HOME`, but a home shared

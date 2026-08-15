@@ -7,6 +7,19 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- `ordo digest <campaign>` prints where a campaign stands in a form a human can read cold:
+  the live phase and its progress, every live task with its title and its `why`, what is
+  waiting on the human, what is launchable next. It never emits a task id without its title
+  on the same line, which is exactly what an orchestrator can no longer guarantee once its
+  own context has been compacted; a live task with no `why` prints the command that repairs
+  it rather than a plausible sentence. Questions not marked for the human are excluded:
+  those belong to the orchestrator. Read-only, no tmux round trip, `--json` like every other
+  read verb.
+- SKILL.md gains "Writing to a human who has been away": the opening three-line block
+  (position, objet, what needs the human), the ban on naked identifiers across all four
+  namespaces a campaign mixes, the one-line heartbeat that must carry a title and say what
+  changed, the four beats of a task closure, the five beats of an arbitration - the fifth
+  being whether the human can still overturn it - and the re-entry test before sending.
 - `ordo map <campaign>` writes a self-contained HTML page of the campaign: one band per
   phase, every phase on screen at once, tiles ordered by dependency depth inside each band.
   Clicking a task opens its prompt, checklist, blocking dependencies, report and the

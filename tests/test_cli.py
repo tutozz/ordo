@@ -197,6 +197,32 @@ class TestChantierVerbs(CliTestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("c-99", err)
 
+    def test_digest_texte_accompagne_chaque_identifiant_de_son_titre(self):
+        cid = self._chantier()
+        tid = self._tache(cid, titre="4.3 pipeline", why="la colonne Preselectionnes")
+        with store.locked() as state:
+            state["taches"][tid]["state"] = "running"
+        code, out, err = self._run(["digest", cid])
+        self.assertEqual(code, 0, msg=err)
+        self.assertIn("4.3 pipeline", out)
+        self.assertIn("la colonne Preselectionnes", out)
+        # Le contrat du verbe : l'humain lit le bloc sans rien aller chercher ailleurs.
+        for ligne in out.splitlines():
+            if tid in ligne:
+                self.assertIn("4.3 pipeline", ligne)
+
+    def test_digest_json(self):
+        cid = self._chantier()
+        self._tache(cid, titre="4.3 pipeline", why="la colonne Preselectionnes")
+        data = self._run_json(["digest", cid, "--json"])
+        self.assertEqual(data["campaign"]["id"], cid)
+        self.assertEqual([n["titre"] for n in data["next"]], ["4.3 pipeline"])
+
+    def test_digest_chantier_absent_refuse(self):
+        code, out, err = self._run(["digest", "c-99"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("c-99", err)
+
     def test_close_refuse_avec_tache_running(self):
         cid = self._chantier()
         tid = self._tache(cid)
@@ -1567,6 +1593,9 @@ class TestJsonValideSurLesVerbesDeLecture(BinOrdoTestCase):
 
     def test_graph(self):
         self._assert_json("graph", self.chantier, "--json")
+
+    def test_digest(self):
+        self._assert_json("digest", self.chantier, "--json")
 
     def test_ready(self):
         self._assert_json("ready", self.chantier, "--json")

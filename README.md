@@ -106,6 +106,7 @@ ordo launch t-01         # creates the pane, starts claude, injects the brief
 ordo attach c-01         # prints the exact command to watch it work
 ordo watch c-01          # read-only event stream, one line per new fact
 ordo tick                # reconcile: reports, dependencies, drift, wake-ups
+ordo digest c-01         # where it stands, in words, with every id spelled out
 ordo map c-01 --open     # the graph as a page you can look at
 ```
 
@@ -156,9 +157,27 @@ signal counts for anything.
 
 ## Seeing the split
 
-A transcript full of task ids tells you nothing about the shape of a campaign. `ordo map`
-writes one self-contained HTML file, no server and no third-party asset, and never
-touches the state:
+A transcript full of task ids tells you nothing about the shape of a campaign. Two commands
+answer that, one for the page and one for the words.
+
+`ordo digest c-01` prints where the campaign stands in a form a human can read cold: the
+live phase and its progress, every running task **with its title and what it is for**, what
+is waiting on you, and what can start next. It never emits a task id without its title,
+which is precisely what an orchestrator can no longer guarantee once its own context has
+been compacted; the orchestrator is told to read it before writing to you rather than
+recalling the position from memory.
+
+```
+c-01  camcast  ·  2/5 tasks done
+phase   : 4 « Écrans » — 2/4 done
+running : t-04 « 4.3 pipeline et présélection »  5h38  checks 1/3
+            why: la colonne Présélectionnés, et la dette B8
+for you : q-01 on t-04 « 4.3 pipeline et présélection » — quel libellé pour la pastille ?
+next    : nothing launchable right now
+```
+
+`ordo map` writes one self-contained HTML file, no server and no third-party asset, and
+never touches the state:
 
 ```bash
 ordo serve --open               # one page for every campaign, at a fixed address

@@ -116,6 +116,7 @@ Do it while you are cutting, not afterwards: nobody ever comes back to explain a
 ordo ready <campaign>      # what can start right now
 ordo launch <task>         # creates the pane, starts claude, injects the brief
 ordo watch <campaign>      # read-only event stream; arm it under Monitor, see below
+ordo digest <campaign>     # where the campaign stands, in words; read it before you write
 ordo map <campaign>        # the graph as an HTML page for the human, read-only
 ordo attach <campaign>     # the exact command for a human to watch
 ordo poll --json           # state of every live executor
@@ -165,6 +166,11 @@ that is the one thing nobody can reconstruct afterwards.** A human who reads "0.
 stable role identifiers" with no `--why` learns nothing they did not already know. The map
 counts the tasks you left unexplained and shows the count in its header; treat that count as
 a defect, not as a style preference.
+
+`--why` is also the **Objet** line of every message you write to the human, see "Writing to
+a human who has been away" below. A task launched without one leaves you nothing to say
+about what it is for, and `ordo digest` prints the repair command instead of the objet.
+
 **3. Give them the page.**
 
 ```bash
@@ -183,6 +189,91 @@ the page open and stop asking you where things stand.
 that puts a task in a phase. A title without it lands in a "hors phase" bucket at the bottom
 of the page, and there is no verb to rename a task afterwards, so a missing prefix is
 permanent.
+
+---
+
+## Writing to a human who has been away, which is where campaigns become unreadable
+
+The map shows the graph. The **transcript** is what the human actually reads, and it is
+where they lose the thread. Not because you write badly: because you write from inside your
+own context. `t-33`, `q-03`, `D98`, `B8`, `§4.3` resolve instantly for you. For a human
+coming back from a meeting they resolve to nothing, and a message that cost you a paragraph
+carries zero.
+
+It degrades rather than improving. Once your context is compacted **you** lose the titles
+too, and you keep citing the identifiers, so the message becomes illegible to everyone and
+nothing signals it.
+
+**Never rebuild the position from memory. Compute it.**
+
+```bash
+ordo digest <campaign>
+```
+
+It prints, from the state: the live phase and its progress, every live task with its title
+and its `why`, what is waiting on the human, and what is launchable next. It never emits a
+task id without its title, which is exactly what you cannot guarantee from memory. Translate
+its labels into the human's language; do not touch its content.
+
+**1. Open every message with three lines.** In this order, always.
+
+```
+Phase 4 Écrans, 3 tâches sur 8 · t-33 « 4.3 Pipeline et présélection »
+Objet : la colonne Présélectionnés, plus la dette B8 (sélection par cases perdue
+        au rechargement)
+Pour toi : rien
+```
+
+Where we stand · what the live task is for · what needs the human. **`Pour toi : rien` is
+written, never omitted**: an absent line reads as an oversight, not as an all-clear.
+
+**2. No naked identifier, ever.** Four namespaces get mixed into one message, and only one
+of them is Ordo's.
+
+| what | naked, unreadable | expanded, once per message |
+|---|---|---|
+| an Ordo task | `t-33` | `t-33 « 4.3 Pipeline et présélection »` |
+| a project decision | `D98` | `D98 (le bouton « Demander les livrables », désactivé faute de route)` |
+| a debt or a risk | `B8` | `B8 (la sélection par cases perdue au rechargement)` |
+| a spec reference | `§4.3` | `§4.3 de 15-API.md (le contrat de dépôt)` |
+
+`ordo digest` covers the Ordo namespace for you. The other three are the project's, and only
+you can expand them: expand each at its **first** mention in a message, then use the short
+form for the rest of that message.
+
+**3. A heartbeat is one line and it carries the title.** "t-25 travaille, tour de 15 min" is
+the message that ruins a transcript: no information, and ten of them push the one useful
+message off the screen. If you send one:
+
+- one line, never two;
+- it names the task **with its title**;
+- it says what changed since the last one, or you do not send it.
+
+Two heartbeats in a row with the same content is a defect, not a pulse. When nothing
+changed, say nothing: the human has the page.
+
+**4. A task closes in four beats, in this order.**
+
+1. one sentence a stranger understands: what the task was for, in the project's words, no
+   identifiers at all;
+2. what actually changed;
+3. the level of proof, and what is not verified;
+4. what it opens: the next task, its title, and why it comes now.
+
+**5. An arbitration is five beats, and you always skip the fifth.**
+
+1. the question, one sentence, in plain words;
+2. what you chose;
+3. what you rejected, and why;
+4. what it costs;
+5. **whether the human can still overturn it, and until when.**
+
+The fifth is the one that matters. A decision reported without it reads as frozen, and the
+human stops arguing with calls they could still change.
+
+**6. The re-entry test, before you send.** Read your own message as someone who has read
+nothing for two hours. Can they tell where the campaign stands, what is running, and whether
+they must act? If not, the opening block is missing. Add it; it costs three lines.
 
 ---
 

@@ -46,8 +46,9 @@ for each invariant it applies one exact, unique textual mutation to the file tha
 it, runs that invariant's test, and requires the test to go red. It does the same for
 three prohibitions written into every executor's brief (no `AskUserQuestion`, no
 self-validation, nothing irreversible without asking), and for the map's own five
-properties (`CARTE1`..`CARTE5`), the server's three (`SERV1`..`SERV3`) and the token
-reader's two (`USAGE1`, `USAGE2`). 26 cases in total, currently.
+properties (`CARTE1`..`CARTE5`), the server's three (`SERV1`..`SERV3`), the token
+reader's two (`USAGE1`, `USAGE2`) and the digest's two (`DIG1`, `DIG2`). 28 cases in
+total, currently.
 
 When you add a behaviour worth protecting:
 

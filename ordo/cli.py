@@ -47,6 +47,7 @@ from . import (
     plan,
     prompt,
     report,
+    situation,
     store,
 )
 
@@ -585,6 +586,22 @@ def cmd_close(args: argparse.Namespace) -> int:
         print(f"  archived: {', '.join(archives)}")
     else:
         print("  nothing archived")
+    return 0
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """Remise en contexte d'un chantier, destinee a etre recopiee dans un message humain.
+
+    Verbe de lecture pure. Son interet n'est pas d'ajouter de l'information mais d'en
+    interdire l'omission : situation.render() ne sort jamais un identifiant de tache sans
+    son titre, ce qu'une orchestratrice dont le contexte a ete compacte ne peut plus
+    garantir de memoire.
+    """
+    m = situation.model(args.campaign)
+    if args.json:
+        _print_json(m)
+        return 0
+    print(situation.render(m))
     return 0
 
 
@@ -1943,6 +1960,14 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p.add_argument("campaign")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_close)
+
+    p = verbs.add_parser(
+        "digest",
+        parents=[json_parent],
+        help="where the campaign stands, in words a human can read cold",
+    )
+    p.add_argument("campaign")
+    p.set_defaults(func=cmd_digest)
 
     p = verbs.add_parser("brief", parents=[json_parent], help="regenerated campaign brief")
     p.add_argument("campaign")

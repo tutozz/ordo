@@ -578,6 +578,39 @@ run_case "USAGE2" "un transcript remplace est relu en entier" \
     "tests.test_usage.TestLectureIncrementale.test_un_fichier_qui_retrecit_est_relu_en_entier" \
     "$LIB_DIR/usage.py" "$S" "$R"
 
+# ---------------------------------------------------------------------------
+# DIGEST1 -- un identifiant de tache ne sort jamais sans son titre. Mutation :
+# le titre disparait du rendu. L'humain relit alors "t-33" sans savoir de quoi
+# il s'agit, ce qui est exactement le defaut que le module existe pour fermer.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sd1"; R="$WORKDIR/rd1"
+cat >"$S" <<'ORDO_EOF'
+    return f"{identifiant} « {titre or 'no title'} »"
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    return f"{identifiant}"
+ORDO_EOF
+run_case "DIG1" "un identifiant de tache ne sort jamais sans son titre" \
+    "tests.test_situation.RenderTest.test_render_ne_cite_aucun_identifiant_nu" \
+    "$LIB_DIR/situation.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# DIGEST2 -- une question de l'orchestratrice ne sonne pas chez l'humain.
+# Mutation : le filtre pourHumain saute. Le digest reclame alors une decision
+# a l'humain pour une question qui appartenait a l'orchestratrice, et une
+# fausse alerte coute plus cher qu'un silence.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sd2"; R="$WORKDIR/rd2"
+cat >"$S" <<'ORDO_EOF'
+        if q["chantier"] != chantier_id or not q.get("pourHumain"):
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+        if q["chantier"] != chantier_id:
+ORDO_EOF
+run_case "DIG2" "une question de l'orchestratrice ne sonne pas chez l'humain" \
+    "tests.test_situation.ForHumanTest.test_question_pour_l_orchestratrice_n_atteint_pas_l_humain" \
+    "$LIB_DIR/situation.py" "$S" "$R"
+
 echo ""
 echo "Interdits du brief d'executante (SPEC.md section 5, ordo/prompt.py) :"
 echo ""

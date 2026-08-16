@@ -1588,6 +1588,21 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 
 def cmd_answer(args: argparse.Namespace) -> int:
+    """Enregistre la réponse ET la pousse dans le pane de l'exécutante qui a demandé,
+    comme le ferait un ordo say (voir panes.send, chemin unique réutilisé ici).
+
+    L'écriture de l'état (réponse + refus de double réponse) et l'envoi tmux sont deux
+    verrous distincts, jamais un seul : un appel tmux peut prendre plusieurs secondes
+    (panes.send() dort, capture, retente) et ne doit jamais avoir lieu sous
+    state.json.lock, même raisonnement que controle.py::_tick_one (étape 4). La réponse
+    est donc TOUJOURS enregistrée en premier, avant même de savoir si la livraison va
+    réussir : un envoi qui échoue ensuite ne doit ni perdre la réponse de l'humain, ni
+    la rendre répondable une seconde fois (refus de double réponse inchangé), seulement
+    signaler bruyamment que personne ne l'a reçue.
+
+    Une question de chantier (q["tache"] est None) n'a pas d'exécutante à qui parler :
+    rien à livrer, comportement inchangé depuis avant cette fonction.
+    """
     with store.locked() as state:
         q = state["questions"].get(args.question)
         if q is None:
@@ -1596,6 +1611,35 @@ def cmd_answer(args: argparse.Namespace) -> int:
             raise CliError(f"answer refused: {args.question} already has an answer")
         q["answer"] = args.text
         q["answeredAt"] = store.now()
+        task_id = q["tache"]
+        task = state["taches"].get(task_id) if task_id else None
+        pane_id = task.get("paneId") if task else None
+
+    if task_id is not None:
+        # Pane mort, jamais lancé, ou tâche disparue : rien à envoyer. Ce n'est pas une
+        # erreur de l'humain qui répond, c'est l'exécutante qui est indisponible -- la
+        # réponse ci-dessus reste enregistrée, seule la livraison échoue (point 3).
+        if task is None or not pane_id or not panes.alive(pane_id):
+            raise CliError(
+                f"{q['id']}: answer recorded but {task_id} has no live pane -- "
+                f"nobody received it, {task_id} must be relaunched"
+            )
+        try:
+            panes.send(pane_id, f"Answer: {args.text}")
+        except RuntimeError as exc:
+            raise CliError(
+                f"{q['id']}: answer recorded but delivery to {task_id} failed: {exc}"
+            ) from exc
+
+        with store.locked() as state:
+            fresh_q = state["questions"].get(args.question)
+            if fresh_q is not None:
+                fresh_q["injectedAt"] = store.now()
+                q["injectedAt"] = fresh_q["injectedAt"]
+            fresh_task = state["taches"].get(task_id)
+            if fresh_task is not None and fresh_task["state"] == "waiting":
+                fresh_task["state"] = "running"
+
     if args.json:
         _print_json(q)
         return 0

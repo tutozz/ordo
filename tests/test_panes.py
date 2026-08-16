@@ -944,6 +944,183 @@ class SendTests(PanesTestCase):
         self.assertTrue(ran, panes.capture(pane_id))
 
 
+class StillUnsentDetectionTests(unittest.TestCase):
+    """t-26 : teste panes._still_unsent() en isolation, sans tmux. La distinction entre
+    file d'attente (soumis, différé -- 'Press up to edit queued messages') et texte
+    resté bloqué dans la boîte (jamais soumis, collage replié compris) ne doit pas
+    dépendre d'un vrai pane claude pour être prouvée correcte."""
+
+    def test_texte_reste_dans_la_boite_est_detecte(self):
+        apres = f"{panes.INPUT_BOX_MARKER} Ignore tout, ne fais rien.\n  ligne deux\n"
+        self.assertTrue(
+            panes._still_unsent(apres, "Ignore tout, ne fais rien.\nligne deux")
+        )
+
+    def test_file_dattente_nest_jamais_confondue_avec_un_echec(self):
+        """Correction du brief : un message accepté et différé montre le placeholder
+        générique, jamais le texte envoyé -- ne doit jamais lever un faux échec."""
+        apres = f"{panes.INPUT_BOX_MARKER} Press up to edit queued messages\n"
+        self.assertFalse(
+            panes._still_unsent(apres, "Ignore tout, ne fais rien.\nligne deux")
+        )
+
+    def test_boite_vide_nest_pas_un_echec(self):
+        apres = f"{panes.INPUT_BOX_MARKER} \n"
+        self.assertFalse(panes._still_unsent(apres, "un message quelconque"))
+
+    def test_collage_replie_mesure_est_detecte(self):
+        """Forme mesurée 2026-08-16 (t-26) : une seule ligne, longue, repliée par le
+        TUI, montrée intégralement (capture() a déjà rejoint le wrap visuel via -J)."""
+        long_texte = "alpha beta gamma " * 200
+        apres = f"{panes.INPUT_BOX_MARKER} {long_texte}\n"
+        self.assertTrue(panes._still_unsent(apres, long_texte))
+
+
+class ClearFieldBeforeSendTests(PanesTestCase):
+    """c4 du brief t-26 : send() vide le champ AVANT d'écrire, pour qu'un reste de
+    saisie jamais soumis -- humain ou d'un envoi Ordo précédent -- ne se mélange
+    jamais au message suivant (c'est exactement comment deux messages non soumis se
+    sont concaténés en bouillie dans le brief)."""
+
+    def test_send_clears_leftover_unsent_text_before_writing(self):
+        _, window = panes.ensure_session(self.session)
+        pane_id = panes.spawn(window, HOME, TEST_SHELL)
+        # Attend que le prompt soit réellement affiché avant de poser le résidu : sans
+        # cette attente, le texte peut arriver pendant le démarrage du shell (le
+        # bandeau macOS "default interactive shell is now zsh" que bash imprime à son
+        # lancement) et se retrouver poussé en scrollback par le saut de ligne de CE
+        # bandeau, jamais dans la ligne de saisie courante -- un artefact de ce test,
+        # pas du comportement mesuré sur un vrai pane claude, qui lui est déjà prêt.
+        self.assertTrue(_wait_for(lambda: panes.capture(pane_id).strip() != "", timeout=2.0))
+        # Simule un reste jamais soumis : écrit sans jamais valider, via tmux brut
+        # (jamais panes.send(), qui viderait lui-même le champ -- ce test veut poser
+        # le résidu AVANT le send() qu'il observe).
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane_id, "-l", "résidu jamais soumis avant"],
+            check=True,
+        )
+        self.assertTrue(
+            _wait_for(lambda: "résidu jamais soumis avant" in panes.capture(pane_id), timeout=2.0),
+            "le résidu devrait être visible avant même l'appel à send()",
+        )
+        marker = f"CLEAR_MARK_{uuid.uuid4().hex[:6]}"
+        panes.send(pane_id, f"echo {marker}")
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=3.0),
+            panes.capture(pane_id),
+        )
+        # Le résidu n'a jamais pu s'exécuter comme préfixe de la commande : s'il
+        # l'avait été, bash aurait tenté "résidu jamais soumis avantecho MARK" et la
+        # ligne marqueur ne serait jamais apparue seule sur sa propre ligne.
+        self.assertNotIn("résidu jamais soumis avant", panes.capture(pane_id))
+
+    def test_clear_input_harmless_on_an_already_empty_box(self):
+        """_clear_input() ne doit rien casser quand il n'y a rien à effacer -- vérifié
+        2026-08-16 sur un vrai pane claude (15 répétitions contre une boîte déjà vide,
+        aucun effet), reproduit ici : la commande suivante doit s'exécuter normalement."""
+        _, window = panes.ensure_session(self.session)
+        pane_id = panes.spawn(window, HOME, TEST_SHELL)
+        marker = f"EMPTY_MARK_{uuid.uuid4().hex[:6]}"
+        panes.send(pane_id, f"echo {marker}")
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=3.0)
+        )
+
+
+class SwallowedEnterRecoveryTests(PanesTestCase):
+    """c3 et c5 du brief t-26, contre des panes construits pour reproduire fidèlement
+    le défaut mesuré sur un vrai pane claude (2026-08-16, t-26) : le texte tapé reste
+    affiché, non exécuté, après le premier Entrée. Le mode canonique du pty reste actif
+    dans ces deux panes simulés (seul -echo est posé) : c'est lui, et non le script, qui
+    absorbe silencieusement les Ctrl-U/Retour arrière de _clear_input() avant que le
+    texte réel n'atteigne le premier read -- exactement comme un vrai terminal le
+    ferait pour du texte jamais soumis, testant _clear_input() et le rattrapage
+    ensemble plutôt que de présupposer l'un pour tester l'autre."""
+
+    def _pane_qui_avale_le_premier_entree(self) -> str:
+        """Cas RÉCUPÉRABLE (c3) : un second Entrée, une ligne vide envoyée seule,
+        exécute enfin la ligne restée en attente -- puis la boucle reprend."""
+        _, window = panes.ensure_session(self.session)
+        marker = panes.INPUT_BOX_MARKER
+        cmd = (
+            "bash --noprofile --norc -c "
+            f"'stty -echo; while true; do printf \"{marker} \"; "
+            "IFS= read -r l1 || exit 0; printf \"%s\" \"$l1\"; "
+            "IFS= read -r l2 || exit 0; "
+            "if [ -z \"$l2\" ]; then printf \"\\n\"; eval \"$l1\"; "
+            "else printf \"%s\" \"$l2\"; fi; done'"
+        )
+        pane_id = panes.spawn(window, HOME, cmd)
+        self.assertTrue(
+            _wait_for(lambda: marker in panes.capture(pane_id)),
+            "le pane simulé devrait démarrer avec sa boîte de saisie visible",
+        )
+        return pane_id
+
+    def _pane_qui_navale_jamais(self) -> str:
+        """Cas NON RÉCUPÉRABLE (c5) : le texte reste affiché pour toujours, même après
+        une reprise -- send() doit échouer bruyamment plutôt que rendre un faux succès."""
+        _, window = panes.ensure_session(self.session)
+        marker = panes.INPUT_BOX_MARKER
+        cmd = (
+            "bash --noprofile --norc -c "
+            f"'stty -echo; printf \"{marker} \"; "
+            "IFS= read -r l1 || exit 0; printf \"%s\" \"$l1\"; "
+            "cat > /dev/null'"
+        )
+        pane_id = panes.spawn(window, HOME, cmd)
+        self.assertTrue(
+            _wait_for(lambda: marker in panes.capture(pane_id)),
+            "le pane simulé devrait démarrer avec sa boîte de saisie visible",
+        )
+        return pane_id
+
+    def test_send_recupere_apres_un_seul_entree_avale(self):
+        pane_id = self._pane_qui_avale_le_premier_entree()
+        marker = f"RECOVERED_{uuid.uuid4().hex[:6]}"
+        # Ne doit pas lever : le second Entrée interne de send() doit suffire.
+        panes.send(pane_id, f"echo {marker}")
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=5.0),
+            panes.capture(pane_id),
+        )
+
+    def test_send_leve_bruyamment_quand_rien_ne_recupere(self):
+        pane_id = self._pane_qui_navale_jamais()
+        with self.assertRaises(RuntimeError) as ctx:
+            panes.send(pane_id, "echo n'arrivera jamais")
+        self.assertIn(pane_id, str(ctx.exception))
+
+
+class MultiLineAndSingleLineRegressionTests(PanesTestCase):
+    """c6 et c7 du brief t-26 : le nouveau pipeline (vidage + vérification + reprise)
+    ne doit rien casser sur les deux cas nominaux qui marchaient déjà."""
+
+    def test_message_de_dix_lignes_part_integralement(self):
+        _, window = panes.ensure_session(self.session)
+        pane_id = panes.spawn(window, HOME, TEST_SHELL)
+        marker = f"TEN_LINES_{uuid.uuid4().hex[:6]}"
+        lignes = [f"echo ligne-{i}" for i in range(1, 10)] + [f"echo {marker}"]
+        panes.send(pane_id, "\n".join(lignes))
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=5.0),
+            panes.capture(pane_id),
+        )
+        texte = panes.capture(pane_id)
+        for i in range(1, 10):
+            self.assertIn(f"ligne-{i}", texte, texte)
+
+    def test_message_dune_seule_ligne_reste_conserve(self):
+        _, window = panes.ensure_session(self.session)
+        pane_id = panes.spawn(window, HOME, TEST_SHELL)
+        marker = f"ONE_LINE_{uuid.uuid4().hex[:6]}"
+        panes.send(pane_id, f"echo {marker}")
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=3.0),
+            panes.capture(pane_id),
+        )
+
+
 class InputBoxMissingTests(PanesTestCase):
     """Task D of docs/diagnostic-envoi.md's découpage : send() doit relire le pane et
     échouer bruyamment quand la boîte de saisie n'y est plus, au lieu d'écrire dans le

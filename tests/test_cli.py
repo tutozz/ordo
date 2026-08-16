@@ -1509,6 +1509,8 @@ class TestSignalVerbs(CliTestCase):
     def test_ask_puis_questions_puis_answer(self):
         cid = self._chantier()
         t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%1"
         q = self._run_json(["ask", t1, "quelle branche ?", "--option", "a",
                              "--option", "b", "--for-human", "--json"])
         self.assertEqual(q["tache"], t1)
@@ -1518,7 +1520,9 @@ class TestSignalVerbs(CliTestCase):
         pending = self._run_json(["questions", "--json"])
         self.assertEqual(len(pending), 1)
 
-        answered = self._run_json(["answer", q["id"], "main", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=True), \
+             mock.patch.object(cli.panes, "send", return_value=None):
+            answered = self._run_json(["answer", q["id"], "main", "--json"])
         self.assertEqual(answered["answer"], "main")
 
         pending_after = self._run_json(["questions", "--json"])
@@ -1564,8 +1568,12 @@ class TestSignalVerbs(CliTestCase):
     def test_answer_refuse_si_deja_repondue(self):
         cid = self._chantier()
         t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%1"
         q = self._run_json(["ask", t1, "q ?", "--json"])
-        self._run_json(["answer", q["id"], "r1", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=True), \
+             mock.patch.object(cli.panes, "send", return_value=None):
+            self._run_json(["answer", q["id"], "r1", "--json"])
         code, out, err = self._run(["answer", q["id"], "r2"])
         self.assertNotEqual(code, 0)
 
@@ -1573,6 +1581,81 @@ class TestSignalVerbs(CliTestCase):
         code, out, err = self._run(["answer", "q-99", "r"])
         self.assertNotEqual(code, 0)
         self.assertIn("q-99", err)
+
+    def test_answer_pousse_la_reponse_dans_le_pane_de_la_tache(self):
+        # c2/c6 : la réponse part réellement dans le pane, comme le ferait un ordo say --
+        # c'est exactement l'appel manquant qui a coûté une demi-heure sur t-20.
+        cid = self._chantier()
+        t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%7"
+            state["taches"][t1]["state"] = "waiting"
+        q = self._run_json(["ask", t1, "quelle branche ?", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=True), \
+             mock.patch.object(cli.panes, "send", return_value=None) as send:
+            answered = self._run_json(["answer", q["id"], "main", "--json"])
+        send.assert_called_once_with("%7", "Answer: main")
+        self.assertIsNotNone(answered.get("injectedAt"))
+        task = store.load()["taches"][t1]
+        self.assertEqual(task["state"], "running")
+
+    def test_answer_echoue_bruyamment_si_pane_mort_mais_garde_la_reponse(self):
+        # c3/c4 : pane mort -> personne n'a rien reçu, la commande le dit et n'affiche
+        # jamais "answered" pour ce mensonge précis (le bug réel de t-20).
+        cid = self._chantier()
+        t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%9"
+        q = self._run_json(["ask", t1, "quelle branche ?", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=False):
+            code, out, err = self._run(["answer", q["id"], "main"])
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("answered", out)
+        self.assertIn(t1, err)
+        stocke = store.load()["questions"][q["id"]]
+        self.assertEqual(stocke["answer"], "main")
+        self.assertIsNone(stocke.get("injectedAt"))
+
+    def test_answer_sans_pane_jamais_lance_echoue_aussi(self):
+        # Même famille que ci-dessus mais sans paneId du tout (tâche jamais lancée).
+        cid = self._chantier()
+        t1 = self._tache(cid)
+        q = self._run_json(["ask", t1, "quelle branche ?", "--json"])
+        code, out, err = self._run(["answer", q["id"], "main"])
+        self.assertNotEqual(code, 0)
+        self.assertIn(t1, err)
+        stocke = store.load()["questions"][q["id"]]
+        self.assertEqual(stocke["answer"], "main")
+
+    def test_answer_reste_repondable_une_fois_meme_si_lenvoi_echoue(self):
+        # c5 : un envoi qui échoue (pane vivant mais send() lève) ne perd pas la réponse
+        # et ne la laisse pas non plus "répondable" une seconde fois -- le refus de
+        # double réponse tient, la réponse reste enregistrée pour une livraison ultérieure.
+        cid = self._chantier()
+        t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%3"
+        q = self._run_json(["ask", t1, "quelle branche ?", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=True), \
+             mock.patch.object(cli.panes, "send", side_effect=RuntimeError("boom")):
+            code, out, err = self._run(["answer", q["id"], "main"])
+        self.assertNotEqual(code, 0)
+        stocke = store.load()["questions"][q["id"]]
+        self.assertEqual(stocke["answer"], "main")
+        self.assertIsNone(stocke.get("injectedAt"))
+        code2, out2, err2 = self._run(["answer", q["id"], "autre"])
+        self.assertNotEqual(code2, 0)
+
+    def test_answer_de_chantier_ne_tente_aucun_envoi(self):
+        # Question sans tâche (portée chantier) : rien à livrer, comportement inchangé.
+        cid = self._chantier()
+        q = self._run_json(["ask", cid, "parallèle ou série ?", "--json"])
+        with mock.patch.object(cli.panes, "alive") as alive, \
+             mock.patch.object(cli.panes, "send") as send:
+            answered = self._run_json(["answer", q["id"], "parallèle", "--json"])
+        alive.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(answered["answer"], "parallèle")
 
 
 # ---------------------------------------------------------------------------

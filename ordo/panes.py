@@ -973,6 +973,103 @@ SEND_VERIFY_LINES = 20
 # own cas H, which used the same delay to catch the same failure.
 SEND_VERIFY_DELAY_S = 1.0
 
+# How many (Ctrl-U, Backspace) pairs _clear_input() sends before every send() writes
+# anything. Each pair erases one logical line of the box back into the previous one
+# (see _clear_input() for why it takes a pair, not one keystroke). Bounded well above
+# any real Ordo message's line count -- a chantier brief run through `ordo say` rarely
+# reaches a few dozen lines -- and the bound costs nothing extra regardless: every
+# repetition goes out in the SAME single tmux invocation (see _clear_input()), not one
+# subprocess per keystroke.
+CLEAR_FIELD_MAX_LINES = 80
+
+# Footer hint Claude Code's TUI shows, measured 2026-08-16 (t-26), the moment a SINGLE
+# paste crosses its own internal size threshold (confirmed between 711 and 2842
+# characters on that run) and collapses pending confirmation instead of submitting on
+# the Enter sent right after it: the box keeps the raw text, the footer status line is
+# replaced by this string. Not itself matched by send()'s detection (_still_unsent()
+# below reads the box's own content, not the footer, since the footer is cosmetic and
+# was not verified to appear in every collapse) -- kept here only to name the cause
+# precisely in the RuntimeError a caller sees.
+PASTE_COLLAPSE_HINT = "paste again to expand"
+
+
+def _clear_input(pane_id: str) -> None:
+    """Erase whatever the pane's input box currently holds, before send() writes to it.
+
+    Measured 2026-08-16 (t-26) against a real claude pane: Ctrl-U kills back to the
+    START of the box's CURRENT line only -- ordinary readline semantics, confirmed by a
+    footer hint that appears right after ("Ctrl+Y to paste deleted text") -- never the
+    whole multi-line buffer in one keystroke. A Backspace sent right after merges that
+    now-empty line into the previous one, moving the cursor to its end. Repeating the
+    pair walks back through every line the box holds, one at a time, regardless of how
+    many there are; repeating it CLEAR_FIELD_MAX_LINES times on an already-empty box
+    was verified harmless the same day (15 repetitions against a bare box left it
+    exactly as empty, no scrollback disturbed, nothing recalled into it).
+
+    Sent as ONE tmux invocation, every keystroke of every pair inline, never
+    CLEAR_FIELD_MAX_LINES separate subprocess calls: a single chained send-keys is
+    exactly what relayout() already does for the same reason (see relayout()'s
+    resize-window + select-layout call).
+
+    Deliberately unconditional on every call to send(), never skipped on the assumption
+    the box is already empty: this is c4 of t-26's brief, and the failure that brief
+    reports is precisely a second, unrelated message concatenating with a first one
+    that never submitted -- clearing first is what stops that regardless of whether the
+    leftover came from Ordo's own previous send() or from a human who typed into the
+    pane in between.
+    """
+    keys = ["C-u", "BSpace"] * CLEAR_FIELD_MAX_LINES
+    _run(["send-keys", "-t", pane_id, *keys])
+
+
+def _last_box_content(apres: str) -> str | None:
+    """Text sitting on the same line as the LAST INPUT_BOX_MARKER in `apres`, stripped.
+
+    The last marker inside SEND_VERIFY_LINES' bounded, recent tail is always the
+    CURRENTLY OPEN box, never an earlier submitted turn's own echo (same reasoning
+    send() already relies on for INPUT_BOX_MARKER, see below): a turn that actually
+    submitted is followed by either the model's own reply or a busy indicator, and
+    either one pushes a FRESH, later "❯" for the box underneath -- empty if idle, or
+    the generic "Press up to edit queued messages" placeholder if the pane was busy
+    and the message was genuinely accepted into its queue (see _still_unsent()).
+    Returns None only when no marker exists at all in `apres`, a case send() already
+    raises on before this is ever reached.
+    """
+    idx = apres.rfind(INPUT_BOX_MARKER)
+    if idx == -1:
+        return None
+    line_end = apres.find("\n", idx)
+    line = apres[idx:] if line_end == -1 else apres[idx:line_end]
+    return line[len(INPUT_BOX_MARKER):].strip()
+
+
+def _still_unsent(apres: str, text: str) -> bool:
+    """True if `text` is still sitting, unconfirmed, in the pane's live input box.
+
+    Compares only text's FIRST line against _last_box_content(). Two real, measured
+    shapes of the same failure (t-26, 2026-08-16) both read as one whole line there:
+    capture()'s -J already rejoins purely visual, terminal-width wrapping (see
+    capture()'s own docstring), so a long SINGLE line Claude Code's TUI has collapsed
+    pending confirmation (PASTE_COLLAPSE_HINT, measured above ~2800 characters on that
+    run) comes back as one unbroken line here; a genuinely MULTI-line message that
+    failed to submit shows its FIRST line alone directly after the marker, the rest on
+    their own indented rows below it -- the first line is therefore enough to catch
+    both shapes with the same test, and matching a PREFIX rather than the whole text
+    keeps it correct even if the box has reflowed the tail differently.
+
+    False on the healthy busy case, on purpose: a message accepted into Claude Code's
+    own queue while the pane is mid-turn replaces the box with the generic "Press up to
+    edit queued messages" placeholder, never the raw text (measured 2026-08-16,
+    distinct from PASTE_COLLAPSE_HINT's collapsed-and-stuck state) -- that placeholder
+    never starts with `text`'s own first line, so this reads it as delivered, not lost,
+    exactly as it should.
+    """
+    first_line = text.split("\n", 1)[0].strip()
+    if not first_line:
+        return False
+    contenu = _last_box_content(apres)
+    return bool(contenu) and contenu.startswith(first_line)
+
 
 def send(pane_id: str, text: str) -> None:
     """Type text into pane_id, then press enter, as two separate tmux calls (I6).
@@ -986,29 +1083,48 @@ def send(pane_id: str, text: str) -> None:
     turn, and there is no legitimate reason to interrupt one from Ordo: if
     it is going the wrong way, it gets talked to, never cut off.
 
-    After both keys are sent, the pane is re-read and checked before returning
-    (task D of docs/diagnostic-envoi.md's découpage). The two send-keys calls above
-    succeeding only proves tmux delivered the bytes to the pane's pty -- not that
-    anything on the other end was listening. Measured twice: a full-screen slash-
-    command panel (e.g. /cost) can silently replace the input box and swallow every
-    message sent afterward without a trace, and the tmux trust dialog throws the typed
-    text away outright and reads C-m as confirming "Yes, I trust this folder" instead.
-    Both leave the pane alive and busy() reading idle -- nothing else in this module
-    would ever notice. A caller that gets RuntimeError here knows its message did NOT
-    land, instead of believing a write that went into the void.
+    _clear_input() runs first, unconditionally (c4 of t-26's brief): see its own
+    docstring for why a leftover, never-submitted line -- Ordo's own or a human's --
+    must never be given the chance to concatenate with what is about to be typed.
 
-    The proof is never on-screen text: the diagnostic that motivated this found the
-    opposite check ("does my own message's text appear on screen?") to be pure decor --
-    text can sit visibly in a still-unsubmitted box, or get echoed by the terminal
-    without ever being interpreted as a command, either way looking like success. This
-    checks for signs of the pane itself instead: TRUST_DIALOG_MARKERS first, for a
-    message naming the actual cause, then INPUT_BOX_MARKER for the general case.
+    After both keys are sent, the pane is re-read and checked before returning
+    (task D of docs/diagnostic-envoi.md's découpage, extended by t-26). The two
+    send-keys calls above succeeding only proves tmux delivered the bytes to the
+    pane's pty -- not that anything on the other end was listening, or that the Enter
+    was actually registered as "submit". Measured, real failures, all leaving the pane
+    alive and busy() reading idle -- nothing else in this module would ever notice:
+
+    - a full-screen slash-command panel (e.g. /cost) can silently replace the input
+      box and swallow every message sent afterward without a trace;
+    - the tmux trust dialog throws the typed text away outright and reads C-m as
+      confirming "Yes, I trust this folder" instead;
+    - measured 2026-08-16 for t-26: Claude Code's TUI can accept the typed text into
+      its box but swallow the very next C-m -- confirmed twice, live, once for a
+      multi-line message sent immediately after an earlier one had just been
+      submitted, once for a single line long enough to cross the TUI's own paste-size
+      threshold and collapse pending confirmation (PASTE_COLLAPSE_HINT). Both times a
+      LATER, separately-timed Enter submitted the exact same unmodified text untouched
+      -- proof the text itself always lands correctly, only its immediate validation
+      is what gets lost.
+
+    A caller that gets RuntimeError here knows its message did NOT land, instead of
+    believing a write that went into the void.
+
+    The proof is never on-screen text used as evidence of SUCCESS: the diagnostic that
+    motivated the panel/dialog checks above found that check ("does my own message's
+    text appear on screen?") to be pure decor -- text can sit visibly in a still-
+    unsubmitted box, or get echoed by the terminal without ever being interpreted as a
+    command, either way looking like success. _still_unsent() below uses on-screen text
+    the OTHER way around, as evidence of FAILURE, which this diagnostic never ruled
+    out: text that is STILL sitting in the box, unconfirmed, five real seconds after
+    send() wrote it, is not decor, it is the message never having left.
     """
     _reject_self(pane_id)
     if _is_escape(text):
         raise ValueError(
             "refused: Escape would interrupt the executor's current turn"
         )
+    _clear_input(pane_id)
     _run(["send-keys", "-t", pane_id, "-l", text])
     _run(["send-keys", "-t", pane_id, "C-m"])
     time.sleep(SEND_VERIFY_DELAY_S)
@@ -1025,6 +1141,25 @@ def send(pane_id: str, text: str) -> None:
             "(a full-screen panel is likely showing instead, e.g. a slash command); "
             "the message was written into the void, not delivered"
         )
+    if _still_unsent(apres, text):
+        # Recovery: measured 2026-08-16 (t-26) that a SECOND, separately-timed Enter
+        # reliably submits the exact same unmodified text once the swallow above has
+        # already happened -- confirmed live against both failure shapes (see
+        # _still_unsent()'s docstring). Retried once, never looped: a pane that is
+        # still stuck after this is treated as a genuine failure, not a race to keep
+        # guessing at (c5 of t-26's brief).
+        _run(["send-keys", "-t", pane_id, "C-m"])
+        time.sleep(SEND_VERIFY_DELAY_S)
+        apres = capture(pane_id, lines=SEND_VERIFY_LINES, join=True)
+        if _still_unsent(apres, text):
+            raise RuntimeError(
+                f"send failed: pane {pane_id} still shows the just-sent text, "
+                "unconfirmed, after a recovery Enter -- likely "
+                f"'{PASTE_COLLAPSE_HINT}' (Claude Code's TUI can collapse a paste "
+                "above its own size threshold, or swallow the Enter sent right after "
+                "an earlier submission, and drop the very next C-m either way, "
+                "measured 2026-08-16); the message was typed but never submitted"
+            )
 
 
 def alive(pane_id: str) -> bool:

@@ -620,9 +620,17 @@ def _tick_one(chantier_id: str) -> list[str]:
     # (clear()), donc relire une tâche waiting est sans risque de réappliquer un rapport
     # périmé : soit rien de neuf n'est arrivé, soit un nouveau rapport réclame d'être lu.
     waiting_tasks = [t for t in _sorted_tasks(state, chantier_id) if t["state"] == "waiting"]
+    # Jumeau exact du défaut waiting ci-dessus, vécu en conditions réelles sur t-31 : une
+    # tâche "blocked" n'était jamais parcourue non plus, donc son rapport ne l'était pas
+    # davantage. Une exécutante débloquée par `ordo say`, qui reprend et écrit un rapport
+    # "done", restait donc "blocked" pour toujours -- rien ne relisait plus jamais son
+    # fichier. Même garantie contre le double emploi que waiting_tasks : report.apply()
+    # consomme le fichier à chaque lecture (clear()), donc relire une tâche blocked est
+    # sans risque de réappliquer un rapport périmé.
+    blocked_tasks = [t for t in _sorted_tasks(state, chantier_id) if t["state"] == "blocked"]
     report_raw: dict[str, str] = {}
     pane_alive: dict[str, bool] = {}
-    for t in running + waiting_tasks:
+    for t in running + waiting_tasks + blocked_tasks:
         rp = report.path(t["id"], t["chantier"])
         if rp.exists():
             report_raw[t["id"]] = rp.read_text(encoding="utf-8")
@@ -642,12 +650,16 @@ def _tick_one(chantier_id: str) -> list[str]:
 
         # Étape 2 (I2) : le rapport est lu EN PREMIER. S'il est présent, il tranche
         # seul ; l'étape 3 ci-dessous ne regarde jamais le pane d'une tâche déjà
-        # traitée ici. Parcourt "running" ET "waiting" (voir plus haut) : une tâche
-        # waiting relue qui reçoit un rapport "done"/"blocked" en sort ici même, par la
-        # seule mutation de task["state"] que report.apply() effectue déjà.
-        for t in running + waiting_tasks:
+        # traitée ici. Parcourt "running", "waiting" ET "blocked" (voir plus haut) :
+        # une tâche waiting ou blocked relue qui reçoit un rapport "done"/"blocked" en
+        # sort ici même, par la seule mutation de task["state"] que report.apply()
+        # effectue déjà. Une tâche blocked dont le rapport redit "blocked" reste
+        # blocked : report.apply() réécrit sa note et sa cause sans jamais la
+        # ressusciter d'elle-même (garde-fou du brief t-35, jamais l'inverse) -- seule
+        # l'orchestratrice décide qu'un blocage est levé.
+        for t in running + waiting_tasks + blocked_tasks:
             task = state["taches"].get(t["id"])
-            if task is None or task["state"] not in ("running", "waiting"):
+            if task is None or task["state"] not in ("running", "waiting", "blocked"):
                 continue
             raw = report_raw.get(t["id"])
             if raw is None:

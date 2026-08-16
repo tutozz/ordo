@@ -6,6 +6,7 @@ construit a la main : ces cas-la n'ont pas besoin de filesystem.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -1220,6 +1221,215 @@ class TestMedianeDureeParCritere(ChantierTestCase):
         self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 1)
 
 
+class EstimationCritereTestCase(ChantierTestCase):
+    """Fixtures communes à l'estimation algorithmique par attributs (brief t-43) : chaque
+    tâche créée ici coche un SEUL critère, portant un SEUL attribut, pour que sa durée
+    réelle (minutes) soit directement la cible d'entraînement, sans calcul intermédiaire à
+    refaire dans les tests -- même parti pris que TestMedianeDureeParCritere ci-dessus.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+
+    def _tache(
+        self, cle: str, valeur: str, minutes: int, debut: str = "2026-08-01T00:00:00Z"
+    ) -> str:
+        t = chantier.add_task(self.chantier_id, "t", "prompt", checklist=["c"])
+        h, m, s = (int(x) for x in debut[11:19].split(":"))
+        fin = f"{debut[:11]}{h:02d}:{(m + minutes) % 60:02d}:{s:02d}Z"
+        if m + minutes >= 60:
+            fin = f"{debut[:11]}{h + (m + minutes) // 60:02d}:{(m + minutes) % 60:02d}:{s:02d}Z"
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = debut
+            item["finishedAt"] = fin
+            item["checklist"][0]["done"] = True
+            item["checklist"][0]["attributs"] = {cle: valeur}
+        return t["id"]
+
+
+class TestObservationsParCritere(EstimationCritereTestCase):
+    """observations_par_critere() : jeu d'entraînement groupé par tâche (brief t-43, c1)."""
+
+    def test_ignore_un_critere_non_coche(self):
+        self._tache("geste", "lire", 5)
+        t = chantier.add_task(self.chantier_id, "pas coché", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:05:00Z"
+            item["checklist"][0]["attributs"] = {"geste": "lire"}
+        groupes = chantier.observations_par_critere(store.load())
+        self.assertEqual(len(groupes), 1)
+
+    def test_ignore_un_critere_sans_attributs(self):
+        self._tache("geste", "lire", 5)
+        t = chantier.add_task(self.chantier_id, "sans attributs", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:05:00Z"
+            item["checklist"][0]["done"] = True
+        groupes = chantier.observations_par_critere(store.load())
+        self.assertEqual(len(groupes), 1)
+
+    def test_ignore_une_tache_non_terminee(self):
+        self._tache("geste", "lire", 5)
+        t = chantier.add_task(self.chantier_id, "en cours", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["checklist"][0]["done"] = True
+            item["checklist"][0]["attributs"] = {"geste": "lire"}
+        groupes = chantier.observations_par_critere(store.load())
+        self.assertEqual(len(groupes), 1)
+
+    def test_groupe_par_tache_triee_par_id(self):
+        premiere = self._tache("geste", "lire", 5)
+        seconde = self._tache("geste", "ecrire", 3)
+        groupes = chantier.observations_par_critere(store.load())
+        self.assertEqual([task_id for task_id, _ in groupes], sorted([premiere, seconde]))
+        self.assertEqual(groupes[0][1], [({"geste": "lire"}, 5.0)])
+
+
+class TestFacteursParAttribut(EstimationCritereTestCase):
+    """facteurs_par_attribut() : écart mesuré par valeur d'attribut (brief t-43, c2)."""
+
+    def test_home_neuf_rend_none(self):
+        self.assertIsNone(chantier.facteurs_par_attribut(store.load()))
+
+    def test_valeur_sous_le_seuil_est_absente(self):
+        # 9 observations de chaque valeur : sous SEUIL_OBSERVATIONS_ATTRIBUT (10), aucun
+        # facteur n'est retenu -- "vue trois fois" du brief, avec une marge large.
+        for _ in range(9):
+            self._tache("geste", "lire", 20)
+        for _ in range(9):
+            self._tache("geste", "ecrire", 4)
+        self.assertEqual(chantier.facteurs_par_attribut(store.load()), {})
+
+    def test_valeur_au_dessus_du_seuil_porte_son_facteur(self):
+        for _ in range(10):
+            self._tache("geste", "lire", 20)
+        for _ in range(10):
+            self._tache("geste", "ecrire", 4)
+        # À la main : dix 4 et dix 20 triés -- médiane globale = (4 + 20) / 2 = 12.
+        facteurs = chantier.facteurs_par_attribut(store.load())
+        self.assertAlmostEqual(facteurs["geste"]["lire"], 20 / 12)
+        self.assertAlmostEqual(facteurs["geste"]["ecrire"], 4 / 12)
+
+
+class TestValidationCroiseeEstimation(EstimationCritereTestCase):
+    """validation_croisee_estimation() : erreur du modèle par attributs contre la seule
+    médiane, en validation croisée déterministe groupée par tâche (brief t-43, c4)."""
+
+    def test_sous_le_seuil_de_taches_rend_none(self):
+        # 14 tâches, une de moins que SEUIL_TACHES_CV (15) : contrainte 3, on ne compare
+        # même pas.
+        for i in range(14):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, 20 if valeur == "lire" else 4)
+        self.assertIsNone(chantier.validation_croisee_estimation(store.load()))
+
+    def test_deterministe_deux_appels_identiques(self):
+        durees = [3, 9, 5, 11, 4, 8, 6]
+        for i in range(20):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, durees[i % len(durees)])
+        state = store.load()
+        self.assertEqual(
+            chantier.validation_croisee_estimation(state),
+            chantier.validation_croisee_estimation(state),
+        )
+
+    def test_signal_reel_et_suffisant_fait_gagner_le_modele(self):
+        # 30 tâches, séparation parfaite geste=lire (20 min) / geste=ecrire (4 min) : un
+        # signal qu'aucune médiane ne peut suivre.
+        for i in range(30):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, 20 if valeur == "lire" else 4)
+        verdict = chantier.validation_croisee_estimation(store.load())
+        self.assertEqual(verdict["gagnant"], "attributs")
+        self.assertLess(verdict["maeAttributs"], verdict["maeMediane"])
+
+    def test_bruit_sans_lien_avec_lattribut_rejette_le_modele(self):
+        # Même durées, réparties sur une période (7) qui ne s'accorde pas avec
+        # l'alternance de l'attribut (2) : aucun lien construit entre les deux, le modèle
+        # ne doit rien trouver de mieux que la médiane.
+        durees = [3, 9, 5, 11, 4, 8, 6]
+        for i in range(20):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, durees[i % len(durees)])
+        verdict = chantier.validation_croisee_estimation(store.load())
+        self.assertEqual(verdict["gagnant"], "mediane")
+        self.assertEqual(verdict["maeAttributs"], verdict["maeMediane"])
+
+
+class TestEstimationCritere(EstimationCritereTestCase):
+    """estimation_critere() : LA fonction du brief t-43, pour un critère donné par ses
+    attributs (brief t-36)."""
+
+    def test_home_neuf_rend_none(self):
+        self.assertIsNone(chantier.estimation_critere(store.load(), {"geste": "lire"}))
+
+    def test_sous_le_seuil_rend_la_mediane_ignore_les_attributs(self):
+        for i in range(14):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, 20 if valeur == "lire" else 4)
+        state = store.load()
+        # À la main : sept 4 et sept 20 triés -- médiane = (4 + 20) / 2 = 12.
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "lire"}), 12)
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "ecrire"}), 12)
+
+    def test_formule_rejetee_rend_exactement_la_mediane_pas_les_facteurs(self):
+        # c5 : même sans lien réel, un petit écart de médiane par groupe existe presque
+        # toujours par hasard -- la fonction doit l'IGNORER puisque le verdict mesuré est
+        # "mediane", jamais l'appliquer en douce.
+        durees = [3, 9, 5, 11, 4, 8, 6]
+        for i in range(20):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, durees[i % len(durees)])
+        state = store.load()
+        # À la main (voir TestValidationCroiseeEstimation) : médiane globale = 6.
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "lire"}), 6)
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "ecrire"}), 6)
+
+    def test_formule_acceptee_applique_les_facteurs_mesures_a_la_main(self):
+        for i in range(30):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, 20 if valeur == "lire" else 4)
+        state = store.load()
+        # À la main : médiane globale 12, facteur lire 20/12, facteur ecrire 4/12.
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "lire"}), 20)
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "ecrire"}), 4)
+
+    def test_attribut_jamais_vu_rend_la_mediane_pure(self):
+        for i in range(30):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, 20 if valeur == "lire" else 4)
+        state = store.load()
+        self.assertEqual(chantier.estimation_critere(state, {"geste": "publier"}), 12)
+
+    def test_recalcul_a_chaque_observation_neuve_sans_toucher_au_code(self):
+        # c6 : le même jeu "bruit" (verdict mediane) bascule vers "attributs" dès qu'on lui
+        # ajoute assez d'observations à vrai signal -- rien qu'en écrivant l'état, sans
+        # rien changer au code.
+        durees = [3, 9, 5, 11, 4, 8, 6]
+        for i in range(20):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, durees[i % len(durees)])
+        avant = chantier.estimation_critere(store.load(), {"geste": "lire"})
+        for i in range(30):
+            valeur = "lire" if i % 2 == 0 else "ecrire"
+            self._tache("geste", valeur, 20 if valeur == "lire" else 4)
+        apres = chantier.estimation_critere(store.load(), {"geste": "lire"})
+        self.assertNotEqual(avant, apres)
+        self.assertEqual(apres, 20)
+
+
 class TestEstimationParDefaut(ChantierTestCase):
     """Quand un critère est créé sans durée, Ordo lui pose la médiane calculée sur ce home
     (brief t-33). Une valeur posée explicitement, elle, n'est jamais écrasée (piège 6)."""
@@ -1366,6 +1576,37 @@ class TestDureeMesureeParCritere(ChantierTestCase):
         durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
         self.assertEqual(durees, {"c1": 3.0})
 
+    def test_le_champ_label_ajoute_par_t55_ne_perturbe_pas_la_mesure(self):
+        # t-55 : "checklist-doing"/"checklist-coche" portent désormais un champ "label"
+        # (le libellé au moment du fait) en plus de "tache"/"item"/"at" -- purement
+        # additif, duree_mesuree_par_critere() ne lit que ce dont elle a besoin.
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:01:00Z", "label": "premier"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:04:00Z", "label": "premier"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {"c1": 3.0})
+
+    def test_les_faits_add_split_reword_de_t55_sont_ignores(self):
+        # t-55 : "checklist-add"/"checklist-split"/"checklist-reword" datent une
+        # évolution de la checklist elle-même, jamais un travail sur un critère -- ils ne
+        # doivent pas entrer dans _EVENEMENTS_DUREE ni fausser la mesure.
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-add", "item": "c2",
+             "at": "2026-08-01T00:02:00Z", "label": "nouveau"},
+            {"tache": self.task_id, "type": "checklist-reword", "item": "c1",
+             "at": "2026-08-01T00:03:00Z", "ancien_label": "premier",
+             "nouveau_label": "corrigé"},
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:01:00Z", "label": "premier"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:04:00Z", "label": "corrigé"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {"c1": 3.0})
+
     def test_sans_doing_utilise_la_coche_precedente(self):
         evenements = [
             {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
@@ -1445,6 +1686,333 @@ class TestDureeMesureeParCritere(ChantierTestCase):
         ]
         durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
         self.assertEqual(durees, {})
+
+
+class TestDureeTravailMin(ChantierTestCase):
+    """duree_travail_min() : le temps de TRAVAIL d'une tâche terminée, distinct du délai
+    d'horloge brut qui compte les nuits comme si c'était du travail (brief t-45).
+
+    Principe : découper le délai brut en repères (lancement, chaque checklist-doing/
+    checklist-coche du journal machine t-34, rapport), plafonner chaque intervalle entre
+    deux repères consécutifs à CREUX_MAX_MIN (une heure) et sommer les intervalles
+    plafonnés. Sans aucun repère intermédiaire, rien à plafonner en confiance : le délai
+    brut sert tel quel s'il est déjà plausible, sinon la tâche est EXCLUE (None), jamais
+    devinée (invariant 2 du brief t-45)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=["premier", "second"]
+        )["id"]
+
+    def _task(self, debut: str, fin: str) -> dict:
+        with store.locked() as state:
+            item = state["taches"][self.task_id]
+            item["state"] = "done"
+            item["startedAt"] = debut
+            item["finishedAt"] = fin
+        return store.load()["taches"][self.task_id]
+
+    def test_sans_creux_anormal_le_temps_de_travail_egale_le_delai_brut(self):
+        task = self._task("2026-08-01T09:00:00Z", "2026-08-01T09:18:00Z")
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T09:07:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c2",
+             "at": "2026-08-01T09:15:00Z"},
+        ]
+        # 7 + 8 + 3 = 18 minutes, aucun creux ne dépasse le plafond : le total plafonné
+        # vaut exactement le délai brut, rien n'est retranché.
+        self.assertEqual(chantier.duree_travail_min(task, evenements), 18.0)
+
+    def test_cas_de_nuit_connu_rend_un_temps_de_travail_plausible_pas_46_heures(self):
+        # Tâche lancée un soir, rendue le lendemain matin : un creux de 11h05 se glisse
+        # entre la déclaration --doing du second critère et sa coche (le café du lendemain
+        # matin), au milieu de creux de travail réels de quelques minutes. Le délai brut
+        # vaut 685 minutes (11h25) ; le temps de travail ne doit en retenir que le plafond.
+        task = self._task("2026-08-01T22:00:00Z", "2026-08-02T09:25:00Z")
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T22:05:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T22:12:00Z"},
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c2",
+             "at": "2026-08-01T22:15:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c2",
+             "at": "2026-08-02T09:20:00Z"},
+        ]
+        resultat = chantier.duree_travail_min(task, evenements)
+        # 5 + 7 + 3 + plafond(60) + 5 = 80 minutes, pas 685.
+        self.assertEqual(resultat, 80.0)
+        self.assertLess(resultat, 120)
+
+    def test_sans_journal_machine_un_delai_court_reste_tel_quel(self):
+        task = self._task("2026-08-01T09:00:00Z", "2026-08-01T09:20:00Z")
+        self.assertEqual(chantier.duree_travail_min(task, []), 20.0)
+
+    def test_sans_journal_machine_un_delai_qui_franchit_la_nuit_est_exclu(self):
+        # Tâche antérieure au journal machine (t-34) : aucun repère à découper. Plafonner
+        # ce délai brut en confiance serait deviner un temps de travail, pas le mesurer
+        # (invariant 2) -- la tâche est exclue plutôt que devinée.
+        task = self._task("2026-08-01T20:00:00Z", "2026-08-02T08:00:00Z")
+        self.assertIsNone(chantier.duree_travail_min(task, []))
+
+    def test_horodatage_manquant_rend_none(self):
+        with store.locked() as state:
+            state["taches"][self.task_id]["state"] = "done"
+            state["taches"][self.task_id]["startedAt"] = "2026-08-01T00:00:00Z"
+        task = store.load()["taches"][self.task_id]
+        self.assertIsNone(chantier.duree_travail_min(task, []))
+
+    def test_evenements_dune_autre_tache_ne_se_melangent_pas(self):
+        autre = chantier.add_task(self.chantier_id, "autre", "prompt", checklist=["x"])["id"]
+        task = self._task("2026-08-01T09:00:00Z", "2026-08-01T09:18:00Z")
+        evenements = [
+            {"tache": autre, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T09:01:00Z"},
+        ]
+        self.assertEqual(chantier.duree_travail_min(task, evenements), 18.0)
+
+    def test_evenement_exactement_au_bord_nest_pas_un_repere_interne(self):
+        # Une coche exactement au lancement (horloges qui coïncident) ne doit ni dupliquer
+        # de repère ni fausser le calcul : elle tombe hors de l'intervalle ouvert.
+        task = self._task("2026-08-01T00:00:00Z", "2026-08-01T00:10:00Z")
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:00:00Z"},
+        ]
+        self.assertEqual(chantier.duree_travail_min(task, evenements), 10.0)
+
+
+class FacteurProjetTestCase(ChantierTestCase):
+    """Fixtures communes au facteur par projet et au rejeu chronologique (brief t-47) : deux
+    chantiers, deux PROJETS différents, dans le même home (home_partage) -- exactement la
+    situation que ce brief distingue du modèle par attributs de t-43, qui ne voit qu'un seul
+    home, jamais plusieurs projets dedans."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_a = chantier.start(str(self._projet("a")), "obj")
+        self.chantier_b = chantier.start(
+            str(self._projet("b")), "obj", home_partage=True
+        )
+        self.projet_a = self.chantier_a["project"]
+        self.projet_b = self.chantier_b["project"]
+
+    def _tache(
+        self,
+        chantier_id: str,
+        minutes: int,
+        cle: str | None = None,
+        valeur: str | None = None,
+        debut: str = "2026-08-01T00:00:00Z",
+    ) -> str:
+        t = chantier.add_task(chantier_id, "t", "prompt", checklist=["c"])
+        h, m, s = (int(x) for x in debut[11:19].split(":"))
+        total = m + minutes
+        fin = f"{debut[:11]}{h + total // 60:02d}:{total % 60:02d}:{s:02d}Z"
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = debut
+            item["finishedAt"] = fin
+            item["checklist"][0]["done"] = True
+            if cle is not None:
+                item["checklist"][0]["attributs"] = {cle: valeur}
+        return t["id"]
+
+
+class TestObservationsProjet(FacteurProjetTestCase):
+    """observations_projet() : jeu d'entraînement du facteur par projet (brief t-47),
+    regroupé par projet et sur la cible en temps de travail (t-45) -- pas le délai brut."""
+
+    def test_home_neuf_rend_dict_vide(self):
+        self.assertEqual(chantier.observations_projet(store.load(), []), {})
+
+    def test_regroupe_par_projet_pas_par_tache(self):
+        self._tache(self.chantier_a["id"], 5, "geste", "lire")
+        self._tache(self.chantier_a["id"], 3, "geste", "ecrire")
+        self._tache(self.chantier_b["id"], 10, "geste", "lire")
+        obs = chantier.observations_projet(store.load(), [])
+        self.assertEqual({k: len(v) for k, v in obs.items()}, {self.projet_a: 2, self.projet_b: 1})
+        self.assertCountEqual(
+            obs[self.projet_a], [({"geste": "lire"}, 5.0), ({"geste": "ecrire"}, 3.0)]
+        )
+
+    def test_critere_sans_attribut_porte_un_dict_vide_mais_compte(self):
+        self._tache(self.chantier_a["id"], 6)
+        obs = chantier.observations_projet(store.load(), [])
+        self.assertEqual(obs[self.projet_a], [({}, 6.0)])
+
+    def test_tache_non_terminee_absente(self):
+        chantier.add_task(self.chantier_a["id"], "en cours", "prompt", checklist=["c"])
+        self.assertEqual(chantier.observations_projet(store.load(), []), {})
+
+
+class TestFacteurProjet(FacteurProjetTestCase):
+    """facteur_projet() : facteur correctif propre à un projet, rapporté à la médiane du
+    home entier (brief t-47, c2)."""
+
+    def test_home_neuf_rend_none(self):
+        self.assertIsNone(chantier.facteur_projet(store.load(), [], self.projet_a))
+
+    def test_projet_sous_le_seuil_rend_none(self):
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET):
+            self._tache(self.chantier_a["id"], 20)
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET - 1):
+            self._tache(self.chantier_b["id"], 4)
+        self.assertIsNone(chantier.facteur_projet(store.load(), [], self.projet_b))
+
+    def test_projet_au_dessus_du_seuil_rend_son_facteur_calcule_a_la_main(self):
+        # 8 tâches à 20 min (projet a) et 8 à 4 min (projet b) : seize valeurs triées, huit 4
+        # et huit 20 -- médiane globale = (4 + 20) / 2 = 12.
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET):
+            self._tache(self.chantier_a["id"], 20)
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET):
+            self._tache(self.chantier_b["id"], 4)
+        state = store.load()
+        self.assertAlmostEqual(chantier.facteur_projet(state, [], self.projet_a), 20 / 12)
+        self.assertAlmostEqual(chantier.facteur_projet(state, [], self.projet_b), 4 / 12)
+
+    def test_projet_inconnu_rend_none(self):
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET):
+            self._tache(self.chantier_a["id"], 20)
+        self.assertIsNone(chantier.facteur_projet(store.load(), [], "/aucun/projet"))
+
+
+class TestCalibrationProjetPersistance(FacteurProjetTestCase):
+    """charger_calibration_projet() / sauver_calibration_projet() / recalculer_calibration_projet()
+    : le petit JSON par home, lisible et éditable à la main (brief t-47, c3)."""
+
+    def test_fichier_absent_rend_dict_vide(self):
+        self.assertEqual(chantier.charger_calibration_projet(), {})
+
+    def test_aller_retour_sauver_charger(self):
+        calibration = {"proj": {"facteur": 1.5, "observations": 10, "recalculeLe": "x"}}
+        chantier.sauver_calibration_projet(calibration)
+        self.assertEqual(chantier.charger_calibration_projet(), calibration)
+
+    def test_fichier_ecrit_reste_du_json_lisible_a_la_main(self):
+        chantier.sauver_calibration_projet({"proj": {"facteur": 1.0, "observations": 8}})
+        chemin = Path(self._tmp) / "calibration_projet.json"
+        with chemin.open(encoding="utf-8") as f:
+            brut = json.load(f)
+        self.assertEqual(brut, {"proj": {"facteur": 1.0, "observations": 8}})
+
+    def test_json_corrompu_rend_dict_vide(self):
+        chemin = Path(self._tmp) / "calibration_projet.json"
+        chemin.write_text("{ pas du json", encoding="utf-8")
+        self.assertEqual(chantier.charger_calibration_projet(), {})
+
+    def test_recalculer_persiste_et_omet_les_projets_sous_le_seuil(self):
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET):
+            self._tache(self.chantier_a["id"], 20)
+        for _ in range(chantier.SEUIL_OBSERVATIONS_PROJET - 1):
+            self._tache(self.chantier_b["id"], 4)
+        calibration = chantier.recalculer_calibration_projet(store.load(), [])
+        self.assertEqual(set(calibration), {self.projet_a})
+        self.assertEqual(calibration[self.projet_a]["observations"], chantier.SEUIL_OBSERVATIONS_PROJET)
+        self.assertEqual(chantier.charger_calibration_projet(), calibration)
+
+
+class TestPreparerRejeu(FacteurProjetTestCase):
+    """preparer_rejeu() : jeu d'entrée du rejeu chronologique, trié par ordre RÉEL de
+    complétion (brief t-47, c4)."""
+
+    def test_trie_par_finishedAt_croissant_pas_par_creation(self):
+        # La tâche du projet b est créée APRÈS celle du projet a mais terminée AVANT :
+        # l'ordre rendu doit suivre finishedAt, pas l'ordre de création.
+        self._tache(self.chantier_a["id"], 5, debut="2026-08-02T00:00:00Z")
+        self._tache(self.chantier_b["id"], 5, debut="2026-08-01T00:00:00Z")
+        rejeu = chantier.preparer_rejeu(store.load(), [])
+        self.assertEqual([o["projet"] for o in rejeu], [self.projet_b, self.projet_a])
+
+    def test_exclut_une_tache_sans_critere_coche(self):
+        chantier.add_task(self.chantier_a["id"], "jamais cochée", "prompt", checklist=["c"])
+        with store.locked() as state:
+            task_id = next(iter(state["taches"]))
+            state["taches"][task_id]["state"] = "done"
+            state["taches"][task_id]["startedAt"] = "2026-08-01T00:00:00Z"
+            state["taches"][task_id]["finishedAt"] = "2026-08-01T00:05:00Z"
+        self.assertEqual(chantier.preparer_rejeu(store.load(), []), [])
+
+    def test_exclut_une_tache_sans_temps_de_travail(self):
+        # Délai qui franchit la nuit, sans aucun repère de journal machine : t-45 exclut,
+        # preparer_rejeu doit suivre.
+        self._tache(self.chantier_a["id"], 1)
+        with store.locked() as state:
+            task_id = next(iter(state["taches"]))
+            state["taches"][task_id]["startedAt"] = "2026-08-01T20:00:00Z"
+            state["taches"][task_id]["finishedAt"] = "2026-08-02T08:00:00Z"
+        self.assertEqual(chantier.preparer_rejeu(store.load(), []), [])
+
+    def test_champs_rendus(self):
+        self._tache(self.chantier_a["id"], 5, "geste", "lire")
+        rejeu = chantier.preparer_rejeu(store.load(), [])
+        self.assertEqual(len(rejeu), 1)
+        self.assertEqual(rejeu[0]["projet"], self.projet_a)
+        self.assertEqual(rejeu[0]["dureeTravailMin"], 5.0)
+        self.assertEqual(rejeu[0]["criteres"], [{"geste": "lire"}])
+        self.assertEqual(rejeu[0]["finishedAt"], "2026-08-01T00:05:00Z")
+
+
+class TestRejeuChronologique(unittest.TestCase):
+    """rejeu_chronologique() : LE LIVRABLE du brief t-47 (c4, c5, c6, c9), sur un jeu de
+    tâches DÉJÀ ASSEMBLÉ par l'appelant (preparer_rejeu ou un autre home) -- fonction pure,
+    aucun state ni fichier, testable directement sur un jeu connu."""
+
+    def test_liste_vide_rend_n_zero_partout(self):
+        rejeu = chantier.rejeu_chronologique([])
+        for strategie in ("A", "B", "C"):
+            self.assertEqual(rejeu[strategie]["n"], 0)
+            self.assertIsNone(rejeu[strategie]["mae"])
+
+    def test_la_toute_premiere_tache_nest_jamais_estimee(self):
+        obs = [
+            {"projet": "p", "dureeTravailMin": 10.0, "criteres": [{}]},
+            {"projet": "p", "dureeTravailMin": 10.0, "criteres": [{}]},
+        ]
+        rejeu = chantier.rejeu_chronologique(obs)
+        self.assertEqual(rejeu["A"]["n"], 1)
+
+    def test_facteur_projet_egal_a_b_sous_le_seuil(self):
+        # Seuil projet jamais atteint (chaque projet vu une seule fois avant chaque
+        # estimation) : C doit rendre EXACTEMENT B, jamais un facteur bricolé sur rien.
+        obs = [
+            {"projet": f"p{i}", "dureeTravailMin": 10.0, "criteres": [{"geste": "lire"}]}
+            for i in range(5)
+        ]
+        rejeu = chantier.rejeu_chronologique(obs, seuil_projet=8)
+        self.assertEqual(rejeu["B"], rejeu["C"])
+
+    def test_jeu_connu_calcule_a_la_main(self):
+        # brief t-47, c9 : deux projets, deux valeurs d'attribut qui séparent vraiment les
+        # durées (lire long, ecrire court) sur le projet p1, puis un projet p2 nettement
+        # plus rapide qui n'apparaît qu'à la fin -- exactement le scénario que la stratégie
+        # C doit rattraper là où A et B stagnent. Nombres vérifiés par exécution, la lecture
+        # à la main de la tâche 8 (dernière) est celle qui compte : A et B se trompent de 3
+        # minutes, C tombe pile sur 0 dès que le facteur du projet p2 se forme.
+        obs = [
+            {"projet": "p1", "dureeTravailMin": 20, "criteres": [{"geste": "lire"}]},
+            {"projet": "p1", "dureeTravailMin": 4, "criteres": [{"geste": "ecrire"}]},
+            {"projet": "p1", "dureeTravailMin": 20, "criteres": [{"geste": "lire"}]},
+            {"projet": "p1", "dureeTravailMin": 4, "criteres": [{"geste": "ecrire"}]},
+            {"projet": "p1", "dureeTravailMin": 4, "criteres": [{"geste": "ecrire"}]},
+            {"projet": "p2", "dureeTravailMin": 1, "criteres": [{"geste": "ecrire"}]},
+            {"projet": "p2", "dureeTravailMin": 1, "criteres": [{"geste": "ecrire"}]},
+            {"projet": "p2", "dureeTravailMin": 1, "criteres": [{"geste": "ecrire"}]},
+        ]
+        rejeu = chantier.rejeu_chronologique(obs, seuil_attribut=2, seuil_projet=2)
+        self.assertEqual(rejeu["A"]["n"], 7)
+        self.assertAlmostEqual(rejeu["A"]["mae"], 8.142857142857142)
+        self.assertAlmostEqual(rejeu["B"]["mae"], 7.0)
+        self.assertAlmostEqual(rejeu["C"]["mae"], 6.571428571428571)
+        # Le dernier tiers (deux dernières tâches, toutes deux du projet p2) est là où le
+        # facteur projet fait la différence : A et B stagnent à 3.0, C descend à 1.5.
+        self.assertAlmostEqual(rejeu["A"]["maeDernierTiers"], 3.0)
+        self.assertAlmostEqual(rejeu["B"]["maeDernierTiers"], 3.0)
+        self.assertAlmostEqual(rejeu["C"]["maeDernierTiers"], 1.5)
 
 
 if __name__ == "__main__":

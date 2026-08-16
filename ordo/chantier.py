@@ -8,6 +8,7 @@ sans verrou, has_cycle() n'accedant meme pas au disque : c'est une fonction pure
 from __future__ import annotations
 
 import calendar
+import json
 import re
 import shutil
 import statistics
@@ -293,6 +294,72 @@ def duree_mesuree_par_critere(task: dict, evenements: Iterable[dict]) -> dict[st
             durees[item_id] = (at - depart) / 60
         repere = at
     return durees
+
+
+# Plafond d'un creux plausible entre deux repères d'une même tâche (brief t-45). Choisi en
+# mesurant les deux seuls journaux machine accessibles (ordo-public, camcast, brief t-45) :
+# les creux réels entre checklist-doing/checklist-coche vont de 0,02 à 14,2 minutes, et la
+# plus grosse estimation JAMAIS posée à la main sur un critère (brief t-33/t-36) est de 25
+# minutes. Une heure laisse une marge large sur ces deux mesures tout en écartant nettement
+# toute vraie pause (repas, nuit) : dans les mêmes journaux, l'écart suivant le plus proche
+# au-dessus de 14 minutes se compte en heures, jamais en dizaines de minutes -- pas de creux
+# "moyen" entre les deux à départager.
+CREUX_MAX_MIN = 60.0
+
+
+def _reperes_tache(task: dict, evenements: Iterable[dict]) -> list[float] | None:
+    """Repères chronologiques (epoch UTC) d'une tâche, du lancement au rapport, en passant
+    par chaque checklist-doing/checklist-coche du journal machine (t-34) qui la concerne et
+    tombe strictement entre les deux (brief t-45).
+
+    None dès que startedAt ou finishedAt manque ou est incohérent -- même garde que
+    _duree_reelle_min : sans ce couple, il n'y a rien à découper.
+    """
+    debut = _epoch(task.get("startedAt"))
+    fin = _epoch(task.get("finishedAt"))
+    if debut is None or fin is None or fin <= debut:
+        return None
+    reperes_internes = sorted(
+        at
+        for evt in evenements
+        if evt.get("tache") == task["id"] and evt.get("type") in _EVENEMENTS_DUREE
+        for at in (_epoch(evt.get("at")),)
+        if at is not None and debut < at < fin
+    )
+    return [debut, *reperes_internes, fin]
+
+
+def duree_travail_min(task: dict, evenements: Iterable[dict]) -> float | None:
+    """Temps de TRAVAIL d'une tâche terminée, en minutes-Claude (brief t-45) : distinct du
+    délai d'horloge brut (_duree_reelle_min), qui compte les nuits et les pauses comme si
+    c'était du travail -- exactement ce qui a fait échouer l'estimation à l'aveugle de t-42
+    (erreur médiane 118% de la durée médiane).
+
+    Principe : découper le délai brut de la tâche en repères chronologiques (lancement,
+    chaque checklist-doing/checklist-coche du journal machine t-34, rapport), plafonner
+    CHAQUE intervalle entre deux repères consécutifs à CREUX_MAX_MIN et sommer les
+    intervalles plafonnés. Un intervalle anormalement long (nuit, repas, changement de
+    session) ne contribue jamais plus de CREUX_MAX_MIN minutes au total ; le reste est
+    retranché, jamais compté comme du travail.
+
+    Une tâche SANS repère intermédiaire (antérieure au journal machine t-34, ou jamais
+    marquée --doing/coché en cours de route) n'a qu'un seul intervalle : son délai brut
+    entier, de bout en bout. Rien à plafonner en confiance dans ce cas précis -- plafonner
+    un délai qu'on ne peut pas découper serait deviner un temps de travail, pas le mesurer
+    (invariant 2 du brief t-45). Un délai brut déjà sous CREUX_MAX_MIN reste tel quel : un
+    travail continu plausible. Au-delà, la tâche est EXCLUE (None) plutôt que devinée --
+    exactement le cas d'une tâche lancée le soir et rendue le lendemain sans aucune trace
+    intermédiaire.
+    """
+    reperes = _reperes_tache(task, evenements)
+    if reperes is None:
+        return None
+    if len(reperes) == 2:
+        brut = (reperes[1] - reperes[0]) / 60
+        return brut if brut <= CREUX_MAX_MIN else None
+    return sum(
+        min((apres - avant) / 60, CREUX_MAX_MIN) for avant, apres in zip(reperes, reperes[1:])
+    )
 
 
 def _session_unique(state: dict, slug: str, chantier_id: str) -> str:
@@ -874,6 +941,515 @@ def set_checklist_attribut(task_id: str, item_id: str, cle: str, valeur: str) ->
                 f"item not found: {item_id} does not exist in the checklist of {task_id}"
             )
     return task
+
+
+# Estimation algorithmique par attributs (brief t-43), sur demande explicite de l'humain :
+# un calcul déterministe, jamais un jugement d'IA, qui se relit et se refait au crayon.
+#
+# RÉSERVE, à lire avant tout le reste : pour les tâches terminées avant l'horodatage des
+# coches (t-34), seule la durée TOTALE de la tâche est mesurée -- aucune durée par critère
+# individuelle n'existe dans cet historique. Chaque critère coché d'une tâche "done" reçoit
+# donc comme cible d'entraînement le même partage moyen de sa tâche
+# (_duree_reelle_par_critere), pas une mesure qui lui soit propre : on apprend sur des
+# sommes d'attributs par tâche, jamais sur des critères isolés. Une tâche à beaucoup de
+# critères cochés pèse donc plus lourd dans l'entraînement qu'une tâche qui en a peu -- une
+# limite du jeu de données actuel, pas un choix, à corriger le jour où l'historique aura
+# assez de couples doing/coche pour que duree_mesuree_par_critere() serve de cible à la
+# place.
+SEUIL_OBSERVATIONS_ATTRIBUT = 10
+# Sous ce nombre d'observations pour une VALEUR d'attribut donnée (ex. geste=publier), son
+# facteur n'est pas retenu (contrainte 3 du brief) : "vue trois fois" ne permet aucune
+# inférence, dix est le plus petit palier rond qui laisse une marge large au-dessus -- sur
+# les deux seuls homes mesurés pour ce brief, les facteurs retenus sont rigoureusement les
+# mêmes pour tout seuil entre 8 et 20, signe que 10 tombe au milieu d'un plateau stable et
+# non sur une cassure arbitraire.
+
+K_PLIS = 5
+SEUIL_TACHES_CV = 15
+# Plancher de tâches (groupées, pas de critères isolés) avant de même tenter la validation
+# croisée : avec K_PLIS=5, 15 tâches donnent trois tâches de test par pli en moyenne. En
+# dessous, une seule tâche inhabituelle dans un pli suffit à faire basculer le verdict --
+# ce serait un artefact du découpage, pas un signal. Sous ce plancher,
+# validation_croisee_estimation() rend None et estimation_critere() s'en tient à la
+# médiane, exactement le "on n'estime pas" de la contrainte 3.
+
+
+def observations_par_critere(state: dict) -> list[tuple[str, list[tuple[dict, float]]]]:
+    """Jeu d'observations d'entraînement (brief t-43, c1) : pour chaque tâche "done" de ce
+    home dont la durée réelle est exploitable, la liste de ses critères COCHÉS qui portent
+    des attributs (brief t-36), chacun associé à la cible partagée de sa tâche (voir la
+    réserve ci-dessus). Groupé par tâche, jamais à plat, parce que la validation croisée a
+    besoin de garder tous les critères d'une même tâche du même côté d'un pli -- les
+    disperser romprait le découpage (une tâche "facile" verrait une partie de ses critères
+    servir à s'évaluer elle-même).
+
+    Trié par identifiant de tâche : reproductible d'un appel à l'autre, indépendant de
+    l'ordre d'insertion dans state["taches"].
+
+    Une tâche sans critère attribué, ou dont aucun critère coché ne porte d'attributs, est
+    simplement absente du résultat -- rien à en tirer, pas une anomalie à signaler.
+    """
+    groupes = []
+    for task_id in sorted(state["taches"]):
+        task = state["taches"][task_id]
+        if task.get("state") != "done":
+            continue
+        cible = _duree_reelle_par_critere(task)
+        if cible is None:
+            continue
+        paires = [
+            (item["attributs"], cible)
+            for item in task.get("checklist", [])
+            if item.get("done") and item.get("attributs")
+        ]
+        if paires:
+            groupes.append((task_id, paires))
+    return groupes
+
+
+def _paires_a_plat(groupes: list[tuple[str, list[tuple[dict, float]]]]) -> list[tuple[dict, float]]:
+    return [paire for _, paires in groupes for paire in paires]
+
+
+def _facteurs(
+    paires: list[tuple[dict, float]], mediane: float, seuil: int
+) -> dict[str, dict[str, float]]:
+    """Facteur multiplicatif médiane(cibles de cette valeur) / médiane globale, par valeur
+    d'attribut retenue (brief t-43, c2) -- un attribut dont la valeur ne change rien à la
+    durée rend un facteur proche de 1, un attribut qui sépare vraiment les critères s'en
+    écarte. Valeur sous SEUIL_OBSERVATIONS_ATTRIBUT : absente du résultat plutôt que posée
+    sur un échantillon trop mince (contrainte 3)."""
+    par_cle: dict[str, dict[str, list[float]]] = {}
+    for attributs, cible in paires:
+        for cle, valeur in attributs.items():
+            par_cle.setdefault(cle, {}).setdefault(valeur, []).append(cible)
+    facteurs: dict[str, dict[str, float]] = {}
+    for cle, par_valeur in par_cle.items():
+        retenus = {
+            valeur: statistics.median(cibles) / mediane
+            for valeur, cibles in par_valeur.items()
+            if len(cibles) >= seuil
+        }
+        if retenus:
+            facteurs[cle] = retenus
+    return facteurs
+
+
+def facteurs_par_attribut(
+    state: dict, seuil: int = SEUIL_OBSERVATIONS_ATTRIBUT
+) -> dict[str, dict[str, float]] | None:
+    """Écart mesuré par valeur d'attribut sur tout l'historique de ce home (brief t-43,
+    c2) : c'est ce tableau qui dit quels attributs séparent vraiment les durées (facteur
+    loin de 1, beaucoup d'observations) et lesquels n'expliquent rien (facteur proche de 1)
+    -- une lecture directe, sans devoir relancer une validation croisée pour la voir.
+
+    None si ce home n'a encore aucune tâche terminée mesurable (pas de médiane à rapporter
+    contre) ; dict vide si des tâches existent mais qu'aucune valeur d'attribut n'atteint
+    le seuil.
+    """
+    mediane = mediane_duree_par_critere(state)
+    if mediane is None:
+        return None
+    paires = _paires_a_plat(observations_par_critere(state))
+    return _facteurs(paires, mediane, seuil)
+
+
+def _estimation_par_attributs(attributs: dict, mediane: float, facteurs: dict) -> float:
+    """Produit des facteurs des attributs FOURNIS et retenus par l'entraînement -- une clé
+    absente de `attributs`, une valeur jamais vue, ou un facteur sous le seuil (absent de
+    `facteurs`) ne modifient pas l'estimation : la médiane reste la valeur neutre par
+    défaut de chaque facteur manquant, jamais une supposition."""
+    estimation = mediane
+    for cle, valeur in attributs.items():
+        facteur = facteurs.get(cle, {}).get(valeur)
+        if facteur is not None:
+            estimation *= facteur
+    return estimation
+
+
+def validation_croisee_estimation(
+    state: dict, seuil: int = SEUIL_OBSERVATIONS_ATTRIBUT, plis: int = K_PLIS
+) -> dict | None:
+    """Erreur du modèle par attributs comparée à celle de la seule médiane, en validation
+    croisée GROUPÉE PAR TÂCHE (brief t-43, c4) : chaque pli entraîne médiane et facteurs sur
+    les autres plis, puis mesure l'écart absolu des deux méthodes sur les tâches qu'il n'a
+    jamais vues à l'entraînement. Le découpage en plis est déterministe (indice de la tâche
+    triée modulo `plis`), jamais tiré au hasard -- deux appels sur le même state rendent
+    exactement le même résultat (contrainte 1).
+
+    None si ce home a moins de SEUIL_TACHES_CV tâches groupées exploitables (contrainte 3) :
+    en dessous, aucune comparaison n'est assez stable pour trancher, voir la justification
+    de la constante.
+
+    Rend {"taches": n, "maeMediane": ..., "maeAttributs": ..., "gagnant": "attributs" ou
+    "mediane"} -- MAE (mean absolute error) en minutes-Claude, la même unité que dureeMin,
+    directement lisible.
+    """
+    groupes = observations_par_critere(state)
+    if len(groupes) < SEUIL_TACHES_CV:
+        return None
+    erreurs_mediane: list[float] = []
+    erreurs_attributs: list[float] = []
+    for pli in range(plis):
+        entrainement = [g for i, g in enumerate(groupes) if i % plis != pli]
+        test = [g for i, g in enumerate(groupes) if i % plis == pli]
+        paires_entrainement = _paires_a_plat(entrainement)
+        if not paires_entrainement:
+            continue
+        mediane_pli = statistics.median(cible for _, cible in paires_entrainement)
+        facteurs_pli = _facteurs(paires_entrainement, mediane_pli, seuil)
+        for _, paires in test:
+            for attributs, cible in paires:
+                erreurs_mediane.append(abs(mediane_pli - cible))
+                estime = _estimation_par_attributs(attributs, mediane_pli, facteurs_pli)
+                erreurs_attributs.append(abs(estime - cible))
+    if not erreurs_mediane:
+        return None
+    mae_mediane = statistics.mean(erreurs_mediane)
+    mae_attributs = statistics.mean(erreurs_attributs)
+    return {
+        "taches": len(groupes),
+        "maeMediane": mae_mediane,
+        "maeAttributs": mae_attributs,
+        "gagnant": "attributs" if mae_attributs < mae_mediane else "mediane",
+    }
+
+
+def estimation_critere(state: dict, attributs: dict) -> int | None:
+    """LA fonction du brief t-43 : pour un critère donné par ses attributs (brief t-36),
+    rend une durée estimée en minutes-Claude, calculée sur l'historique de CE home.
+
+    Ne livre le modèle par attributs QUE si validation_croisee_estimation() le mesure
+    réellement meilleur que la médiane seule (contrainte du brief : "si ta formule ne fait
+    pas mieux que la médiane, tu ne la livres pas") -- ce verdict est recalculé à CHAQUE
+    appel à partir de l'état courant (contrainte 2, "ça s'ajuste tout seul") : aucun
+    drapeau écrit sur disque ne fige jamais la décision, une tâche terminée de plus peut la
+    faire basculer sans qu'on touche à ce fichier. Au moment d'écrire ceci, mesuré sur les
+    deux seuls homes disponibles (voir le rapport de t-43), le modèle par attributs PERD
+    contre la médiane en validation croisée groupée par tâche -- cette fonction rend donc
+    la médiane, un verdict mesuré à chaque appel, pas une valeur câblée.
+
+    None si ce home n'a encore aucune tâche terminée mesurable (contrainte 3, home neuf) :
+    rien à estimer. Sinon toujours un entier, jamais zéro (même convention que
+    _duree_calculee).
+    """
+    mediane = mediane_duree_par_critere(state)
+    if mediane is None:
+        return None
+    verdict = validation_croisee_estimation(state)
+    if verdict is None or verdict["gagnant"] != "attributs":
+        return _duree_calculee(mediane)
+    facteurs = facteurs_par_attribut(state) or {}
+    return max(1, round(_estimation_par_attributs(attributs, mediane, facteurs)))
+
+
+# Facteur par projet et rejeu chronologique (brief t-47), deuxième étage au-dessus du
+# modèle par attributs de t-43 : "ce qu'un critère coûte en général" (facteurs_par_attribut,
+# appris sur tout le home) ne dit rien de "ce que CE projet coûte en plus ou en moins" --
+# un gros dépôt lent fait durer toutes ses tâches, quels que soient leurs attributs. La
+# cible d'entraînement ici est le temps de TRAVAIL (duree_travail_min, brief t-45), jamais
+# le délai brut : c'est la même correction nuit/pause que t-45 a apportée à
+# _duree_reelle_par_critere, appliquée à ce second étage plutôt que de continuer à apprendre
+# sur des pauses. Les fonctions par attributs de t-43 ci-dessus restent, elles, sur le délai
+# brut -- les faire migrer vers duree_travail_min est un chantier à part, hors zone de ce
+# brief, signalé dans le rapport plutôt que fait en douce.
+
+
+def _cible_travail_par_critere(task: dict, evenements: Iterable[dict]) -> float | None:
+    """Temps de travail (duree_travail_min, brief t-45) réparti à parts égales entre les
+    critères COCHÉS d'une tâche -- même partage que _duree_reelle_par_critere (brief t-43)
+    sur le délai brut, appliqué ici à la mesure corrigée des nuits. Cible commune du
+    facteur par projet et du rejeu chronologique (brief t-47).
+
+    None si le temps de travail est inconnu (tâche exclue faute de repère, brief t-45) ou
+    si aucun critère de la tâche n'est coché.
+    """
+    travail = duree_travail_min(task, evenements)
+    if travail is None:
+        return None
+    franchis = sum(1 for item in task.get("checklist", []) if item.get("done"))
+    if franchis == 0:
+        return None
+    return travail / franchis
+
+
+def _projet_de_tache(state: dict, task: dict) -> str:
+    """Étiquette de projet d'une tâche : le chemin canonique posé par chantier.start() sur
+    son chantier (state["chantiers"][...]["project"]), pas la tâche elle-même qui ne le
+    porte pas. Un home_partage (décision D) peut porter plusieurs projets à la fois -- c'est
+    justement ce que ce brief distingue. Retombe sur l'identifiant du chantier si celui-ci a
+    disparu (archive, brief t-25) plutôt que de planter : mieux vaut une étiquette imparfaite
+    qu'une exception qui casse tout le calcul.
+    """
+    chantier = state.get("chantiers", {}).get(task.get("chantier"), {})
+    return chantier.get("project") or task.get("chantier") or "?"
+
+
+def observations_projet(
+    state: dict, evenements: Iterable[dict]
+) -> dict[str, list[tuple[dict, float]]]:
+    """Jeu d'observations du facteur par projet (brief t-47) : comme observations_par_critere()
+    (t-43) mais regroupé par PROJET plutôt que par tâche, et sur la cible en temps de
+    travail (_cible_travail_par_critere) plutôt que le délai brut -- c'est le HOME entier,
+    tous projets confondus s'il en porte plusieurs (home_partage), qui sert de fond commun ;
+    chaque projet en est la subdivision qu'on corrige.
+
+    Chaque critère COCHÉ de chaque tâche exploitable contribue une paire (attributs -- {} si
+    le critère n'en porte aucun --, cible), pour que la médiane par projet et par home
+    compte TOUS les critères francs, exactement comme mediane_duree_par_critere : un projet
+    qui coche beaucoup de critères sans attributs pèse quand même sur son propre facteur.
+    """
+    par_projet: dict[str, list[tuple[dict, float]]] = {}
+    for task_id in sorted(state["taches"]):
+        task = state["taches"][task_id]
+        if task.get("state") != "done":
+            continue
+        cible = _cible_travail_par_critere(task, evenements)
+        if cible is None:
+            continue
+        projet = _projet_de_tache(state, task)
+        paires = [
+            (item.get("attributs") or {}, cible)
+            for item in task.get("checklist", [])
+            if item.get("done")
+        ]
+        par_projet.setdefault(projet, []).extend(paires)
+    return par_projet
+
+
+SEUIL_OBSERVATIONS_PROJET = 8
+# Plancher de critères cochés d'un projet avant de lui reconnaître un facteur (brief t-47,
+# "sous un seuil que tu fixes et justifies, pas de facteur du tout"). Plus bas que
+# SEUIL_OBSERVATIONS_ATTRIBUT (10) parce que le facteur projet ne compare qu'UNE médiane à
+# UNE autre (deux valeurs), pas dix valeurs de gestes différentes en concurrence sur le même
+# budget d'observations : une médiane sur 8 points reste lisible et se resserre vite --
+# lire une seule fois, en dessous, une majorité de tâches viendrait d'une poignée de critères
+# voisins dans le temps, pas d'un vrai échantillon du projet. Mesuré sur les trois homes de
+# ce brief (camcast 54, loko 33, lavuln 17 tâches "done" au moment du rejeu) : les trois
+# dépassent ce seuil dès le premier tiers de leur histoire, ce qui laisse au rejeu de quoi
+# comparer les deux tiers suivants avec un facteur déjà formé.
+
+
+def facteur_projet(
+    state: dict,
+    evenements: Iterable[dict],
+    canon_project: str,
+    seuil: int = SEUIL_OBSERVATIONS_PROJET,
+) -> float | None:
+    """Facteur correctif propre à UN projet de ce home (brief t-47, c2) : médiane des
+    cibles (temps de travail, t-45) des critères de ce projet, rapportée à la médiane du
+    HOME ENTIER. >1 : ce projet coûte systématiquement plus cher que le reste du home, quels
+    que soient les attributs de ses critères (dépôt lent, tests longs, machine chargée...) ;
+    <1 : moins cher. Facteur neutre implicite = 1 pour tout projet absent du résultat.
+
+    None si ce home n'a encore aucune cible mesurable (rien à rapporter), ou si CE projet a
+    moins de `seuil` critères cochés observés (contrainte du brief, voir
+    SEUIL_OBSERVATIONS_PROJET) : sous ce seuil, pas de facteur du tout plutôt qu'un chiffre
+    instable formé sur une poignée de critères.
+    """
+    par_projet = observations_projet(state, evenements)
+    toutes = [paire for paires in par_projet.values() for paire in paires]
+    if not toutes:
+        return None
+    paires_projet = par_projet.get(canon_project, [])
+    if len(paires_projet) < seuil:
+        return None
+    mediane_home = statistics.median(cible for _, cible in toutes)
+    mediane_projet = statistics.median(cible for _, cible in paires_projet)
+    return mediane_projet / mediane_home
+
+
+_FICHIER_CALIBRATION_PROJET = "calibration_projet.json"
+
+
+def _chemin_calibration_projet(home: Path | None = None) -> Path:
+    return (home if home is not None else store.home()) / _FICHIER_CALIBRATION_PROJET
+
+
+def charger_calibration_projet(home: Path | None = None) -> dict[str, dict]:
+    """Relit le petit JSON de calibration par projet de ce home (brief t-47, c3) : quelques
+    clés par projet, lisible et éditable à la main -- pas un modèle sérialisé que personne
+    ne pourrait corriger. {} si le fichier n'existe pas encore (home neuf, ou tous ses
+    projets sous le seuil) ou est illisible (JSON corrompu) : une calibration absente
+    équivaut à "aucun facteur", jamais une exception qui casse l'estimation appelante.
+    """
+    chemin = _chemin_calibration_projet(home)
+    if not chemin.exists():
+        return {}
+    try:
+        with chemin.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def sauver_calibration_projet(calibration: dict[str, dict], home: Path | None = None) -> None:
+    """Écrit le JSON de calibration par projet -- indenté et trié par clé, pour rester
+    lisible et diffable à la main (brief t-47, c3)."""
+    chemin = _chemin_calibration_projet(home)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with chemin.open("w", encoding="utf-8") as f:
+        json.dump(calibration, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def recalculer_calibration_projet(
+    state: dict,
+    evenements: Iterable[dict],
+    seuil: int = SEUIL_OBSERVATIONS_PROJET,
+    home: Path | None = None,
+) -> dict[str, dict]:
+    """Recalcule le facteur de TOUS les projets de ce home et PERSISTE le résultat (brief
+    t-47, c3) -- à appeler quand une tâche se termine (contrat du brief ; le point d'appel
+    côté report.py/cli.py reste hors zone de cette tâche, voir le rapport de t-47). Relu à
+    chaque estimation via charger_calibration_projet(), jamais mis en cache en mémoire.
+
+    Un projet qui retombe sous le seuil (tâches annulées, historique qui change) voit sa
+    clé DISPARAÎTRE du fichier plutôt que d'y garder un chiffre devenu moins mesurable --
+    la relecture humaine du JSON reste honnête sur ce qui est vraiment établi.
+    """
+    par_projet = observations_projet(state, evenements)
+    toutes = [paire for paires in par_projet.values() for paire in paires]
+    calibration: dict[str, dict] = {}
+    if toutes:
+        mediane_home = statistics.median(cible for _, cible in toutes)
+        for projet, paires in par_projet.items():
+            if len(paires) < seuil:
+                continue
+            calibration[projet] = {
+                "facteur": statistics.median(cible for _, cible in paires) / mediane_home,
+                "observations": len(paires),
+                "recalculeLe": store.now(),
+            }
+    sauver_calibration_projet(calibration, home)
+    return calibration
+
+
+def _stats_rejeu(erreurs: list[float]) -> dict:
+    """Statistiques d'une série d'erreurs absolues DANS L'ORDRE DU REJEU (brief t-47, c5) :
+    ensemble, premier tiers, dernier tiers -- c'est la comparaison de ces deux derniers qui
+    dit si une stratégie s'améliore avec l'usage. Sous 3 erreurs, premier et dernier tiers
+    se recouvrent (au moins un élément commun) : lu en connaissance de cause plutôt que
+    masqué, un rejeu aussi court n'a de toute façon rien de concluant à offrir.
+    """
+    n = len(erreurs)
+    if n == 0:
+        return {
+            "n": 0,
+            "mae": None,
+            "medianeErreur": None,
+            "maePremierTiers": None,
+            "maeDernierTiers": None,
+        }
+    tiers = max(1, n // 3)
+    return {
+        "n": n,
+        "mae": statistics.mean(erreurs),
+        "medianeErreur": statistics.median(erreurs),
+        "maePremierTiers": statistics.mean(erreurs[:tiers]),
+        "maeDernierTiers": statistics.mean(erreurs[-tiers:]),
+    }
+
+
+def preparer_rejeu(state: dict, evenements: Iterable[dict]) -> list[dict]:
+    """Assemble, pour CE home, le jeu d'entrée de rejeu_chronologique() (brief t-47) : une
+    entrée par tâche "done" exploitable (temps de travail connu, au moins un critère coché),
+    triées par ordre RÉEL de complétion (finishedAt croissant -- format ISO 8601 de ce
+    fichier, donc comparable directement en chaîne, sans reparser).
+
+    Un rejeu qui combine plusieurs homes (les trois chantiers du brief t-47, chacun son
+    state.json) appelle cette fonction une fois par home puis trie l'UNION des listes
+    rendues sur "finishedAt", jamais chaque liste séparément -- sinon l'ordre inter-home se
+    perd et le rejeu entraînerait parfois sur un futur qu'il n'aurait pas dû connaître.
+    """
+    resultat = []
+    for task_id in sorted(state["taches"]):
+        task = state["taches"][task_id]
+        if task.get("state") != "done":
+            continue
+        travail = duree_travail_min(task, evenements)
+        if travail is None:
+            continue
+        criteres = [
+            item.get("attributs") or {} for item in task.get("checklist", []) if item.get("done")
+        ]
+        if not criteres:
+            continue
+        resultat.append(
+            {
+                "projet": _projet_de_tache(state, task),
+                "dureeTravailMin": travail,
+                "criteres": criteres,
+                "finishedAt": task.get("finishedAt") or "",
+            }
+        )
+    resultat.sort(key=lambda o: o["finishedAt"])
+    return resultat
+
+
+def rejeu_chronologique(
+    observations: list[dict],
+    seuil_attribut: int = SEUIL_OBSERVATIONS_ATTRIBUT,
+    seuil_projet: int = SEUIL_OBSERVATIONS_PROJET,
+) -> dict[str, dict]:
+    """LE REJEU du brief t-47, le livrable qui compte : rejoue `observations` (triées par
+    l'appelant, voir preparer_rejeu, dans l'ordre RÉEL de complétion) et mesure, à CHAQUE
+    tâche, ce que chacune des trois stratégies aurait estimé en ne connaissant que ce qui la
+    précède -- jamais un entraînement sur le futur de cette même tâche.
+
+    Chaque élément de `observations` : {"projet": <étiquette>, "dureeTravailMin": <float>,
+    "criteres": [<attributs>, ...]} -- un dict d'attributs (éventuellement {}) par critère
+    coché de la tâche ; la même liste sert à répartir également dureeTravailMin entre eux
+    pour former sa cible d'entraînement UNE FOIS la tâche intégrée (même convention que
+    _cible_travail_par_critere).
+
+    Trois stratégies comparées à chaque pas :
+      A. médiane globale seule (attributs ignorés) ;
+      B. attributs seuls (médiane globale + facteurs par attribut, comme t-43) ;
+      C. B, multiplié par le facteur du projet de la tâche s'il est déjà formé (seuil_projet
+         critères cochés antérieurs pour CE projet), sinon C == B pour cette tâche -- un
+         projet neuf part sans facteur, au modèle global, exactement la règle du brief.
+
+    La toute première tâche du rejeu ne peut être estimée par AUCUNE stratégie (aucune
+    observation antérieure, pas même une médiane) : elle est intégrée mais absente des
+    erreurs, jamais devinée à zéro observation.
+
+    Rend {"A": {...}, "B": {...}, "C": {...}}, une entrée par stratégie -- voir
+    _stats_rejeu() pour la forme de chaque valeur : n, mae, medianeErreur,
+    maePremierTiers, maeDernierTiers.
+    """
+    paires_globales: list[tuple[dict, float]] = []
+    paires_par_projet: dict[str, list[tuple[dict, float]]] = {}
+    erreurs: dict[str, list[float]] = {"A": [], "B": [], "C": []}
+
+    for obs in observations:
+        criteres = obs["criteres"]
+        reel = obs["dureeTravailMin"]
+
+        if paires_globales:
+            mediane = statistics.median(cible for _, cible in paires_globales)
+            facteurs = _facteurs(paires_globales, mediane, seuil_attribut)
+            estime_a = mediane * len(criteres)
+            estime_b = sum(
+                _estimation_par_attributs(attrs, mediane, facteurs) for attrs in criteres
+            )
+            paires_projet = paires_par_projet.get(obs["projet"], [])
+            facteur_proj = (
+                statistics.median(cible for _, cible in paires_projet) / mediane
+                if len(paires_projet) >= seuil_projet
+                else None
+            )
+            estime_c = estime_b * facteur_proj if facteur_proj is not None else estime_b
+
+            erreurs["A"].append(abs(estime_a - reel))
+            erreurs["B"].append(abs(estime_b - reel))
+            erreurs["C"].append(abs(estime_c - reel))
+
+        cible = reel / len(criteres)
+        for attrs in criteres:
+            paires_globales.append((attrs, cible))
+            paires_par_projet.setdefault(obs["projet"], []).append((attrs, cible))
+
+    return {strategie: _stats_rejeu(liste) for strategie, liste in erreurs.items()}
 
 
 def reword_checklist_item(task_id: str, item_id: str, label: str) -> dict:

@@ -1068,5 +1068,202 @@ class TestGraphAscii(ChantierTestCase):
         self.assertTrue(rendu)
 
 
+class TestMedianeDureeParCritere(ChantierTestCase):
+    """mediane_duree_par_critere() : calibration sur l'historique réel (brief t-33).
+
+    "durée par critère" d'une tâche = sa durée réelle (finishedAt - startedAt) divisée par
+    le nombre de critères réellement cochés -- chaque tâche de ces tests ne coche qu'UN
+    seul critère, pour que sa durée réelle en minutes SOIT directement la valeur qui entre
+    dans la médiane, sans calcul supplémentaire à refaire dans le test.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+
+    def _tache_finie(self, minutes: int, debut: str = "2026-08-01T00:00:00Z") -> str:
+        t = chantier.add_task(self.chantier_id, "t", "prompt", checklist=["c"])
+        h, m, s = (int(x) for x in debut[11:19].split(":"))
+        fin = f"{debut[:11]}{h:02d}:{(m + minutes) % 60:02d}:{s:02d}Z"
+        if m + minutes >= 60:
+            fin = f"{debut[:11]}{h + (m + minutes) // 60:02d}:{(m + minutes) % 60:02d}:{s:02d}Z"
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = debut
+            item["finishedAt"] = fin
+            item["checklist"][0]["done"] = True
+        return t["id"]
+
+    def test_home_neuf_sans_historique_rend_none(self):
+        # Piège 2 : ne pas planter, ne pas poser zéro, s'abstenir.
+        self.assertIsNone(chantier.mediane_duree_par_critere(store.load()))
+
+    def test_mediane_pas_moyenne(self):
+        # Piège 1 : [1, 2, 2, 3, 10] a pour médiane 2 et pour moyenne 3.6 -- une
+        # implémentation qui ferait la moyenne par erreur romprait cette assertion.
+        for minutes in (1, 2, 2, 3, 10):
+            self._tache_finie(minutes)
+        self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 2)
+
+    def test_mediane_paire_moyenne_des_deux_valeurs_du_milieu(self):
+        for minutes in (1, 2, 3, 4):
+            self._tache_finie(minutes)
+        self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 2.5)
+
+    def test_ignore_les_taches_non_terminees(self):
+        self._tache_finie(1)
+        t = chantier.add_task(self.chantier_id, "en cours", "prompt", checklist=["c"])
+        with store.locked() as state:
+            state["taches"][t["id"]]["state"] = "running"
+            state["taches"][t["id"]]["startedAt"] = "2026-08-01T00:00:00Z"
+        self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 1)
+
+    def test_ignore_une_tache_sans_horodatage_de_lancement(self):
+        self._tache_finie(1)
+        t = chantier.add_task(self.chantier_id, "sans départ", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["finishedAt"] = "2026-08-01T00:05:00Z"
+            item["checklist"][0]["done"] = True
+        self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 1)
+
+    def test_ignore_une_tache_a_lhorodatage_incoherent(self):
+        # finishedAt avant startedAt : incohérent, jamais estimé à zéro (contaminerait la
+        # médiane de toutes les autres tâches).
+        self._tache_finie(1)
+        t = chantier.add_task(self.chantier_id, "incohérente", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:10:00Z"
+            item["finishedAt"] = "2026-08-01T00:00:00Z"
+            item["checklist"][0]["done"] = True
+        self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 1)
+
+    def test_ignore_une_tache_terminee_sans_aucun_critere_coche(self):
+        self._tache_finie(1)
+        t = chantier.add_task(self.chantier_id, "rien de coché", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][t["id"]]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:07:00Z"
+        self.assertEqual(chantier.mediane_duree_par_critere(store.load()), 1)
+
+
+class TestEstimationParDefaut(ChantierTestCase):
+    """Quand un critère est créé sans durée, Ordo lui pose la médiane calculée sur ce home
+    (brief t-33). Une valeur posée explicitement, elle, n'est jamais écrasée (piège 6)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        # Une seule tâche de référence, coche un seul critère en 6 minutes : la médiane de
+        # ce home vaut exactement 6, sans ambiguïté d'arrondi.
+        ref = chantier.add_task(self.chantier_id, "ref", "prompt", checklist=["c"])
+        with store.locked() as state:
+            item = state["taches"][ref["id"]]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:06:00Z"
+            item["checklist"][0]["done"] = True
+
+    def test_add_task_pose_le_defaut_sur_un_critere_sans_duree(self):
+        t = chantier.add_task(self.chantier_id, "t", "prompt", checklist=["nouveau"])
+        item = t["checklist"][0]
+        self.assertEqual(item["dureeMin"], 6)
+        self.assertTrue(item["dureeDefaut"])
+
+    def test_add_task_necrase_jamais_une_duree_explicite(self):
+        t = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=[{"label": "x", "dureeMin": 99}]
+        )
+        item = t["checklist"][0]
+        self.assertEqual(item["dureeMin"], 99)
+        self.assertNotIn("dureeDefaut", item)
+
+    def test_add_checklist_item_pose_le_defaut(self):
+        t = chantier.add_task(self.chantier_id, "t", "prompt")["id"]
+        after = chantier.add_checklist_item(t, "ajouté après coup")
+        item = after["checklist"][0]
+        self.assertEqual(item["dureeMin"], 6)
+        self.assertTrue(item["dureeDefaut"])
+
+    def test_home_neuf_sans_historique_ne_pose_rien(self):
+        # Un VRAI home neuf, pas un second chantier du même home (celui du setUp porte déjà
+        # une tâche de référence) : un autre ORDO_HOME, sans aucun historique.
+        autre_home = tempfile.mkdtemp(prefix="ordo-chantier-test-neuf-")
+        try:
+            os.environ["ORDO_HOME"] = autre_home
+            cid = chantier.start(str(self._projet("neuf")), "obj")["id"]
+            t = chantier.add_task(cid, "t", "prompt", checklist=["c"])
+        finally:
+            os.environ["ORDO_HOME"] = self._tmp
+        item = t["checklist"][0]
+        self.assertIsNone(item["dureeMin"])
+        self.assertNotIn("dureeDefaut", item)
+
+
+class TestEcartEstimeReel(ChantierTestCase):
+    """ecart_estime_reel() : confrontation, sur une tâche terminée, entre l'estimation
+    totale de sa checklist et sa durée réellement mesurée (brief t-33)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+
+    def test_tache_plus_rapide_que_prevu(self):
+        # L'exemple du brief : 110 minutes annoncées, 17 réelles.
+        t = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=[{"label": "c", "dureeMin": 110}]
+        )["id"]
+        with store.locked() as state:
+            item = state["taches"][t]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:17:00Z"
+        ecart = chantier.ecart_estime_reel(store.load()["taches"][t])
+        self.assertEqual(ecart, {"estimeMin": 110, "reelMin": 17, "ecartMin": -93})
+
+    def test_tache_plus_lente_que_prevu(self):
+        t = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=[{"label": "c", "dureeMin": 5}]
+        )["id"]
+        with store.locked() as state:
+            item = state["taches"][t]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:12:00Z"
+        ecart = chantier.ecart_estime_reel(store.load()["taches"][t])
+        self.assertEqual(ecart, {"estimeMin": 5, "reelMin": 12, "ecartMin": 7})
+
+    def test_tache_pas_terminee_rend_none(self):
+        t = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=[{"label": "c", "dureeMin": 5}]
+        )["id"]
+        with store.locked() as state:
+            state["taches"][t]["startedAt"] = "2026-08-01T00:00:00Z"
+        self.assertIsNone(chantier.ecart_estime_reel(store.load()["taches"][t]))
+
+    def test_aucun_critere_estime_rend_none(self):
+        t = chantier.add_task(self.chantier_id, "t", "prompt", checklist=["c"])["id"]
+        with store.locked() as state:
+            item = state["taches"][t]
+            item["state"] = "done"
+            item["startedAt"] = "2026-08-01T00:00:00Z"
+            item["finishedAt"] = "2026-08-01T00:12:00Z"
+        self.assertIsNone(chantier.ecart_estime_reel(store.load()["taches"][t]))
+
+    def test_horodatage_manquant_rend_none(self):
+        t = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=[{"label": "c", "dureeMin": 5}]
+        )["id"]
+        with store.locked() as state:
+            state["taches"][t]["state"] = "done"
+        self.assertIsNone(chantier.ecart_estime_reel(store.load()["taches"][t]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,15 +7,32 @@ sans verrou, has_cycle() n'accedant meme pas au disque : c'est une fonction pure
 
 from __future__ import annotations
 
+import calendar
 import re
 import shutil
+import statistics
+import time
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import suppress
 from pathlib import Path
 
 from . import store
 
-# Valeurs valides du champ chantier["permissions"] (point G). "skip" est le defaut :
+# Horodatage ISO 8601 UTC, même format que store.now() et carte._ISO -- pas de fonction
+# commune entre les deux modules, carte.py important déjà chantier.py (l'inverse créerait
+# un cycle), donc ce petit parseur reste local à ce fichier plutôt que partagé.
+_ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _epoch(horodatage: str | None) -> float | None:
+    if not horodatage:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(horodatage, _ISO)))
+    except (ValueError, TypeError):
+        return None
+
+# Valeurs valides du champ chantier["permissions"] (point G). "skip" est le défaut :
 # comportement actuel, ajoute --dangerously-skip-permissions au lancement d'une
 # executante. "normal" n'ajoute rien, l'executante repasse par les prompts d'autorisation
 # habituels de claude.
@@ -63,7 +80,14 @@ def _slug(canon_project: str) -> str:
     return slug or "chantier"
 
 
-def _normalize_checklist(items: Iterable) -> list[dict]:
+def _normalize_checklist(items: Iterable, defaut_min: float | None = None) -> list[dict]:
+    """defaut_min (brief t-33) : médiane historique à poser sur tout item SANS dureeMin
+    explicite. None par défaut, donc un appel sans ce paramètre reproduit exactement le
+    comportement d'avant t-33 -- les 349 critères déjà normalisés sans lui doivent
+    continuer de fonctionner (c8). La clé "dureeDefaut" n'apparaît QUE quand un défaut a
+    réellement été posé : jamais sur un item dont la durée est explicite, jamais quand
+    aucune médiane n'est disponible -- une valeur posée explicitement n'est jamais écrasée
+    (piège 6 du brief)."""
     normalized = []
     for i, item in enumerate(items, start=1):
         if isinstance(item, dict):
@@ -76,9 +100,13 @@ def _normalize_checklist(items: Iterable) -> list[dict]:
             item_id = f"c{i}"
             done = False
             duree_min = None
-        normalized.append(
-            {"id": item_id, "label": label, "done": done, "dureeMin": duree_min}
-        )
+        normalized_item = {"id": item_id, "label": label, "done": done, "dureeMin": duree_min}
+        if duree_min is None:
+            calculee = _duree_calculee(defaut_min)
+            if calculee is not None:
+                normalized_item["dureeMin"] = calculee
+                normalized_item["dureeDefaut"] = True
+        normalized.append(normalized_item)
     return normalized
 
 
@@ -116,6 +144,99 @@ def checklist_sans_duree(checklist: Iterable[dict]) -> list[dict]:
     estimation doivent continuer de fonctionner (c8), jamais lever de KeyError.
     """
     return [{"id": item["id"]} for item in checklist if item.get("dureeMin") is None]
+
+
+def _duree_reelle_min(task: dict) -> float | None:
+    """Minutes-Claude réellement écoulées entre lancement et rapport d'une tâche (brief
+    t-33) : startedAt jusqu'à finishedAt, l'horodatage posé par report.apply() au moment
+    exact où le rapport final est appliqué.
+
+    None dès que le couple manque ou est incohérent (fin <= début) : une tâche pareille
+    doit être IGNORÉE par l'appelant, jamais comptée comme zéro -- une valeur fausse
+    contaminerait la médiane de toutes les autres (piège du brief).
+    """
+    debut = _epoch(task.get("startedAt"))
+    fin = _epoch(task.get("finishedAt"))
+    if debut is None or fin is None or fin <= debut:
+        return None
+    return (fin - debut) / 60
+
+
+def _duree_reelle_par_critere(task: dict) -> float | None:
+    """Minutes-Claude réellement passées, en moyenne, sur chaque critère réellement
+    franchi (coché) d'une tâche (brief t-33) : sa durée réelle divisée par son nombre de
+    critères cochés. None si la tâche n'a aucun critère coché, ou si sa durée réelle
+    elle-même est inconnue (voir _duree_reelle_min).
+    """
+    duree = _duree_reelle_min(task)
+    if duree is None:
+        return None
+    franchis = sum(1 for item in task["checklist"] if item.get("done"))
+    if franchis == 0:
+        return None
+    return duree / franchis
+
+
+def mediane_duree_par_critere(state: dict) -> float | None:
+    """Médiane -- PAS la moyenne (brief t-33, piège 1) -- des minutes-Claude réellement
+    passées par critère, calculée sur TOUTES les tâches "done" de ce home, tous chantiers
+    confondus : c'est le seul repère qui ne dépend pas d'une intuition humaine, qu'aucun
+    humain n'a sur cette échelle. Une tâche non "done" (en cours, bloquée, annulée) n'est
+    jamais mesurée : sa durée n'est pas encore un fait acquis.
+
+    None sur un home neuf sans aucune tâche terminée mesurable (piège 2) : ne pas planter,
+    ne jamais poser zéro, laisser l'appelant s'abstenir de toute estimation par défaut.
+    """
+    valeurs = [
+        v
+        for t in state["taches"].values()
+        if t.get("state") == "done"
+        for v in (_duree_reelle_par_critere(t),)
+        if v is not None
+    ]
+    if not valeurs:
+        return None
+    return statistics.median(valeurs)
+
+
+def _duree_calculee(defaut_min: float | None) -> int | None:
+    """Durée par défaut à poser sur un critère créé sans estimation (brief t-33) : la
+    médiane arrondie à l'entier le plus proche, jamais à zéro (round() peut y tomber sur
+    une médiane très basse ; zéro se lirait comme une absence d'estimation plutôt que
+    comme une très courte -- voir dureeMin=None). None tant qu'aucune médiane n'est
+    disponible (home neuf, piège 2) : rien à poser, la case reste vide comme aujourd'hui.
+    """
+    if defaut_min is None:
+        return None
+    return max(1, round(defaut_min))
+
+
+def ecart_estime_reel(task: dict) -> dict | None:
+    """Confrontation estimé/réel d'une tâche TERMINÉE, en minutes-Claude (brief t-33) :
+    l'estimé est la somme des dureeMin connues de sa checklist (cochées comprises), le
+    réel est mesuré entre lancement et rapport (_duree_reelle_min). C'est cette
+    confrontation, DANS LES DEUX SENS, qui rend visible une tâche sur-estimée aussi bien
+    qu'une tâche sous-estimée : une tâche annoncée 110 minutes et faite en 17 doit le dire
+    (brief t-33), pas seulement un dépassement au-delà de l'estimé (voir
+    carte._depassement_min, brief t-27, qui ne regarde que le sens inverse).
+
+    None tant que la tâche n'est pas terminée, que son couple d'horodatages est absent ou
+    incohérent, ou qu'aucun critère de sa checklist ne porte d'estimation -- rien à
+    comparer.
+    """
+    if task.get("state") != "done":
+        return None
+    reel = _duree_reelle_min(task)
+    if reel is None:
+        return None
+    estimes = [
+        item["dureeMin"] for item in task["checklist"] if item.get("dureeMin") is not None
+    ]
+    if not estimes:
+        return None
+    estime_min = sum(estimes)
+    reel_min = round(reel)
+    return {"estimeMin": estime_min, "reelMin": reel_min, "ecartMin": reel_min - estime_min}
 
 
 def _session_unique(state: dict, slug: str, chantier_id: str) -> str:
@@ -373,7 +494,7 @@ def add_task(
             "state": "queued",
             "dependsOn": list(depends_on),
             "touches": list(touches),
-            "checklist": _normalize_checklist(checklist),
+            "checklist": _normalize_checklist(checklist, mediane_duree_par_critere(state)),
             "currentItem": None,
             "priority": 0,
             "attempts": 0,
@@ -528,13 +649,20 @@ def add_checklist_item(task_id: str, label: str) -> dict:
     créé, seul son propre id est nouveau (voir _next_checklist_id). Ne vérifie pas la
     convention de longueur (CHECKLIST_LABEL_MAX) : c'est un plafond signalé, jamais un
     refus, à l'appelant (cli.py) de le rapporter après coup, comme pour add_task.
+
+    Reçoit, comme add_task, la médiane historique du home en défaut (brief t-33) : un
+    critère ajouté après coup n'a pas plus d'intuition sur sa propre durée qu'un critère
+    posé à la création.
     """
     with store.locked() as state:
         task = _get_task(state, task_id)
         new_id = _next_checklist_id(task["checklist"])
-        task["checklist"].append(
-            {"id": new_id, "label": label, "done": False, "dureeMin": None}
-        )
+        item = {"id": new_id, "label": label, "done": False, "dureeMin": None}
+        calculee = _duree_calculee(mediane_duree_par_critere(state))
+        if calculee is not None:
+            item["dureeMin"] = calculee
+            item["dureeDefaut"] = True
+        task["checklist"].append(item)
     return task
 
 

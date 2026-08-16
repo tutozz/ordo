@@ -635,12 +635,45 @@ def _total_estime_min(checklist: list[dict]) -> int | None:
     return sum(valeurs) if valeurs else None
 
 
-def _depassement_min(elapsed_s: int | None, total_estime_min: int | None) -> str:
+def _restant_chantier_min(nodes: dict[str, dict]) -> int | None:
+    """Minutes-Claude restant du CHANTIER ENTIER (brief t-38) : somme, sur les tâches NI
+    FINIES NI ANNULÉES (même filtre que settled() côté JS), des restants déjà calculés
+    par _restant_min ci-dessous pour chaque case -- jamais un second calcul du même
+    nombre, qui finirait par diverger de celui affiché sur chaque tâche.
+
+    Une tâche dont le restant est partiellement inconnu (_restant_min y répond None) est
+    ignorée de la somme, exactement comme son propre None l'ignore déjà de sa case : un
+    trou d'estimation sur une tâche ne doit pas taire le total des vingt-cinq autres.
+
+    None seulement quand AUCUNE tâche active n'a le moindre restant connu : l'en-tête
+    doit alors ne rien afficher plutôt que mentir par un "0h00" qui se lirait comme
+    "chantier fini" (point 2 du brief).
+    """
+    connus = [
+        r
+        for r in (
+            _restant_min(node["checklist"])
+            for node in nodes.values()
+            if node["state"] not in ("done", "cancelled")
+        )
+        if r is not None
+    ]
+    return sum(connus) if connus else None
+
+
+def _depassement_min(state: str, elapsed_s: int | None, total_estime_min: int | None) -> str:
     """Le passé (elapsedS, mesuré depuis startedAt, jamais déclaré -- voir _elapsed) au-delà
     du total estimé (brief t-27, point 5) : jamais masqué en zéro, ce serait un mensonge
     exactement au moment où l'humain a besoin de l'information. Chaîne vide tant que le
     passé ne dépasse pas l'estimé, ou que l'un des deux est inconnu -- rien à comparer.
+
+    Chaîne vide aussi sur une tâche TERMINÉE (state == "done", retouche t-38) : son écart
+    (voir _ecart_valeur_texte ci-dessous) dit déjà le même fait, dans les deux sens en
+    plus, et le redire ici doublait le nombre à l'écran -- "+20m" ici, "estimé 1h50
+    (+20m)" dans l'écart, pour une seule et même tâche.
     """
+    if state == "done":
+        return ""
     if elapsed_s is None or total_estime_min is None:
         return ""
     ecart = (elapsed_s // 60) - total_estime_min
@@ -648,6 +681,22 @@ def _depassement_min(elapsed_s: int | None, total_estime_min: int | None) -> str
         return ""
     return "+" + _duree_min(ecart)
 
+
+
+
+def _ecart_valeur_texte(ecart: dict | None) -> str:
+    """La différence entre estimé et réel d'une tâche TERMINÉE, SIGNÉE et SEULE (brief
+    t-33, retouche t-38) : "-1h27" pour un gain -- plus rapide que prévu --, "+20m" pour
+    un dépassement. Le signe porte le sens ; c'est à la carte de le confirmer par une
+    couleur (vert pour un gain, couleur d'alerte pour un dépassement).
+
+    Chaîne vide dès que rien n'a été mesuré ou estimé -- même convention que
+    _depassement_min et "restant" plus haut.
+    """
+    if ecart is None:
+        return ""
+    signe = "+" if ecart["ecartMin"] > 0 else ("-" if ecart["ecartMin"] < 0 else "")
+    return f'{signe}{_duree_min(abs(ecart["ecartMin"]))}'
 
 
 
@@ -753,6 +802,9 @@ def vue(m: dict) -> dict:
     for tid in sorted(m["nodes"], key=_num_id):
         node = m["nodes"][tid]
         jetons = node.get("usage")
+        # Passé à "ecartValeur" ci-dessous, calculé ici pour rester à côté de son seul
+        # appelant.
+        ecart = chantier.ecart_estime_reel(node)
         tasks.append({
             "id": tid,
             "title": node["titre"],
@@ -779,10 +831,28 @@ def vue(m: dict) -> dict:
             # Restant (somme des critères non cochés) et dépassement (passé au-delà du
             # total estimé) : brief t-27. Chaîne vide et jamais un zéro fabriqué quand on
             # ne sait simplement pas -- même convention que "duree" et "doing" ci-dessus.
+            # "restant" ne s'affiche plus dans l'en-tête de la case fermée (retouche
+            # demandée pendant t-41, qui lui préfère "totalEstime" à côté de la durée) mais
+            # reste consommé tel quel par le détail ouvert (voir detailNode(), _JS).
             "restant": _duree_min(_restant_min(node["checklist"])),
+            # Total estimé de la checklist (cochés compris), affiché à côté de la durée
+            # écoulée sous la forme "écoulé / total" tant que la tâche n'est pas terminée
+            # (retouche demandée pendant t-41) -- jamais un second calcul du restant, qui
+            # ne dit que la moitié de l'histoire une fois une partie des critères cochés.
+            "totalEstime": _duree_min(_total_estime_min(node["checklist"])),
+            # Dépassement et écart sont désormais EXCLUSIFS, décidés par l'état de la
+            # tâche (retouche t-38) : _depassement_min se tait lui-même dès que la tâche
+            # est "done", pour ne jamais doubler ce que l'écart dit déjà mieux.
             "depassement": _depassement_min(
-                node["elapsedS"], _total_estime_min(node["checklist"])
+                node["state"], node["elapsedS"], _total_estime_min(node["checklist"])
             ),
+            # Écart estimé/réel (brief t-33), sur une tâche TERMINÉE seulement : la
+            # différence signée entre l'estimation totale de la checklist et la durée
+            # effectivement mesurée, colorée côté JS selon son signe. Le rappel de
+            # l'estimé seul ("estimé 1h50") a disparu de la case (retouche demandée
+            # pendant t-41) : il doublait la durée déjà affichée à côté, et empêchait le
+            # nom de tâche, le modèle et ces deux nombres de tenir sur une seule ligne.
+            "ecartValeur": _ecart_valeur_texte(ecart),
             # Le modele sort a part de facts pour la meme raison que la duree : il se lit
             # SANS ouvrir la tache. C'est lui qui dit s'il faut relire le brief avant de
             # lancer, et le relire apres coup ne sert plus a rien.
@@ -815,8 +885,28 @@ def vue(m: dict) -> dict:
                 {"id": r["id"], "text": f'{r["id"]} : {r["reason"]}'}
                 for r in node["blockedBy"]
             ],
+            # duree : déjà formatée en minutes-Claude par critère (brief t-31), même
+            # convention que "restant" juste au-dessus -- chaîne vide et jamais un tiret ni
+            # un zéro quand le critère n'a pas encore d'estimation (cas majoritaire).
+            #
+            # attrs : les cinq attributs de nature posés par t-36 (brief t-39), filtrés à
+            # ceux réellement RENSEIGNÉS sur ce critère -- jamais les cinq clés à plat avec
+            # une valeur vide, ce qui obligerait le JS à décider lui-même quoi taire (point
+            # 1 du brief : l'absence est le cas courant, pas le cas limite). L'ordre vient
+            # de chantier.ATTRIBUTS_VALEURS, source unique, plutôt qu'une seconde liste
+            # dupliquée ici qui pourrait un jour diverger de celle qui valide les valeurs.
             "checklist": [
-                {"text": c["label"], "done": bool(c["done"])} for c in node["checklist"]
+                {
+                    "text": c["label"],
+                    "done": bool(c["done"]),
+                    "duree": _duree_min(c.get("dureeMin")),
+                    "attrs": [
+                        {"cle": cle, "valeur": c["attributs"][cle]}
+                        for cle in chantier.ATTRIBUTS_VALEURS
+                        if cle in c.get("attributs", {})
+                    ],
+                }
+                for c in node["checklist"]
             ],
             "docs": _docs(node),
         })
@@ -837,6 +927,12 @@ def vue(m: dict) -> dict:
         "terminals": m["terminals"],
         "missingWhy": m["missingWhy"],
         "warnings": m["warnings"],
+        # Restant du CHANTIER entier (brief t-38), en minutes brutes et pas déjà
+        # formaté : contrairement à tout le reste de ce dict, ce nombre doit encore
+        # traverser une addition côté navigateur ("maintenant" + ce restant, pour
+        # l'heure de fin) avant de devenir du texte -- voir paintHeure() et
+        # finChantier() dans _JS. None si aucune tâche active n'a de restant connu.
+        "restantChantierMin": _restant_chantier_min(m["nodes"]),
         "tasks": tasks,
         "phases": [
             {
@@ -906,7 +1002,20 @@ padding:12px 14px 10px}
 display:flex;align-items:baseline;gap:8px}
 .cid{font-size:12px;font-weight:600;letter-spacing:.04em;color:var(--txt);
 border:1px solid #2b3038;border-radius:5px;padding:1px 6px}
-.pct{margin-left:auto;font-size:13px;font-weight:600;color:var(--txt)}
+/* ctx (slug/état/session) est le seul élément de l'en-tête à longueur variable : sans ce
+   rétrécissement, il repousserait le bloc restant/fin/pourcentage hors de la colonne
+   plutôt que de s'effacer devant lui (brief t-38, en-tête étroit). */
+#ctx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+/* Bloc de fin de ligne (restant, heure de fin, pourcentage) : un seul margin-left:auto
+   pour les trois, posé sur le conteneur et non sur .pct comme avant (brief t-38). Poser
+   la marge sur .pct seul aurait laissé le bloc [restant][fin] livré à lui-même dès que
+   l'un des deux se cache (colonne sans rien d'estimé, point 2) : le pourcentage seul se
+   serait alors retrouvé collé à ctx, sans le trou que laissait le bloc masqué. */
+#hend{margin-left:auto;flex:none;display:flex;align-items:baseline;gap:8px;min-width:0}
+#hrest{font-size:11.5px;color:var(--dim2)}
+#hfin{font-size:11.5px;font-weight:600;color:var(--txt2)}
+#hfin sup{font-size:9px;font-weight:600;color:var(--dim2);margin-left:1px}
+.pct{font-size:13px;font-weight:600;color:var(--txt)}
 #segs{display:flex;gap:3px;margin-top:9px;align-items:flex-end}
 #segs .seg{min-width:12px}
 #segs .track{height:6px;border-radius:2px;background:var(--line2);overflow:hidden}
@@ -1008,6 +1117,13 @@ border-radius:4px;padding:0 4px;color:var(--dim2);flex:none}
    d'alarme du reste de la carte (voir COL/kind()), jamais une nouvelle variable pour ce
    qui est la même famille de signal : quelque chose ne va pas comme prévu. */
 .over{color:var(--blocked);font-weight:600}
+/* Écart estimé/réel (brief t-33), sur une tâche terminée : neutre par défaut, --done (le
+   même vert que le reste de la carte) sur un gain, --blocked (la même alarme que .over)
+   sur un dépassement -- jamais une couleur inventée ici. Le rappel de l'estimé, qui avait
+   sa propre classe .ecart, a disparu de la case (retouche demandée pendant t-41). */
+.ecartv{color:var(--dim2);font-weight:600}
+.ecartv.gain{color:var(--done)}
+.ecartv.depasse{color:var(--blocked)}
 /* Le contexte du dernier tour, pas la sortie cumulée de la session (voir vue() en
    Python). Il ne se colore que sur une tâche en cours, où le chiffre bouge encore ; au-delà
    du seuil de compaction lu dans usage.SEUIL_CONTEXTE, il vire à l'orange : c'est le
@@ -1029,7 +1145,6 @@ color:var(--dim2)}
 .rprog{display:flex;gap:6px;align-items:baseline;margin-top:3px;font-size:10.5px;min-width:0}
 .rprog .cnt{color:var(--dim2);font-weight:600;flex:none}
 .row.done .rprog .cnt{color:var(--done)}
-.rprog .rest{color:var(--dim3);flex:none}
 .rprog .doing{color:var(--dim);min-width:0;overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}
 /* Troisième état, pas une nuance du deuxième : une checklist à 100% sur une tâche encore
@@ -1130,9 +1245,10 @@ border-radius:4px;padding:1px 6px}
 
 .checks{margin-top:12px}
 .chead{display:flex;align-items:center;gap:8px}
-.chead .cnt{font-size:10.5px;color:var(--dim2)}
-.check{display:flex;gap:7px;align-items:flex-start;font-size:11.5px;line-height:1.4;
+.chead .cnt{font-size:10.5px;color:var(--dim2);margin-left:auto}
+.check{display:flex;flex-direction:column;gap:3px;font-size:11.5px;line-height:1.4;
 margin-top:4px}
+.ctop{display:flex;gap:7px;align-items:flex-start}
 .box{flex:none;width:13px;height:13px;border-radius:3px;border:1px solid #2b3038;
 color:var(--done);font-size:9px;line-height:12px;text-align:center;margin-top:2px}
 .box.on{border-color:#2c4d35;background:#122116}
@@ -1140,6 +1256,21 @@ color:var(--done);font-size:9px;line-height:12px;text-align:center;margin-top:2p
 animation:ordopulse 1.8s ease-in-out infinite}
 .check.on .ctext{color:#7d8794}
 .check.doing .ctext{color:var(--txt)}
+.ctext{flex:1 1 auto;min-width:0}
+.cdur{flex:none;margin-left:auto;padding-left:8px;font-size:10.5px;color:var(--dim3);
+white-space:nowrap}
+/* Attributs de nature (brief t-39), en clair et non plus en initiale (retouche t-41) :
+   sous le libellé et jamais à côté (voir .ctop ci-dessus) -- mesuré sur les 201 critères
+   qualifiés de camcast, leurs cinq valeurs concaténées font jusqu'à 47 caractères et le
+   libellé qui les accompagne jusqu'à 41, ce qu'aucune colonne de mur (340px, sa plus
+   étroite mesurée) ne tient côte à côte sans tronquer ou repousser le libellé. flex-wrap
+   plutôt qu'une troncature : une valeur qui ne tient pas passe à la ligne suivante,
+   jamais coupée. padding-left aligne la première valeur sous le début du libellé (largeur
+   de .box + gap de .ctop), pas sous la coche. Ton discret (var(--dim3), même famille que
+   .cdur ci-dessus) pour ne pas rivaliser avec le critère en cours. */
+.cattrs{display:flex;flex-wrap:wrap;gap:3px;padding-left:20px}
+.cattr{font-size:10px;font-weight:600;line-height:13px;color:var(--dim3);
+border:1px solid var(--line2);border-radius:3px;padding:0 4px}
 .doc{margin-top:10px}
 .doc button{width:100%;text-align:left;background:#191d23;border:1px solid #262c34;
 border-radius:6px;color:#9aa4b1;font:inherit;font-size:11px;padding:5px 9px;cursor:pointer;
@@ -1332,7 +1463,16 @@ function rowNode(t){
   // Durée et contexte AVANT les liens, et toujours visibles : ce sont les deux chiffres
   // qu'on lit pendant qu'une tâche tourne, c'est-à-dire au seul moment où on la regarde.
   // Ils vivaient dans la ligne de meta, que la vue graphe n'affiche pas.
-  if(t.duree)links.appendChild(el("span","dur",t.duree));
+  //
+  // Tant que la tâche n'est pas terminée, le total estimé de la checklist rejoint la
+  // durée écoulée ici même, sous la forme "écoulé / total" (retouche demandée pendant
+  // t-41) : c'est ce qui vivait auparavant dans .rprog sous forme de restant, et qui y
+  // mangeait la place du libellé du critère en cours. Jamais l'un des deux nombres
+  // fabriqué quand il manque -- t.duree seul reste l'affichage d'une tâche sans
+  // estimation, exactement comme avant cette retouche.
+  var durTxt=t.duree;
+  if(durTxt&&t.status!=="done"&&t.totalEstime)durTxt+=" / "+t.totalEstime;
+  if(durTxt)links.appendChild(el("span","dur",durTxt));
   // Le dépassement (passé au-delà du total estimé des critères, brief t-27) : à côté de
   // la durée, jamais soumis à `condense` -- une tâche finie en dépassement le reste,
   // c'est une donnée acquise pour affiner la prochaine estimation, pas un état transitoire
@@ -1341,6 +1481,18 @@ function rowNode(t){
     var over=el("span","over",t.depassement);
     over.title="dépassement : le temps passé dépasse le total estimé des critères";
     links.appendChild(over);
+  }
+  // Écart estimé/réel (brief t-33) : seulement sur une tâche terminée, dans les deux sens
+  // -- distinct du dépassement ci-dessus, qui ne dit que la moitié de l'histoire. Le
+  // rappel de l'estimé ("estimé 1h50") a disparu de la case (retouche demandée pendant
+  // t-41) : juste la différence signée, à côté de la durée, colorée par classeEcart() --
+  // "23m -1h27" tient sur une seule ligne avec le nom de tâche et le modèle, là où
+  // "23m estimé 1h50 -1h27" ne tenait pas.
+  if(t.ecartValeur){
+    var cl=classeEcart(t.ecartValeur);
+    var ev=el("span","ecartv"+(cl?" "+cl:""),t.ecartValeur);
+    ev.title="écart : différence signée entre estimé et réel — négatif est un gain";
+    links.appendChild(ev);
   }
   // t.tokens porte le contexte du DERNIER tour (voir vue() en Python), pas la sortie
   // cumulée de la session : c'est ce chiffre-là, pas l'autre, qui prédit ce qu'un tour de
@@ -1374,10 +1526,10 @@ function rowNode(t){
   if(t.checkTotal){
     var prog=el("div","rprog");
     prog.appendChild(el("span","cnt",t.checkDone+"/"+t.checkTotal));
-    // Restant : somme des critères non cochés (brief t-27), moot une fois la case réglée
-    // -- condense comme le compteur et le libellé du critère en cours, contrairement au
-    // dépassement, resté dans l'en-tête inconditionnel.
-    if(t.restant)prog.appendChild(el("span","rest",t.restant));
+    // Le restant vivait ici (brief t-27) ; il mangeait la place du libellé du critère en
+    // cours juste après lui (retouche demandée pendant t-41). Il est monté dans l'en-tête,
+    // à côté de la durée écoulée -- voir "totalEstime" dans rowNode() ci-dessus -- et le
+    // libellé du critère en cours récupère désormais toute la largeur de cette ligne.
     // Le libellé du critère en cours et la mention de fin de rapport se disputent la
     // MÊME place : jamais les deux à la fois, jamais hors d'une tâche en cours. k vaut
     // déjà "finishing" (voir kind()) quand tout est coché sur une tâche running -- c'est
@@ -1723,12 +1875,49 @@ function detailNode(t){
     var ch=el("div","chead");
     ch.appendChild(el("span","k",
       k==="finishing"?"rédaction du rapport":doingIdx>-1?"critère en cours et suite":"critères"));
+    // Même nombre que la case fermée (span .rest, brief t-27) : t.restant vient déjà de
+    // _restant_min côté Python, jamais resommé ici en JS à partir des durées de critère --
+    // deux calculs finiraient par diverger sans que rien ne le signale (t-31).
+    if(t.restant)ch.appendChild(el("span","cnt",t.restant));
     ck.appendChild(ch);
     cl.forEach(function(c,i){
       var st=c.done?" on":i===doingIdx?" doing":"";
       var line=el("div","check"+st);
-      line.appendChild(el("span","box"+st,c.done?"✓":i===doingIdx?"·":""));
-      line.appendChild(el("span","ctext",c.text));
+      var top=el("div","ctop");
+      top.appendChild(el("span","box"+st,c.done?"✓":i===doingIdx?"·":""));
+      top.appendChild(el("span","ctext",c.text));
+      // Chaîne vide et jamais un tiret ni un zéro quand le critère n'a pas encore
+      // d'estimation : ce cas est le cas MAJORITAIRE aujourd'hui, pas le cas limite.
+      if(c.duree)top.appendChild(el("span","cdur",c.duree));
+      line.appendChild(top);
+      // Attributs de nature (brief t-39), en clair et non plus en initiale (retouche
+      // t-41) : sur les seize valeurs d'ATTRIBUTS_VALEURS (côté Python), aucune n'est
+      // partagée entre deux clés, donc la valeur écrite en toutes lettres identifie sa
+      // clé toute seule, sans table de correspondance à apprendre par cœur -- ce que
+      // "M", l'initiale qui précédait cette retouche, n'offrait qu'au survol.
+      //
+      // SOUS le libellé, jamais à côté de lui (ligne .ctop ci-dessus) : mesuré sur les
+      // 201 critères qualifiés de camcast (tous porteurs de leurs cinq attributs), les
+      // valeurs d'un même critère concaténées font jusqu'à 47 caractères, et son libellé
+      // jusqu'à 41 -- la colonne de mur la plus étroite (340px) ne tient jamais les deux
+      // côte à côte sans tronquer ou repousser le libellé, ce que l'invariant du brief
+      // interdit. flex-wrap : une valeur qui ne tient pas passe à la ligne suivante,
+      // jamais tronquée, jamais aux dépens du libellé.
+      //
+      // title reste le minimum demandé par le brief ; aria-label en plus, pour qui
+      // navigue au clavier ou au lecteur d'écran, jamais forcé à bouger une souris pour
+      // retrouver la clé.
+      if(c.attrs&&c.attrs.length){
+        var ca=el("span","cattrs");
+        c.attrs.forEach(function(a){
+          var mk=el("span","cattr m",a.valeur);
+          var titre=a.cle+" : "+a.valeur;
+          mk.title=titre;
+          mk.setAttribute("aria-label",titre);
+          ca.appendChild(mk);
+        });
+        line.appendChild(ca);
+      }
       ck.appendChild(line);
     });
     d.appendChild(ck);
@@ -1872,11 +2061,72 @@ function paintFocus(){
   draw();
 }
 
+// Formate des minutes-Claude en "9h54"/"45m" (brief t-38), MÊME RÈGLE que _duree_min
+// en Python : côté serveur pour chaque case, ici pour l'en-tête, parce que l'heure de
+// fin qui l'accompagne dépend de "maintenant" et doit se calculer au rendu, côté
+// navigateur (voir paintHeure() ci-dessous) -- il faut donc le restant BRUT jusqu'ici,
+// pas seulement son texte déjà formé.
+//
+// --- t-38 : à partir d'ici, fonctions PURES (aucun accès au DOM, aucun Date.now()
+// implicite), extraites telles quelles et exécutées sous Node par
+// TestFinDeChantierSousNode -- une assertion de chaîne ne peut pas prouver un calcul de
+// date, seule son exécution le peut. ---
+function dureeMin(m){
+  if(m<60)return m+"m";
+  return Math.floor(m/60)+"h"+String(m%60).padStart(2,"0");
+}
+
+// Heure de fin et exposant de jour (brief t-38) : "now" est un PARAMÈTRE, jamais lu ici
+// via `new Date()` -- c'est paintHeure() qui le fournit, au moment du rendu, ce qui rend
+// cette fonction testable avec un "maintenant" figé. L'exposant compte les MINUITS
+// franchis entre "now" et l'heure de fin, pas les tranches de 24h : 23h50 plus 20
+// minutes tombe le lendemain (+1) après dix minutes seulement, pas après 24h.
+function finChantier(now,restantMin){
+  var fin=new Date(now.getTime()+restantMin*60000);
+  var jourNow=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  var jourFin=new Date(fin.getFullYear(),fin.getMonth(),fin.getDate());
+  return {
+    heure:fin.getHours()+"h"+String(fin.getMinutes()).padStart(2,"0"),
+    jours:Math.round((jourFin-jourNow)/86400000),
+  };
+}
+
+// Couleur de l'écart signé (retouche t-38) : le signe du TEXTE déjà formaté par
+// _ecart_valeur_texte en Python porte le sens, jamais un second champ numérique --
+// "-1h27" commence par "-", "+20m" par "+", "0m" par aucun des deux.
+function classeEcart(valeur){
+  if(valeur.charAt(0)==="-")return "gain";
+  if(valeur.charAt(0)==="+")return "depasse";
+  return "";
+}
+
+// Repeint le restant du chantier et son heure de fin (brief t-38), à GAUCHE du
+// pourcentage. Recalculé à CHAQUE appel, jamais mis en cache : l'heure de fin dépend de
+// "maintenant", qui avance même quand rien d'autre ne bouge dans le chantier -- une
+// colonne ouverte depuis trois heures doit voir sa fin reculer de trois heures, pas la
+// garder figée au dernier battement qui a changé quelque chose. D'où l'appel depuis
+// paintTop() (à chaque redessin réel) ET depuis un minuteur dédié (voir bootstrap en bas
+// de ce fichier), qui rafraîchit même quand le battement réseau ne change rien.
+function paintHeure(){
+  var rEl=document.getElementById("hrest"), fEl=document.getElementById("hfin");
+  if(!rEl||!fEl)return;
+  var min=D&&D.restantChantierMin;
+  var connu=min!=null;
+  rEl.hidden=!connu;fEl.hidden=!connu;
+  if(!connu)return;
+  rEl.textContent=dureeMin(min);
+  var r=finChantier(new Date(),min);
+  fEl.textContent="";
+  fEl.appendChild(document.createTextNode(r.heure));
+  if(r.jours>0)fEl.appendChild(el("sup",null,"+"+r.jours));
+}
+
 function paintTop(){
   var vivantes=D.tasks.filter(function(t){return kind(t)!=="cancelled"}).length;
   var faits=D.tasks.filter(function(t){return kind(t)==="done"}).length;
   document.getElementById("pct").textContent=
     (vivantes?Math.round(faits/vivantes*100):0)+"%";
+  paintHeure();
   var segs=document.getElementById("segs");segs.innerHTML="";
   D.phases.forEach(function(p){
     var ts=p.order.map(function(i){return byId[i]}).filter(Boolean);
@@ -2083,6 +2333,12 @@ window.addEventListener("resize",draw);
 try{var last=sessionStorage.getItem(K("sel"));if(last)S.sel=last}catch(e){}
 window.addEventListener("scroll",function(){
   try{sessionStorage.setItem(K("scroll"),window.scrollY)}catch(e){}});
+// L'heure de fin (brief t-38) dépend de "maintenant" : sur une colonne du mur, le
+// battement réseau ne redessine QUE si le chantier a changé (voir _PANNEAU_JS), donc
+// sans ce minuteur dédié une colonne inactive pendant des heures garderait l'heure de
+// fin figée à son dernier vrai changement. Trente secondes : largement assez pour un
+// affichage qui ne porte que la minute, jamais la seconde.
+setInterval(paintHeure,30000);
 if(window.ORDO){
   window.ordoSetData(window.ORDO);
   window.ordoRestoreScroll();
@@ -2129,7 +2385,7 @@ def html(m: dict, interval: int = 0) -> str:
 <body>
 <div id="top">
   <h1><span class="cid m" id="cid"></span><span id="ctx"></span>
-      <span class="pct m" id="pct"></span></h1>
+      <span id="hend"><span class="m" id="hrest" hidden></span><span class="m" id="hfin" hidden></span><span class="pct m" id="pct"></span></span></h1>
   <div id="segs"></div>
   <div id="bar">
     <input id="q" placeholder="filtrer : id, titre, zone…" autocomplete="off">
@@ -2273,7 +2529,7 @@ def panneau(home: str, campaign: str, poll: int = POLL_S) -> str:
 <body>
 <div id="top">
   <h1><span class="cid m" id="cid"></span><span id="ctx"></span>
-      <span class="pct m" id="pct"></span></h1>
+      <span id="hend"><span class="m" id="hrest" hidden></span><span class="m" id="hfin" hidden></span><span class="pct m" id="pct"></span></span></h1>
   <div id="segs"></div>
   <div id="bar">
     <input id="q" placeholder="filtrer : id, titre, zone..." autocomplete="off">

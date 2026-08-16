@@ -645,6 +645,23 @@ class TestDetailDeTache(CarteTestCase):
         self.assertIn('"box"+st', page)
         self.assertIn("i===doingIdx", page)
 
+    def test_chaque_critere_affiche_sa_propre_duree(self):
+        # t-31 : la moitié manquante du contrat -- la composition du total, critère par
+        # critère, jamais seulement le total.
+        self._add("0.1 a")
+        page = self._page()
+        self.assertIn('el("span","cdur",c.duree)', page)
+
+    def test_le_total_du_detail_reutilise_restant_jamais_un_second_calcul(self):
+        # c4 : le total du détail DOIT être le même nombre que celui de la case fermée
+        # (span .rest, brief t-27) -- en réutilisant t.restant tel quel, jamais une somme
+        # refaite en JS sur cl[i].dureeMin qui finirait par diverger.
+        self._add("0.1 a")
+        page = self._page()
+        bloc = page[page.index("function detailNode(t){"):page.rindex("return d;")]
+        self.assertIn("t.restant", bloc)
+        self.assertNotIn("dureeMin", bloc)
+
     def test_les_couleurs_ajoutees_sont_des_variables_pas_du_dur(self):
         # Les teintes qui viennent de la maquette et n'avaient pas d'équivalent dans le
         # thème existant sont posées en variables sur :root, jamais collées en dur dans les
@@ -690,7 +707,9 @@ class TestVue(CarteTestCase):
             self.assertIn(cle, t, cle)
         self.assertEqual(t["deps"], [])
         self.assertEqual(t["dependants"], ["t-02"])
-        self.assertEqual(t["checklist"], [{"text": "c un", "done": False}])
+        self.assertEqual(
+            t["checklist"], [{"text": "c un", "done": False, "duree": "", "attrs": []}]
+        )
         self.assertIn("index.js", t["facts"]["zones"])
 
     def test_une_tache_sans_pourquoi_le_declare_au_lieu_de_rendre_du_vide(self):
@@ -885,6 +904,30 @@ class TestRestantEtDepassementSurLaCarte(CarteTestCase):
         t = carte.vue(carte.model(self.chantier))["tasks"][0]
         self.assertEqual(t["restant"], "")
 
+    def test_chaque_critere_porte_sa_duree_formatee(self):
+        # Le détail montre la durée de CHAQUE critère, pas seulement le total (t-31) --
+        # même formatage que le restant, via _duree_min, jamais une seconde formule.
+        a = self._add("0.1 a", checklist=["c un", "c deux"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl[0]["id"], "label": "c un", "done": False, "dureeMin": 5},
+            {"id": cl[1]["id"], "label": "c deux", "done": False, "dureeMin": 75},
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["checklist"][0]["duree"], "5m")
+        self.assertEqual(t["checklist"][1]["duree"], "1h15")
+
+    def test_un_critere_sans_estimation_ne_porte_aucune_duree(self):
+        # Cas MAJORITAIRE aujourd'hui (t-31, c3/c7) : chaîne vide, jamais un tiret ni un
+        # zéro qui se liraient comme une valeur connue.
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl[0]["id"], "label": "c un", "done": False},
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["checklist"][0]["duree"], "")
+
     def test_depassement_vide_tant_que_le_passe_ne_depasse_pas_lestime(self):
         a = self._add("0.1 a", checklist=["c un"])
         cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
@@ -898,11 +941,13 @@ class TestRestantEtDepassementSurLaCarte(CarteTestCase):
 
     def test_depassement_affiche_quand_le_passe_depasse_le_total_estime(self):
         # c7/c10 : un restant négatif affiché en zéro serait un mensonge -- ce test échoue
-        # si le dépassement cesse d'apparaître une fois le budget dépassé.
+        # si le dépassement cesse d'apparaître une fois le budget dépassé. state="running"
+        # et non "done" (retouche t-38) : une tâche TERMINÉE montre désormais l'écart,
+        # jamais le dépassement -- voir TestExclusiviteEcartEtDepassement ci-dessous.
         a = self._add("0.1 a", checklist=["c un"])
         cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
         self._set_state(
-            a["id"], state="done",
+            a["id"], state="running",
             startedAt="2020-01-01T00:00:00Z", finishedAt="2020-01-01T00:12:00Z",
             checklist=[{"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 5}],
         )
@@ -929,15 +974,339 @@ class TestRestantEtDepassementSurLaCarte(CarteTestCase):
         page = carte.html(carte.model(self.chantier))
         bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
         garde_checklist = bloc.index("if(!condense){")
-        self.assertLess(bloc.index('el("span","dur",t.duree)'), garde_checklist)
+        self.assertLess(bloc.index('el("span","dur",durTxt)'), garde_checklist)
         self.assertLess(bloc.index("t.depassement"), garde_checklist)
 
-    def test_le_chip_de_restant_vit_dans_la_ligne_de_progression(self):
-        # Contrairement au dépassement : moot une fois la case réglée, condense comme le
-        # compteur et le libellé du critère en cours.
+    def test_ecart_ne_repete_pas_le_reel_deja_affiche_par_la_duree(self):
+        # Retouche demandée après coup (brief t-33) : t.duree affiche déjà le temps
+        # passé juste à côté. Le rappel de l'estimé ("ecart") a lui-même disparu de la
+        # case (retouche t-41) : seule la différence signée reste, directement à côté de
+        # la durée -- "23m -1h27", jamais "23m estimé 1h50 -1h27", pour que le nom de
+        # tâche, le modèle et ces deux nombres tiennent sur une seule ligne.
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(
+            a["id"], state="done",
+            startedAt="2026-08-01T00:00:00Z", finishedAt="2026-08-01T00:23:00Z",
+            checklist=[{"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 110}],
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertNotIn("ecart", t)
+        self.assertEqual(t["ecartValeur"], "-1h27")
+
+    def test_ecart_valeur_vide_sans_aucune_estimation_connue(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        self._set_state(
+            a["id"], state="done",
+            startedAt="2026-08-01T00:00:00Z", finishedAt="2026-08-01T01:00:00Z",
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["ecartValeur"], "")
+
+    def test_ecart_valeur_vide_sur_une_tache_pas_terminee(self):
+        a = self._add("0.1 a", checklist=[{"label": "c un", "dureeMin": 5}])
+        self._set_state(a["id"], startedAt="2026-08-01T00:00:00Z")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["ecartValeur"], "")
+
+
+class TestAttributsSurLaCarte(CarteTestCase):
+    """Marqueur compact par attribut (brief t-39) : t-36 pose jusqu'à cinq attributs de
+    nature par critère (item["attributs"]), rien ne les montrait avant cette tâche. c8 :
+    un critère qui n'a jamais reçu d'attribut (cas MAJORITAIRE, 201 critères de camcast
+    aujourd'hui) ne doit produire aucun placeholder, la liste "attrs" reste vide."""
+
+    def test_un_critere_sans_attribut_ne_porte_aucun_marqueur(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["checklist"][0]["attrs"], [])
+
+    def test_un_critere_porte_un_marqueur_par_attribut_renseigne(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {
+                "id": cl[0]["id"], "label": "c un", "done": False,
+                "attributs": {"geste": "lire", "dependance": "aucune"},
+            },
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(
+            t["checklist"][0]["attrs"],
+            [
+                {"cle": "geste", "valeur": "lire"},
+                {"cle": "dependance", "valeur": "aucune"},
+            ],
+        )
+
+    def test_lordre_des_marqueurs_suit_toujours_attributs_valeurs_jamais_la_pose(self):
+        # Posés dans l'ordre inverse de chantier.ATTRIBUTS_VALEURS : la vue doit quand
+        # même les rendre dans l'ordre canonique, pas l'ordre d'écriture du dict Python
+        # (qui suit l'ordre d'insertion), sans quoi deux exécutantes qui posent les mêmes
+        # attributs dans un ordre différent feraient bouger les marqueurs à l'écran.
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {
+                "id": cl[0]["id"], "label": "c un", "done": False,
+                "attributs": {"validation": "assertion", "geste": "tester"},
+            },
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(
+            [a["cle"] for a in t["checklist"][0]["attrs"]], ["geste", "validation"]
+        )
+
+    def test_le_marqueur_ecrit_la_valeur_en_clair_jamais_une_initiale(self):
+        # Retouche t-41 : sur les seize valeurs de chantier.ATTRIBUTS_VALEURS, aucune
+        # n'est partagée entre deux clés -- la valeur en toutes lettres identifie donc sa
+        # clé toute seule, contrairement à "M", l'initiale qu'elle remplace, un code que
+        # rien n'expliquait à l'écran.
+        self._add("0.1 a")
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
-        self.assertIn("t.restant", bloc)
+        self.assertIn('el("span","cattr m",a.valeur)', page)
+        # charAt(0) existe ailleurs dans le fichier (classeEcart, sur le signe de l'écart) :
+        # la garde porte donc sur le bloc des marqueurs, pas sur la page entière.
+        bloc = page[page.index("c.attrs.forEach"):page.index("ca.appendChild(mk)")]
+        self.assertNotIn("charAt(0)", bloc)
+
+    def test_la_cle_reste_lisible_au_survol_et_sans_bouger_la_souris(self):
+        # Invariant 3 du brief : title au survol au minimum, aria-label en plus pour qui
+        # navigue au clavier ou au lecteur d'écran -- jamais besoin de bouger la souris
+        # pour retrouver la clé.
+        self._add("0.1 a")
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn('var titre=a.cle+" : "+a.valeur', page)
+        self.assertIn("mk.title=titre", page)
+        self.assertIn('mk.setAttribute("aria-label",titre)', page)
+
+    def test_les_marqueurs_sont_sous_le_libelle_jamais_a_cote(self):
+        # Invariant 1 du brief : le libellé du critère ne cède jamais sa place. La coche
+        # et le libellé vivent dans .ctop, les marqueurs dans .cattrs juste après, à
+        # l'extérieur de .ctop -- ils tombent donc sur leur propre ligne, jamais à côté du
+        # libellé qu'ils décrivent.
+        self._add("0.1 a")
+        page = carte.html(carte.model(self.chantier))
+        top = page[page.index('var top=el("div","ctop")'):page.index('line.appendChild(top)')]
+        self.assertNotIn("cattrs", top)
+        apres = page[page.index('line.appendChild(top)'):page.index("ck.appendChild(line)")]
+        self.assertIn("cattrs", apres)
+
+    def test_les_marqueurs_passent_a_la_ligne_plutot_que_de_deborder(self):
+        # c4/c5 du brief : mesuré sur camcast, cinq valeurs concaténées peuvent dépasser
+        # la largeur d'une colonne de mur (340px, sa plus étroite) -- flex-wrap plutôt
+        # qu'une troncature, pour ne jamais couper une valeur au milieu.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn(".cattrs{display:flex;flex-wrap:wrap;", page)
+
+    def test_le_detail_ne_rend_le_bloc_de_marqueurs_que_sil_y_a_au_moins_un_attribut(self):
+        # Point 1 du brief : l'absence est le cas courant, jamais un tiret ni une case
+        # grise -- la garde en JS ne doit rien afficher tant qu'aucun attribut n'existe.
+        self._add("0.1 a")
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn("if(c.attrs&&c.attrs.length)", page)
+
+    def test_le_pire_cas_de_longueur_mesure_sur_camcast_ne_deloge_pas_le_libelle(self):
+        # c8 du brief : pire cas RÉEL mesuré sur les 201 critères qualifiés de camcast
+        # (t-41), pas le pire cas théorique -- un libellé de 41 caractères et ses cinq
+        # attributs concaténés à 47 caractères. Le libellé traverse tel quel, jamais
+        # tronqué ni raccourci : c'est aux attributs de céder de la place, jamais à lui
+        # (invariant 1).
+        libelle = "Les quatre exemples s'accordent entre eux"
+        self.assertEqual(len(libelle), 41)
+        a = self._add("0.1 a", checklist=[libelle])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        chantier.set_checklist_attribut(a["id"], cl[0]["id"], "geste", "mesurer")
+        chantier.set_checklist_attribut(a["id"], cl[0]["id"], "etendue", "module")
+        chantier.set_checklist_attribut(a["id"], cl[0]["id"], "dependance", "navigateur")
+        chantier.set_checklist_attribut(a["id"], cl[0]["id"], "incertitude", "connu")
+        chantier.set_checklist_attribut(a["id"], cl[0]["id"], "validation", "observation")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["checklist"][0]["text"], libelle)
+        valeurs = " ".join(x["valeur"] for x in t["checklist"][0]["attrs"])
+        self.assertEqual(len(valeurs), 43)
+        page = carte.html(carte.model(self.chantier))
+        # Le libellé traverse la page intact, jamais coupé : aucune troncature côté
+        # Python, la seule limite de largeur vit en CSS (flex-wrap), pas dans la donnée.
+        self.assertIn(libelle, page)
+
+
+class TestExclusiviteEcartEtDepassement(CarteTestCase):
+    """Retouche demandée par l'humain (brief t-38) : sur une tâche TERMINÉE en
+    dépassement, _depassement_min et _ecart_valeur_texte disaient le même fait deux fois
+    -- "+20m" ici, "estimé 1h50 (+20m)" là. Les deux champs sont désormais exclusifs,
+    décidés par l'état de la tâche."""
+
+    def test_le_depassement_disparait_sur_une_tache_terminee_au_profit_de_lecart(self):
+        # Exactement le scénario rapporté : une tâche finie qui a dépassé son estimé.
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(
+            a["id"], state="done",
+            startedAt="2020-01-01T00:00:00Z", finishedAt="2020-01-01T00:12:00Z",
+            checklist=[{"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 5}],
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["depassement"], "")
+        self.assertEqual(t["ecartValeur"], "+7m")
+
+    def test_lecart_reste_absent_sur_une_tache_en_cours_en_depassement(self):
+        # Symétrique : une tâche encore en cours montre le dépassement, jamais l'écart,
+        # qui n'existe pas tant que la tâche n'est pas terminée (chantier.ecart_estime_reel).
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(
+            a["id"], state="running",
+            startedAt="2020-01-01T00:00:00Z", finishedAt="2020-01-01T00:12:00Z",
+            checklist=[{"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 5}],
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["depassement"], "+7m")
+        self.assertEqual(t["ecartValeur"], "")
+
+    def test_le_total_estime_vit_dans_len_tete_jamais_dans_la_progression(self):
+        # Retouche demandée pendant t-41 : le restant mangeait la place du libellé du
+        # critère en cours dans .rprog ; il en est retiré au profit du total estimé,
+        # affiché à côté de la durée écoulée dans l'en-tête (rlinks), pour que le libellé
+        # récupère toute la largeur de sa ligne.
+        page = carte.html(carte.model(self.chantier))
+        rprog = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        self.assertNotIn("t.restant", rprog)
+        entete = page[page.index('var links=el("span","rlinks m")'):page.index("if(t.depassement){")]
+        self.assertIn("t.totalEstime", entete)
+
+
+class TestRestantEtFinDuChantierDansLEnTete(CarteTestCase):
+    """En-tête de colonne (brief t-38) : le restant de TOUT le chantier et l'heure de
+    fin, à gauche du pourcentage déjà présent. Réutilise _restant_min de chaque tâche,
+    additionné ici -- jamais un second calcul du même nombre (_restant_chantier_min)."""
+
+    def test_additionne_les_restants_connus_des_taches_actives(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        cl_a = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl_a[0]["id"], "label": "c un", "done": False, "dureeMin": 20},
+        ])
+        b = self._add("0.2 b", checklist=["c un"])
+        cl_b = carte.model(self.chantier)["nodes"][b["id"]]["checklist"]
+        self._set_state(b["id"], checklist=[
+            {"id": cl_b[0]["id"], "label": "c un", "done": False, "dureeMin": 40},
+        ])
+        v = carte.vue(carte.model(self.chantier))
+        self.assertEqual(v["restantChantierMin"], 60)
+
+    def test_ignore_les_taches_finies_ou_annulees(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        cl_a = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl_a[0]["id"], "label": "c un", "done": False, "dureeMin": 20},
+        ])
+        b = self._add("0.2 b", checklist=["c un"])
+        cl_b = carte.model(self.chantier)["nodes"][b["id"]]["checklist"]
+        self._set_state(
+            b["id"], state="done",
+            checklist=[{"id": cl_b[0]["id"], "label": "c un", "done": False, "dureeMin": 999}],
+        )
+        c = self._add("0.3 c", checklist=["c un"])
+        cl_c = carte.model(self.chantier)["nodes"][c["id"]]["checklist"]
+        self._set_state(
+            c["id"], state="cancelled",
+            checklist=[{"id": cl_c[0]["id"], "label": "c un", "done": False, "dureeMin": 999}],
+        )
+        v = carte.vue(carte.model(self.chantier))
+        self.assertEqual(v["restantChantierMin"], 20)
+
+    def test_ignore_une_tache_partiellement_inconnue_sans_taire_les_autres(self):
+        # a : un critère non coché sans durée -> _restant_min(a) répond None, la tâche
+        # entière est exclue -- pas ses 5 minutes connues comptées à part.
+        a = self._add("0.1 a", checklist=["c un", "c deux"])
+        cl_a = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl_a[0]["id"], "label": "c un", "done": False, "dureeMin": 5},
+            {"id": cl_a[1]["id"], "label": "c deux", "done": False},
+        ])
+        b = self._add("0.2 b", checklist=["c un"])
+        cl_b = carte.model(self.chantier)["nodes"][b["id"]]["checklist"]
+        self._set_state(b["id"], checklist=[
+            {"id": cl_b[0]["id"], "label": "c un", "done": False, "dureeMin": 15},
+        ])
+        v = carte.vue(carte.model(self.chantier))
+        self.assertEqual(v["restantChantierMin"], 15)
+
+    def test_absent_quand_rien_nest_estime(self):
+        self._add("0.1 a", checklist=["c un"])
+        v = carte.vue(carte.model(self.chantier))
+        self.assertIsNone(v["restantChantierMin"])
+
+    def test_len_tete_porte_les_spans_restant_et_fin_avant_le_pourcentage(self):
+        page = carte.html(carte.model(self.chantier))
+        h1 = page[page.index("<h1>"):page.index("</h1>")]
+        self.assertLess(h1.index('id="hrest"'), h1.index('id="pct"'))
+        self.assertLess(h1.index('id="hfin"'), h1.index('id="pct"'))
+
+    def test_le_panneau_de_colonne_porte_aussi_les_spans(self):
+        p = carte.panneau("/tmp/ordo-home", "c-01")
+        h1 = p[p.index("<h1>"):p.index("</h1>")]
+        self.assertLess(h1.index('id="hrest"'), h1.index('id="pct"'))
+        self.assertLess(h1.index('id="hfin"'), h1.index('id="pct"'))
+
+
+class TestFinDeChantierSousNode(CarteTestCase):
+    """L'heure de fin et son exposant de jour (brief t-38) se calculent au rendu, côté
+    navigateur (voir paintHeure() dans _JS) : aucune assertion de chaîne ne peut prouver
+    un calcul de date, seule son exécution le peut -- même principe que
+    TestMurDistingueTroisEtats pour _MUR_JS."""
+
+    def _fonctions(self) -> str:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS de l'en-tête")
+        js = carte._JS
+        debut = js.index("function dureeMin")
+        fin = js.index("function paintHeure")
+        return js[debut:fin]
+
+    def _appelle(self, expr: str):
+        script = self._fonctions() + f"\nprocess.stdout.write(JSON.stringify({expr}));"
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    def test_duree_min_sous_lheure_donne_des_minutes(self):
+        self.assertEqual(self._appelle("dureeMin(45)"), "45m")
+
+    def test_duree_min_au_dela_dune_heure_donne_heures_et_minutes(self):
+        self.assertEqual(self._appelle("dureeMin(75)"), "1h15")
+
+    def test_fin_sans_franchir_minuit(self):
+        r = self._appelle("finChantier(new Date(2026,7,16,10,0,0),60)")
+        self.assertEqual(r["heure"], "11h00")
+        self.assertEqual(r["jours"], 0)
+
+    def test_fin_franchit_un_seul_minuit(self):
+        # Le cas qui compte le plus (c8) : dix minutes avant minuit, vingt minutes de
+        # restant, l'exposant doit dire "+1", jamais "0" -- lire "0h10" comme "dans dix
+        # minutes" serait faux d'une nuit entière.
+        r = self._appelle("finChantier(new Date(2026,7,16,23,50,0),20)")
+        self.assertEqual(r["heure"], "0h10")
+        self.assertEqual(r["jours"], 1)
+
+    def test_fin_franchit_deux_minuits(self):
+        r = self._appelle("finChantier(new Date(2026,7,16,23,50,0),1460)")
+        self.assertEqual(r["jours"], 2)
+
+    def test_fin_franchit_trois_minuits(self):
+        r = self._appelle("finChantier(new Date(2026,7,16,23,50,0),2900)")
+        self.assertEqual(r["jours"], 3)
+
+    def test_classe_ecart_vert_sur_un_gain(self):
+        self.assertEqual(self._appelle('classeEcart("-1h27")'), "gain")
+
+    def test_classe_ecart_alerte_sur_un_depassement(self):
+        self.assertEqual(self._appelle('classeEcart("+20m")'), "depasse")
+
+    def test_classe_ecart_neutre_sans_ecart(self):
+        self.assertEqual(self._appelle('classeEcart("0m")'), "")
 
 
 class TestModeleSurLaCarte(CarteTestCase):
@@ -1699,7 +2068,7 @@ class TestCondensationDesTachesReglees(CarteTestCase):
         page = carte.html(carte.model(self.chantier))
         bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
         garde_checklist = bloc.index("if(!condense){")
-        self.assertLess(bloc.index('el("span","dur",t.duree)'), garde_checklist)
+        self.assertLess(bloc.index('el("span","dur",durTxt)'), garde_checklist)
         self.assertLess(bloc.index('head.appendChild(md)'), garde_checklist)
         self.assertLess(
             bloc.index('el("span",t.deps.length?"nup":"nnone"'), garde_checklist,

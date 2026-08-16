@@ -1053,7 +1053,7 @@ class TestSessionSurLaCase(CarteTestCase):
     qu'elle va coûter, et c'est précisément celui qui n'apparaissait nulle part.
     """
 
-    def test_une_tache_lancee_porte_son_pane_et_ses_tours(self):
+    def test_une_tache_lancee_porte_ses_tours(self):
         a = self._add("0.1 a")
         self._set_state(a["id"], state="running", paneId="%126",
                         claudeSessionId="ce85c8b5-0000")
@@ -1062,8 +1062,10 @@ class TestSessionSurLaCase(CarteTestCase):
             usage_de=lambda x: {"input": 0, "output": 900, "cacheCreation": 0,
                                 "cacheRead": 0, "turns": 180},
         ))["tasks"][0]
-        self.assertEqual(t["pane"], "%126")
         self.assertEqual(t["turns"], 180)
+        # Le pane reste joignable, dans les faits : on ne va voir un pane qu'apres avoir
+        # ouvert la tache, jamais en balayant le mur du regard.
+        self.assertIn("%126", t["facts"]["pane"])
 
     def test_une_session_trop_longue_est_signalee(self):
         a = self._add("0.1 a")
@@ -1092,7 +1094,6 @@ class TestSessionSurLaCase(CarteTestCase):
         t = carte.vue(carte.model(self.chantier))["tasks"][0]
         self.assertEqual(t["turns"], 0)
         self.assertFalse(t["sessionLongue"])
-        self.assertEqual(t["pane"], "")
 
     def test_les_compactions_deja_faites_sont_dans_les_faits(self):
         a = self._add("0.1 a")
@@ -1101,7 +1102,7 @@ class TestSessionSurLaCase(CarteTestCase):
         t = carte.vue(carte.model(self.chantier))["tasks"][0]
         self.assertEqual(t["facts"]["compactions"], "2")
 
-    def test_la_page_porte_le_pane_et_les_tours(self):
+    def test_la_page_porte_les_tours(self):
         a = self._add("0.1 a")
         self._set_state(a["id"], state="running", paneId="%126")
         page = carte.html(carte.model(
@@ -1109,5 +1110,14 @@ class TestSessionSurLaCase(CarteTestCase):
             usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
                                 "cacheRead": 0, "turns": 200},
         ))
-        self.assertIn('"pane"', page)
         self.assertIn("sessionLongue", page)
+
+    def test_la_case_ne_repete_ni_l_etat_ni_le_pane(self):
+        # La barre de couleur porte deja l'etat, et le repeter en toutes lettres coutait
+        # la moitie de la largeur d'une colonne : le reste debordait de la case.
+        self._add("0.1 a")
+        page = carte.html(carte.model(self.chantier))
+        self.assertNotIn('el("span","rst"', page)
+        self.assertNotIn('el("span","pane"', page)
+        # L'information n'est pas perdue : elle passe en infobulle sur la barre.
+        self.assertIn("sb.title=LAB[k]", page)

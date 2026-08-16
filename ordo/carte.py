@@ -704,11 +704,11 @@ def vue(m: dict) -> dict:
             "model": node["model"],
             "modelWhy": node["modelWhy"],
             "modelPredit": node["modelPredit"],
-            # Le pane et les tours sortent a part de facts, comme la duree et le modele :
-            # ce sont les chiffres qui disent OU une tache s'execute et depuis combien de
-            # temps elle traine son contexte, et le second predit son cout mieux que tout
-            # le reste. Les lire ne doit pas demander d'ouvrir la tache.
-            "pane": node["paneId"] or "",
+            # Les tours sortent a part de facts, comme la duree et le modele : c'est le
+            # chiffre qui dit depuis combien de temps une tache traine son contexte, et il
+            # predit son cout mieux que tout le reste. Le lire ne doit pas demander
+            # d'ouvrir la tache. Le pane, lui, reste dans facts : il sert a aller voir, ce
+            # qu'on ne fait qu'apres avoir ouvert la tache.
             "turns": tours,
             "sessionLongue": bool(tours >= (usage.SEUIL_TOURS or float("inf"))),
             "tokens": usage.court(jetons["output"]) if jetons else "",
@@ -880,9 +880,10 @@ transition:opacity .12s,border-color .12s}
 .row.sel.settled{opacity:1}
 .sb{position:absolute;left:4px;top:9px;width:3px;height:22px;border-radius:2px}
 .row.running .sb{animation:ordopulse 1.6s ease-in-out infinite}
-.rhead{display:flex;align-items:baseline;gap:7px}
+/* flex-wrap, parce qu'une colonne de mur fait quelques centaines de pixels : sans lui,
+   la derniere pastille sortait de la case au lieu de passer a la ligne. */
+.rhead{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}
 .rid{font-size:10.5px;font-weight:600;color:#9aa4b1;flex:none}
-.rst{font-size:10px;font-weight:500}
 /* Le modele de l'executante, sur la case. Trait plein quand il a reellement tourne,
    pointille quand ce n'est encore qu'une prevision du routage : la difference entre un
    fait et un pronostic doit se voir sans lire le mot. */
@@ -895,7 +896,6 @@ border-radius:4px;padding:0 4px;color:var(--dim2);flex:none}
 /* Le pane et les tours d'une session en cours. Les tours virent a l'orange au-dela du
    seuil de compaction : c'est le seul chiffre qui predit ce qu'une session va coûter, et
    il n'apparaissait nulle part. */
-.pane{color:var(--dim3)}
 .turns{color:var(--dim2)}
 .row.running .turns{color:var(--txt2)}
 .turns.longue{color:#e3b341;font-weight:600}
@@ -1103,12 +1103,13 @@ function rowNode(t){
   if(S.filter==="reste"&&settled(t))cls+=" settled";
   var row=el("div",cls);
   row.setAttribute("data-row",t.id);
-  var sb=el("span","sb");sb.style.background=COL[k];row.appendChild(sb);
+  // La barre de couleur PORTE l'etat : la repeter en toutes lettres sur la case coutait
+  // la moitie de la largeur d'une colonne et faisait deborder le reste. Le mot part en
+  // infobulle, ou il reste joignable sans rien occuper.
+  var sb=el("span","sb");sb.style.background=COL[k];sb.title=LAB[k];row.appendChild(sb);
 
   var head=el("div","rhead");
   head.appendChild(el("span","rid m",t.id));
-  var st=el("span","rst",LAB[k]);st.style.color=(k==="queued")?"#6d7683":COL[k];
-  head.appendChild(st);
   if(t.model){
     // La teinte ne se prend QUE dans cette table. t.model vient de l'etat, donc d'un
     // --model tape a la main : le poser tel quel en classe laisserait ecrire n'importe
@@ -1126,10 +1127,9 @@ function rowNode(t){
   // Ils vivaient dans la ligne de meta, que la vue graphe n'affiche pas.
   if(t.duree)links.appendChild(el("span","dur",t.duree));
   if(t.tokens)links.appendChild(el("span","tok",t.tokens));
-  // Le pane dit OU la tache s'execute, les tours disent depuis combien de temps elle
-  // traine son contexte. Une session longue s'allume : au dela du seuil, chaque tour
-  // supplementaire relit tout ce qui precede.
-  if(t.pane)links.appendChild(el("span","pane",t.pane));
+  // Les tours disent depuis combien de temps la tache traine son contexte. Une session
+  // longue s'allume : au dela du seuil, chaque tour supplementaire relit tout ce qui
+  // precede.
   if(t.turns){
     var tr=el("span","turns"+(t.sessionLongue?" longue":""),t.turns+"t");
     tr.title=t.sessionLongue

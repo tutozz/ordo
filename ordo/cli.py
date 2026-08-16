@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -167,7 +168,7 @@ def _avertissement_multi_projet(state: dict) -> str | None:
 
 def _avertissement_checklist(hors_convention: list[dict]) -> str | None:
     """Alerte quand un ou plusieurs labels de checklist dépassent la convention de
-    60 caractères (chantier.CHECKLIST_LABEL_MAX).
+    40 caractères (chantier.CHECKLIST_LABEL_MAX).
 
     Jamais un refus : la tâche existe déjà quand cette fonction est appelée, le label
     n'est ni tronqué ni corrigé, seulement signalé à qui l'a rédigé trop long.
@@ -179,6 +180,37 @@ def _avertissement_checklist(hors_convention: list[dict]) -> str | None:
         f"WARNING: checklist label(s) exceed the {chantier.CHECKLIST_LABEL_MAX}-char "
         f"convention: {detail}"
     )
+
+
+# "label" ou "label:minutes" : le suffixe reste collé à SON item, jamais apparié par
+# position avec une option séparée qui se désynchroniserait au moindre réordonnancement de
+# plusieurs --check sur une même commande (brief t-27). \d+ seulement : un suffixe non
+# numérique (ex. "chapitre:trois") n'est pas une durée, il reste dans le libellé tel quel.
+_CHECK_DUREE_RE = re.compile(r"^(.*):(\d+)$")
+
+
+def _parse_check(brut: str) -> dict:
+    """Un `--check` accepte "libellé" ou "libellé:minutes" (brief t-27, minutes-Claude)."""
+    trouve = _CHECK_DUREE_RE.match(brut)
+    if not trouve:
+        return {"label": brut, "dureeMin": None}
+    return {"label": trouve.group(1), "dureeMin": int(trouve.group(2))}
+
+
+def _avertissement_checklist_sans_duree(sans_duree: list[dict]) -> str | None:
+    """Alerte quand un ou plusieurs critères créés n'ont reçu aucune estimation
+    (chantier.checklist_sans_duree), même régime que _avertissement_checklist ci-dessus :
+    jamais un refus, seulement un signal à qui vient de rédiger la checklist.
+
+    Scopée à la création (`ordo add`) seulement, pas à `checklist add`/`split` : ce sont
+    justement les critères ajoutés en cours de route, par une exécutante qui vient de lire
+    le code, qui ont le moins besoin qu'on le lui rappelle -- la révision volontaire est
+    déjà couverte par `ordo checklist duree`.
+    """
+    if not sans_duree:
+        return None
+    detail = ", ".join(item["id"] for item in sans_duree)
+    return f"WARNING: checklist item(s) without a duration estimate: {detail}"
 
 
 def _trace_tmux(command: list[str]) -> None:
@@ -655,7 +687,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         args.prompt,
         depends_on=args.depends or [],
         touches=args.touches or [],
-        checklist=args.check or [],
+        checklist=[_parse_check(c) for c in (args.check or [])],
         why=args.why or "",
     )
     if args.json:
@@ -664,6 +696,11 @@ def cmd_add(args: argparse.Namespace) -> int:
     avertissement = _avertissement_checklist(chantier.checklist_hors_convention(t["checklist"]))
     if avertissement:
         print(avertissement, file=sys.stderr)
+    avertissement_duree = _avertissement_checklist_sans_duree(
+        chantier.checklist_sans_duree(t["checklist"])
+    )
+    if avertissement_duree:
+        print(avertissement_duree, file=sys.stderr)
     print(f"{t['id']}  {t['titre']}  (depends on: {', '.join(t['dependsOn']) or '-'})")
     if not t["why"]:
         # Dit une fois, au moment ou la reponse est encore fraiche dans la tete de qui
@@ -799,15 +836,108 @@ def cmd_amend(args: argparse.Namespace) -> int:
 
 def cmd_check(args: argparse.Namespace) -> int:
     t = chantier.check(args.task, args.item, done=not args.undo, doing=args.doing)
+    # Déduction du critère en cours : seulement après une coche réelle (ni --doing, qui
+    # déclare déjà explicitement le sien, ni --undo, qui décoche et n'est jamais une
+    # "attaque" d'un nouveau critère). Import local et défensif, même raison qu'ailleurs
+    # dans ce fichier (voir cmd_tick) : ordo/controle.py est écrit en parallèle par une
+    # autre exécutante et peut être absent ou cassé, ce qui ne doit jamais empêcher un
+    # `ordo check` de fonctionner -- la déduction est un confort, pas le cœur du verbe.
+    if not args.doing and not args.undo:
+        try:
+            from . import controle
+        except ImportError:
+            controle = None
+        if controle is not None:
+            suivant = controle.deduce_current_item(t)
+            if suivant:
+                t = chantier.check(args.task, suivant, doing=True)
     if args.json:
         _print_json(t)
         return 0
     item = next(i for i in t["checklist"] if i["id"] == args.item)
     if args.doing:
         print(f"{t['id']}: {item['id']} in progress")
+        # Rappel déductible, pas volontaire (brief t-27, c4/c9) : accroché à --doing, déjà
+        # obligatoire pour toucher cet item, jamais un paragraphe à part qu'on peut sauter
+        # -- exactement ce qui est arrivé trois fois de suite à --doing lui-même avant que
+        # le brief ne l'explique ici même.
+        duree = item.get("dureeMin")
+        commande = f"ordo checklist duree {t['id']} {item['id']} <minutes>"
+        if duree is None:
+            print(f"  no duration estimate on {item['id']}; set one now: {commande}", file=sys.stderr)
+        else:
+            print(
+                f"  {item['id']} estimated at {duree}m; correct it now if wrong: {commande}",
+                file=sys.stderr,
+            )
         return 0
     etat = "checked" if item["done"] else "unchecked"
     print(f"{t['id']}: {item['id']} {etat}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Checklist : ajouter, decouper, reformuler -- jamais supprimer (brief t-22)
+# ---------------------------------------------------------------------------
+
+
+def cmd_checklist_add(args: argparse.Namespace) -> int:
+    state = store.load()
+    _, ch = _resolve_task(state, args.task)
+    t = chantier.add_checklist_item(args.task, args.label)
+    nouveau = t["checklist"][-1]
+    journal.write(
+        ch["id"], args.author, f'checklist {args.task}: added {nouveau["id"]} "{args.label}"'
+    )
+    if args.json:
+        _print_json(t)
+        return 0
+    avertissement = _avertissement_checklist(chantier.checklist_hors_convention(t["checklist"]))
+    if avertissement:
+        print(avertissement, file=sys.stderr)
+    print(f"{args.task}: {nouveau['id']} added - {args.label}")
+    return 0
+
+
+def cmd_checklist_split(args: argparse.Namespace) -> int:
+    state = store.load()
+    _, ch = _resolve_task(state, args.task)
+    t = chantier.split_checklist_item(args.task, args.item, args.first, args.second)
+    nouveau = t["checklist"][-1]
+    journal.write(
+        ch["id"],
+        args.author,
+        f"checklist {args.task}: split {args.item} into {args.item} + {nouveau['id']}",
+    )
+    if args.json:
+        _print_json(t)
+        return 0
+    avertissement = _avertissement_checklist(chantier.checklist_hors_convention(t["checklist"]))
+    if avertissement:
+        print(avertissement, file=sys.stderr)
+    print(f"{args.task}: {args.item} split into {args.item} + {nouveau['id']}")
+    return 0
+
+
+def cmd_checklist_reword(args: argparse.Namespace) -> int:
+    t = chantier.reword_checklist_item(args.task, args.item, args.label)
+    if args.json:
+        _print_json(t)
+        return 0
+    avertissement = _avertissement_checklist(chantier.checklist_hors_convention(t["checklist"]))
+    if avertissement:
+        print(avertissement, file=sys.stderr)
+    print(f"{args.task}: {args.item} reworded")
+    return 0
+
+
+def cmd_checklist_duree(args: argparse.Namespace) -> int:
+    t = chantier.set_checklist_duree(args.task, args.item, args.minutes)
+    if args.json:
+        _print_json(t)
+        return 0
+    item = next(i for i in t["checklist"] if i["id"] == args.item)
+    print(f"{args.task}: {item['id']} estimated at {item['dureeMin']}m")
     return 0
 
 
@@ -2093,7 +2223,12 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p.add_argument("--prompt", required=True)
     p.add_argument("--depends", action="append", metavar="TASK")
     p.add_argument("--touches", action="append", metavar="ZONE")
-    p.add_argument("--check", action="append", metavar="LABEL")
+    p.add_argument(
+        "--check",
+        action="append",
+        metavar="LABEL[:MINUTES]",
+        help='checklist item; optional Claude-minutes estimate as "label:20"',
+    )
     p.add_argument(
         "--why",
         default="",
@@ -2199,6 +2334,51 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
         help="declare the item as the one currently being worked on, without checking it",
     )
     p.set_defaults(func=cmd_check)
+
+    # Checklist : ajouter, decouper, reformuler -- jamais supprimer (brief t-22)
+    checklist_parser = verbs.add_parser(
+        "checklist",
+        help="grow a task's checklist: add a criterion, split one, reword one (never delete)",
+    )
+    checklist_sub = checklist_parser.add_subparsers(
+        dest="action", metavar="action", required=False
+    )
+
+    p = checklist_sub.add_parser(
+        "add", parents=[json_parent], help="append a new criterion to a task"
+    )
+    p.add_argument("task")
+    p.add_argument("label")
+    p.add_argument("--author", default="ORDO", choices=("ORDO", "ORCH", "USER"))
+    p.set_defaults(func=cmd_checklist_add)
+
+    p = checklist_sub.add_parser(
+        "split", parents=[json_parent], help="split one existing criterion into two"
+    )
+    p.add_argument("task")
+    p.add_argument("item")
+    p.add_argument("first", help="new label for the item that keeps its id")
+    p.add_argument("second", help="label for the freshly created item")
+    p.add_argument("--author", default="ORDO", choices=("ORDO", "ORCH", "USER"))
+    p.set_defaults(func=cmd_checklist_split)
+
+    p = checklist_sub.add_parser(
+        "reword", parents=[json_parent], help="fix a criterion's label, same id, same state"
+    )
+    p.add_argument("task")
+    p.add_argument("item")
+    p.add_argument("label")
+    p.set_defaults(func=cmd_checklist_reword)
+
+    p = checklist_sub.add_parser(
+        "duree",
+        parents=[json_parent],
+        help="set or correct a criterion's estimate, in Claude-minutes",
+    )
+    p.add_argument("task")
+    p.add_argument("item")
+    p.add_argument("minutes", type=int)
+    p.set_defaults(func=cmd_checklist_duree)
 
     # Plan
     p = verbs.add_parser("plan", parents=[json_parent], help="propose a graph from stdin")
@@ -2416,7 +2596,12 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p.add_argument("--limit", type=int, default=None)
     p.set_defaults(func=cmd_journal_show)
 
-    return {"main": parser, "sensor": capteur_parser, "journal": journal_parser}
+    return {
+        "main": parser,
+        "sensor": capteur_parser,
+        "journal": journal_parser,
+        "checklist": checklist_parser,
+    }
 
 
 # ---------------------------------------------------------------------------

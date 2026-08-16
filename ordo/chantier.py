@@ -70,19 +70,25 @@ def _normalize_checklist(items: Iterable) -> list[dict]:
             label = item.get("label", "")
             item_id = item.get("id") or f"c{i}"
             done = bool(item.get("done", False))
+            duree_min = item.get("dureeMin")
         else:
             label = str(item)
             item_id = f"c{i}"
             done = False
-        normalized.append({"id": item_id, "label": label, "done": done})
+            duree_min = None
+        normalized.append(
+            {"id": item_id, "label": label, "done": done, "dureeMin": duree_min}
+        )
     return normalized
 
 
 # Longueur maximale conventionnelle d'un label de checklist. Un plafond, jamais un refus
 # (voir checklist_hors_convention) : la convention vaut pour la lisibilité d'une carte ou
 # d'un plan, pas pour la validité d'une tâche, et rien dans Ordo ne doit la faire respecter
-# de force.
-CHECKLIST_LABEL_MAX = 60
+# de force. Quarante, pas soixante : une case dans une colonne de mur fait quelques
+# centaines de pixels, et le libellé y voisine déjà l'identifiant, le badge de modèle, la
+# durée écoulée et la taille du contexte porté.
+CHECKLIST_LABEL_MAX = 40
 
 
 def checklist_hors_convention(checklist: Iterable[dict]) -> list[dict]:
@@ -97,6 +103,19 @@ def checklist_hors_convention(checklist: Iterable[dict]) -> list[dict]:
         for item in checklist
         if len(item["label"]) > CHECKLIST_LABEL_MAX
     ]
+
+
+def checklist_sans_duree(checklist: Iterable[dict]) -> list[dict]:
+    """Items d'une checklist déjà normalisée dont l'estimation (dureeMin) est absente
+    (brief t-27).
+
+    Pure et sans effet de bord, même contrat que checklist_hors_convention() ci-dessus :
+    ne pose rien, ne refuse rien, se contente de mesurer. .get() et non [] : un critère
+    créé avant ce champ n'a jamais porté la clé "dureeMin" sur disque, et l'absence de la
+    clé doit se lire exactement comme une valeur None -- les 349 critères existants sans
+    estimation doivent continuer de fonctionner (c8), jamais lever de KeyError.
+    """
+    return [{"id": item["id"]} for item in checklist if item.get("dureeMin") is None]
 
 
 def _session_unique(state: dict, slug: str, chantier_id: str) -> str:
@@ -459,6 +478,152 @@ def check(task_id: str, item_id: str, done: bool = True, doing: bool = False) ->
                     item["done"] = done
                     if task.get("currentItem") == item_id:
                         task["currentItem"] = None
+                break
+        else:
+            raise ChantierError(
+                f"item not found: {item_id} does not exist in the checklist of {task_id}"
+            )
+    return task
+
+
+# Motif des id générés par _normalize_checklist() ("c1", "c2", ...). Sert uniquement à
+# repérer le plus grand numéro déjà pris ; un id qui ne suit pas cette forme (checklist
+# écrite à la main avec des id personnalisés) n'entre simplement pas dans le calcul.
+_CHECKLIST_ID_RE = re.compile(r"^c(\d+)$")
+
+
+def _next_checklist_id(checklist: Iterable[dict]) -> str:
+    """Id frais pour un nouvel item de checklist, jamais une renumérotation (brief t-22).
+
+    Une exécutante en cours a lu "c3" dans son brief et coche "c3" : quoi qu'on ajoute ou
+    découpe ensuite, cet identifiant doit continuer à désigner exactement le même critère.
+    Le nouvel id reprend donc toujours au-delà du plus grand numéro "c<N>" déjà vu dans la
+    checklist, jamais en comblant un trou ni en renommant un voisin. La boucle finale est
+    la garantie ultime, pas le chemin normal : elle protège du seul cas où le calcul par
+    numéro ne suffirait pas (un id personnalisé qui porte déjà, par coïncidence, le
+    prochain numéro attendu).
+    """
+    plus_grand = 0
+    ids_pris = set()
+    for item in checklist:
+        ids_pris.add(item["id"])
+        trouve = _CHECKLIST_ID_RE.match(item["id"])
+        if trouve:
+            plus_grand = max(plus_grand, int(trouve.group(1)))
+    n = plus_grand + 1
+    candidat = f"c{n}"
+    while candidat in ids_pris:
+        n += 1
+        candidat = f"c{n}"
+    return candidat
+
+
+def add_checklist_item(task_id: str, label: str) -> dict:
+    """Ajoute un critère en fin de checklist d'une tâche déjà créée (brief t-22).
+
+    Geste ouvert à l'exécutante elle-même : c'est en travaillant qu'on découvre qu'un pan
+    du travail n'avait pas été prévu, et le contrat lui interdit de se déclarer finie en
+    passant ce pan sous silence. Toujours ajouté en DERNIÈRE position d'affichage, jamais
+    inséré entre deux items existants : un item ne change donc jamais de voisin une fois
+    créé, seul son propre id est nouveau (voir _next_checklist_id). Ne vérifie pas la
+    convention de longueur (CHECKLIST_LABEL_MAX) : c'est un plafond signalé, jamais un
+    refus, à l'appelant (cli.py) de le rapporter après coup, comme pour add_task.
+    """
+    with store.locked() as state:
+        task = _get_task(state, task_id)
+        new_id = _next_checklist_id(task["checklist"])
+        task["checklist"].append(
+            {"id": new_id, "label": label, "done": False, "dureeMin": None}
+        )
+    return task
+
+
+def split_checklist_item(task_id: str, item_id: str, label_un: str, label_deux: str) -> dict:
+    """Découpe un critère existant en deux (brief t-22).
+
+    item_id GARDE son identifiant et prend label_un : toute référence déjà lue par
+    l'exécutante dans son brief continue de désigner la même case. label_deux part sous un
+    id frais (_next_checklist_id), ajouté en fin de liste, jamais inséré entre deux items
+    déjà présents : le seul rang qui bouge est celui du nouveau venu.
+
+    Les deux moitiés repartent à done=False, même si l'item d'origine était déjà coché :
+    l'état "fait" d'un critère fusionné ne prouve rien sur chacune des deux moitiés prises
+    séparément, et le conserver aurait permis de gonfler le compteur sans travail réel.
+
+    La durée SE RÉPARTIT entre les deux moitiés, elle ne se duplique jamais (brief t-27) :
+    un split qui laisserait chaque moitié porter la durée entière de l'original ferait
+    gonfler le total estimé de la tâche à chaque découpage, sans qu'aucun travail
+    supplémentaire n'ait été prévu. La division entière perd au plus une minute, reversée à
+    la première moitié plutôt que perdue en silence (10+11 sur 21, jamais 10+10).
+    """
+    with store.locked() as state:
+        task = _get_task(state, task_id)
+        for item in task["checklist"]:
+            if item["id"] == item_id:
+                duree_min = item.get("dureeMin")
+                if duree_min is None:
+                    duree_un, duree_deux = None, None
+                else:
+                    duree_deux = duree_min // 2
+                    duree_un = duree_min - duree_deux
+                item["label"] = label_un
+                item["done"] = False
+                item["dureeMin"] = duree_un
+                break
+        else:
+            raise ChantierError(
+                f"item not found: {item_id} does not exist in the checklist of {task_id}"
+            )
+        new_id = _next_checklist_id(task["checklist"])
+        task["checklist"].append(
+            {"id": new_id, "label": label_deux, "done": False, "dureeMin": duree_deux}
+        )
+    return task
+
+
+def set_checklist_duree(task_id: str, item_id: str, minutes: int) -> dict:
+    """Pose ou corrige l'estimation d'un critère, en MINUTES-CLAUDE (brief t-27).
+
+    Minutes-Claude, jamais minutes humaines : le temps qu'une session Claude Code met à
+    franchir ce critère, pas celui qu'un humain y passerait -- deux échelles sans rapport
+    l'une avec l'autre. Ouvert à l'exécutante elle-même, comme add/split/reword : une
+    estimation posée avant d'avoir lu le code est fausse, celle posée après vaut quelque
+    chose, et rien ne doit empêcher de la corriger à tout moment.
+
+    minutes doit être strictement positif : zéro ou négatif n'est pas une estimation basse,
+    c'est une absence d'estimation qui a déjà sa représentation propre (dureeMin=None) --
+    les confondre ferait lire un vrai zéro là où on ne sait simplement rien.
+    """
+    if minutes <= 0:
+        raise ChantierError(
+            f"duration refused: {minutes} is not a positive number of minutes"
+        )
+    with store.locked() as state:
+        task = _get_task(state, task_id)
+        for item in task["checklist"]:
+            if item["id"] == item_id:
+                item["dureeMin"] = minutes
+                break
+        else:
+            raise ChantierError(
+                f"item not found: {item_id} does not exist in the checklist of {task_id}"
+            )
+    return task
+
+
+def reword_checklist_item(task_id: str, item_id: str, label: str) -> dict:
+    """Reformule le libellé d'un critère existant, sans toucher à son id ni à son état
+    (brief t-22).
+
+    Corrige un libellé qui s'avère faux ou trop gros une fois le travail commencé.
+    L'état done n'a aucune raison de bouger : reformuler n'est pas désavouer un travail
+    déjà vérifié.
+    """
+    with store.locked() as state:
+        task = _get_task(state, task_id)
+        for item in task["checklist"]:
+            if item["id"] == item_id:
+                item["label"] = label
                 break
         else:
             raise ChantierError(

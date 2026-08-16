@@ -9,6 +9,7 @@ Aucun test ne touche le vrai ~/.claude/ordo, ni un vrai process claude, ni ne la
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -1097,3 +1098,282 @@ class TestCompaction(ControleTestCase):
             resultat = controle.tick(cid)
         self.assertEqual(envois, [("%1", "/compact")])
         self.assertTrue(any("compacted" in e for e in resultat["chantiers"][cid]["events"]))
+
+
+# ===========================================================================
+# deduce_current_item (brief t-25, volet 2)
+# ===========================================================================
+
+
+class TestDeduceCurrentItem(unittest.TestCase):
+    """Fonction pure : pas d'ORDO_HOME, pas de store, des dicts de tâche construits à
+    la main. Les trois garde-fous du brief, chacun dans son propre test."""
+
+    def _tache(self, *, state="running", current_item=None, checklist=()) -> dict:
+        return {"state": state, "currentItem": current_item, "checklist": list(checklist)}
+
+    def test_rien_sur_une_tache_qui_nest_pas_running(self):
+        t = self._tache(state="blocked", checklist=[{"id": "c1", "done": True}])
+        self.assertIsNone(controle.deduce_current_item(t))
+
+    def test_une_declaration_explicite_nest_jamais_ecrasee(self):
+        # Le cas mesuré sur trois exécutantes réelles : le seul des trois garde-fous où
+        # une régression serait invisible à l'œil (le champ resterait rempli, mais avec
+        # la mauvaise valeur).
+        t = self._tache(
+            current_item="c3",
+            checklist=[
+                {"id": "c1", "done": True},
+                {"id": "c2", "done": False},
+                {"id": "c3", "done": False},
+            ],
+        )
+        self.assertIsNone(controle.deduce_current_item(t))
+
+    def test_deduit_le_premier_critere_non_coche(self):
+        t = self._tache(
+            checklist=[
+                {"id": "c1", "done": True},
+                {"id": "c2", "done": False},
+                {"id": "c3", "done": False},
+            ],
+        )
+        self.assertEqual(controle.deduce_current_item(t), "c2")
+
+    def test_rend_none_quand_tout_est_coche(self):
+        t = self._tache(
+            checklist=[{"id": "c1", "done": True}, {"id": "c2", "done": True}],
+        )
+        self.assertIsNone(controle.deduce_current_item(t))
+
+    def test_rien_sur_une_tache_sans_checklist(self):
+        self.assertIsNone(controle.deduce_current_item(self._tache()))
+
+
+# ===========================================================================
+# wake_reasons : famille checklist-silent (brief t-25, volet 1)
+# ===========================================================================
+
+
+class TestChecklistSilentWakeReasons(ControleTestCase):
+    def _seed_watch(self, cid: str, tid: str, since_ago: float, signature=None) -> None:
+        with store.locked() as state:
+            ch = state["chantiers"][cid]
+            task = state["taches"][tid]
+            ch.setdefault("checklistWatch", {})[tid] = {
+                "signature": signature if signature is not None else controle._checklist_signature(task),
+                "since": _iso_ago(since_ago),
+            }
+
+    def test_une_tache_sans_checklist_nest_jamais_signalee(self):
+        # Garde-fou 2 du brief : même avec un cache figé de longue date, une tâche sans
+        # checklist ne peut pas produire ce motif (sa barre ne peut pas bouger).
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._seed_watch(cid, tid, since_ago=9999.0, signature=())
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 1.0):
+            reasons = controle.wake_reasons(cid)
+        self.assertFalse(any(r["kind"] == "checklist-silent" for r in reasons))
+
+    def test_pas_de_signal_avant_le_seuil(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        self._seed_watch(cid, tid, since_ago=5.0)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 600.0):
+            reasons = controle.wake_reasons(cid)
+        self.assertFalse(any(r["kind"] == "checklist-silent" for r in reasons))
+
+    def test_signal_quand_la_barre_est_figee_au_dela_du_seuil(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        self._seed_watch(cid, tid, since_ago=900.0)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 600.0):
+            reasons = controle.wake_reasons(cid)
+        motifs = [r for r in reasons if r["kind"] == "checklist-silent"]
+        self.assertEqual(len(motifs), 1)
+        self.assertEqual(motifs[0]["task"], tid)
+        # Marge de quelques secondes : le temps réel s'écoule entre le seed et l'appel.
+        self.assertRegex(motifs[0]["detail"], r"checklist unchanged for 90\d s")
+
+    def test_le_point_de_reference_est_le_dernier_mouvement_pas_le_lancement(self):
+        # Exemple exact du brief : une tâche lancée depuis 45 min qui a coché un item à
+        # la 30e minute (donc "since" = 15 min) doit se déclencher à un seuil de 10 min,
+        # PAS être jugée calme depuis les 45 minutes écoulées depuis le lancement.
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid, started_ago=45 * 60)
+        self._seed_watch(cid, tid, since_ago=15 * 60)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 10 * 60):
+            reasons = controle.wake_reasons(cid)
+        self.assertTrue(any(r["kind"] == "checklist-silent" for r in reasons))
+
+    def test_pas_de_signal_si_le_mouvement_est_recent_meme_tache_ancienne(self):
+        # Contrôle négatif du test précédent : même tâche lancée il y a 45 minutes, mais
+        # la checklist a bougé il y a 2 minutes seulement -> aucun signal, alors qu'une
+        # référence sur le lancement en produirait un à tort.
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid, started_ago=45 * 60)
+        self._seed_watch(cid, tid, since_ago=2 * 60)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 10 * 60):
+            reasons = controle.wake_reasons(cid)
+        self.assertFalse(any(r["kind"] == "checklist-silent" for r in reasons))
+
+    def test_le_detail_porte_le_critere_declare_en_cours(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        self._set_task(tid, currentItem="c2")
+        self._seed_watch(cid, tid, since_ago=900.0)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 600.0):
+            reasons = controle.wake_reasons(cid)
+        motif = next(r for r in reasons if r["kind"] == "checklist-silent")
+        self.assertIn("c2", motif["detail"])
+
+    def test_le_detail_ne_mentionne_rien_sans_critere_declare(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        self._seed_watch(cid, tid, since_ago=900.0)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 600.0):
+            reasons = controle.wake_reasons(cid)
+        motif = next(r for r in reasons if r["kind"] == "checklist-silent")
+        self.assertNotIn("declared on", motif["detail"])
+
+
+class TestChecklistSilentWakeNew(ControleTestCase):
+    """wake_new() sert le motif une fois par période de silence, jamais à chaque tour
+    (contrainte 3 du brief), et un nouveau signal redevient légitime une fois que la
+    checklist est repartie puis s'est figée à nouveau (contrainte 4)."""
+
+    def test_un_seul_signal_tant_que_rien_ne_bouge_puis_de_nouveau_apres_un_mouvement(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        with mock.patch.object(controle, "CHECKLIST_SILENT_AFTER_S", 1.0):
+            with store.locked() as state:
+                ch = state["chantiers"][cid]
+                task = state["taches"][tid]
+                ch.setdefault("checklistWatch", {})[tid] = {
+                    "signature": controle._checklist_signature(task), "since": _iso_ago(5.0),
+                }
+            premiers = controle.wake_new(cid)
+            self.assertTrue(any(m["kind"] == "checklist-silent" for m in premiers))
+
+            # Même état, tour suivant : déjà servi, ne doit pas revenir.
+            suivants = controle.wake_new(cid)
+            self.assertFalse(any(m["kind"] == "checklist-silent" for m in suivants))
+
+            # La checklist bouge : nouvelle signature, "since" tout frais -> pas encore
+            # au-delà du seuil, rien ne doit se déclencher.
+            chantier.check(tid, "c1")
+            with store.locked() as state:
+                task = state["taches"][tid]
+                state["chantiers"][cid]["checklistWatch"][tid] = {
+                    "signature": controle._checklist_signature(task), "since": store.now(),
+                }
+            frais = controle.wake_new(cid)
+            self.assertFalse(any(m["kind"] == "checklist-silent" for m in frais))
+
+            # Elle se fige à nouveau assez longtemps : nouveau signal légitime, pas
+            # avalé par le souvenir du premier (clé différente, nouvelle signature).
+            with store.locked() as state:
+                state["chantiers"][cid]["checklistWatch"][tid]["since"] = _iso_ago(5.0)
+            reveil = controle.wake_new(cid)
+            self.assertTrue(any(m["kind"] == "checklist-silent" for m in reveil))
+
+
+class TestChecklistWatchCache(ControleTestCase):
+    """tick() maintient le cache checklistWatch ; wake_reasons() ne fait que le lire
+    (voir son docstring, famille 8)."""
+
+    def test_tick_cree_une_entree_pour_une_tache_running_a_checklist(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a"])
+        self._make_running(tid)
+        controle.tick(cid)
+        watch = store.load()["chantiers"][cid].get("checklistWatch") or {}
+        self.assertIn(tid, watch)
+
+    def test_tick_ne_reinitialise_pas_since_quand_rien_ne_bouge(self):
+        # Bug réel trouvé et corrigé pendant ce chantier : state.json n'a pas de
+        # tuple, donc une signature stockée comme tuple revient en liste après le
+        # passage par store.locked() (JSON) -- comparée telle quelle à la signature
+        # fraîchement recalculée (un tuple), elle paraissait "changée" à CHAQUE tick,
+        # y compris quand la checklist n'avait pas bougé. Un sommeil réel entre les
+        # deux tick() est nécessaire : sans lui, deux appels dans la même seconde
+        # auraient masqué le bug (store.now() est horodaté à la seconde).
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        controle.tick(cid)
+        premier_since = store.load()["chantiers"][cid]["checklistWatch"][tid]["since"]
+        time.sleep(1.1)
+        controle.tick(cid)
+        second_since = store.load()["chantiers"][cid]["checklistWatch"][tid]["since"]
+        self.assertEqual(premier_since, second_since)
+
+    def test_tick_ne_cree_rien_pour_une_tache_sans_checklist(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        controle.tick(cid)
+        watch = store.load()["chantiers"][cid].get("checklistWatch") or {}
+        self.assertNotIn(tid, watch)
+
+    def test_tick_change_la_signature_quand_un_item_est_coche(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a", "b"])
+        self._make_running(tid)
+        controle.tick(cid)
+        avant = store.load()["chantiers"][cid]["checklistWatch"][tid]["signature"]
+        chantier.check(tid, "c1")
+        controle.tick(cid)
+        apres = store.load()["chantiers"][cid]["checklistWatch"][tid]["signature"]
+        self.assertNotEqual(avant, apres)
+
+    def test_tick_retire_lentree_dune_tache_qui_nest_plus_running(self):
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["a"])
+        self._make_running(tid)
+        controle.tick(cid)
+        self.assertIn(tid, store.load()["chantiers"][cid]["checklistWatch"])
+        self._set_task(tid, state="done")
+        controle.tick(cid)
+        watch = store.load()["chantiers"][cid].get("checklistWatch") or {}
+        self.assertNotIn(tid, watch)
+
+
+# ===========================================================================
+# CHECKLIST_SILENT_AFTER_S : seuil nommé, surchargeable par variable d'environnement
+# (brief t-25, contrainte 1 -- même convention que usage.SEUIL_CONTEXTE)
+# ===========================================================================
+
+
+class TestChecklistSilentAfterSeuil(unittest.TestCase):
+    """Lu à l'import du module, comme usage.SEUIL_CONTEXTE (voir test_usage.py) : chaque
+    test change l'environnement puis recharge controle, et restaure les deux en sortant
+    pour ne pas polluer les tests suivants."""
+
+    def setUp(self) -> None:
+        self._avant = os.environ.get("ORDO_CHECKLIST_SILENT_AFTER_S")
+
+    def tearDown(self) -> None:
+        if self._avant is None:
+            os.environ.pop("ORDO_CHECKLIST_SILENT_AFTER_S", None)
+        else:
+            os.environ["ORDO_CHECKLIST_SILENT_AFTER_S"] = self._avant
+        importlib.reload(controle)
+
+    def test_valeur_par_defaut_de_dix_minutes(self):
+        os.environ.pop("ORDO_CHECKLIST_SILENT_AFTER_S", None)
+        importlib.reload(controle)
+        self.assertEqual(controle.CHECKLIST_SILENT_AFTER_S, 600.0)
+
+    def test_la_variable_d_environnement_surcharge_le_seuil(self):
+        os.environ["ORDO_CHECKLIST_SILENT_AFTER_S"] = "42"
+        importlib.reload(controle)
+        self.assertEqual(controle.CHECKLIST_SILENT_AFTER_S, 42.0)

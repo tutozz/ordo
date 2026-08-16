@@ -111,6 +111,23 @@ def _section_zones(task: dict) -> str:
     return "## Declared zones\nYou touch only this:\n" + contenu
 
 
+def _ligne_duree(task_id: str, item: dict, home: str) -> str:
+    """Demande la révision de l'estimation, item par item, plutôt que de seulement la
+    permettre (brief t-27, c9).
+
+    Postée juste au-dessus de la commande --doing déjà obligatoire de CE critère, jamais
+    dans un paragraphe à part : trois exécutantes sur trois ont ignoré un geste facultatif
+    documenté item par item quand il vivait loin de l'action qu'elles devaient déjà faire
+    (voir --doing avant que ce brief ne l'explique ici même). Une estimation posée avant
+    de lire le code est fausse ; celle posée après l'avoir lu vaut quelque chose.
+    """
+    duree = item.get("dureeMin")
+    commande = f"ORDO_HOME={home} ordo checklist duree {task_id} {item['id']} <minutes>"
+    if duree is None:
+        return f"no duration estimate yet — set one now that you've read the code: {commande}"
+    return f"estimate: {duree} Claude-minute(s) — correct it now if wrong, having read the code: {commande}"
+
+
 def _section_checklist(task_id: str, task: dict) -> str:
     """Dit de cocher tout de suite, commande prête à copier, avant de rappeler le filet.
 
@@ -132,20 +149,56 @@ def _section_checklist(task_id: str, task: dict) -> str:
     home = shlex.quote(str(store.home()))
     lignes = [
         f"- {item['id']}: {item['label']}\n"
-        f"  ORDO_HOME={home} ordo check {task_id} {item['id']}"
+        f"  {_ligne_duree(task_id, item, home)}\n"
+        f"  when you start it: ORDO_HOME={home} ordo check {task_id} {item['id']} --doing\n"
+        f"  when it is true:   ORDO_HOME={home} ordo check {task_id} {item['id']}"
         for item in checklist
     ]
     return (
         "## Checklist\n"
-        "Before starting an item, declare it so the human sees what you are actively "
-        "working on, not just a counter that never moves between two checks:\n"
-        f"  ORDO_HOME={home} ordo check {task_id} <item-id> --doing\n\n"
+        "Two commands per item, both written out below: one when you START it, one when "
+        "it is TRUE. Run the first one before touching an item - it is not optional and it "
+        "is not a report. The human watches a card, and between two ticks that card can "
+        "either name what you are doing right now or say nothing at all; without --doing it "
+        "says nothing, and twenty silent minutes look exactly like a session that died.\n\n"
         "Tick each item AS SOON AS you have actually verified it, immediately, do not "
-        "wait for the end of the task. Run the exact command below it (a wrongly ticked "
-        "item blocks the tasks that depend on it):\n"
+        "wait for the end of the task (a wrongly ticked item blocks the tasks that depend "
+        "on it):\n"
         + "\n".join(lignes)
         + "\n\nThe report's \"checked\" field, described below, still stands at the end "
-        "as a safety net: ticking the same item twice has no effect."
+        "as a safety net: ticking the same item twice has no effect.\n\n"
+        + _section_checklist_evolution(task_id, home)
+    )
+
+
+def _section_checklist_evolution(task_id: str, home: str) -> str:
+    """La part du brief qui ouvre a l'executante trois gestes sur SA propre checklist,
+    et lui dit sans ambiguite ce qu'aucun des trois ne fait (brief t-22).
+
+    Un verbe qu'on ne donne pas a l'executante n'est jamais utilise, elle ne le devine
+    pas -- c'est exactement ce qui est arrive au verbe check lui-meme avant que ce brief
+    ne l'explique. Le refus de suppression est dit ICI, au moment ou l'idee de retirer un
+    critere genant pourrait naitre, pas seulement laisse a l'absence d'un verbe dans
+    l'aide : le contrat interdit formellement de se declarer finie en retirant un critere.
+    """
+    return (
+        "It is working that reveals a criterion was really two, or that a whole piece of "
+        "work was never planned for. You can grow this checklist yourself:\n"
+        f'- a piece of work was not planned for: `ordo checklist add {task_id} "<label>"`\n'
+        f'- a criterion turns out to be two: `ordo checklist split {task_id} <item-id> '
+        '"<label one>" "<label two>"` (the original id keeps the first label, the second '
+        "gets a fresh id)\n"
+        f'- a label turns out wrong or too broad: `ordo checklist reword {task_id} '
+        '<item-id> "<new label>"` (same id, same checked state)\n'
+        f'- an estimate is missing or turns out wrong, once you have read the code: '
+        f'`ordo checklist duree {task_id} <item-id> <minutes>` (Claude-minutes, same id, '
+        'same label, same checked state)\n\n'
+        "What you CANNOT do, on purpose: remove a criterion. There is no verb for it, and "
+        "there never will be for you -- an executor able to drop a criterion could declare "
+        "itself done by dropping the one in its way, and the contract formally forbids "
+        "self-validation. If a criterion turns out impossible or off-topic, say so in your "
+        "report (\"blocked\" or \"asking\"), never make it disappear; the orchestrator is "
+        "the one who decides."
     )
 
 

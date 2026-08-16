@@ -217,11 +217,34 @@ class TestAddTask(ChantierTestCase):
 
     def test_add_task_normalizes_string_checklist(self):
         t = chantier.add_task(self.chantier_id, "titre", "prompt", checklist=["tests verts"])
-        self.assertEqual(t["checklist"], [{"id": "c1", "label": "tests verts", "done": False}])
+        self.assertEqual(
+            t["checklist"],
+            [{"id": "c1", "label": "tests verts", "done": False, "dureeMin": None}],
+        )
         self.assertEqual(t["state"], "queued")
         self.assertEqual(t["chantier"], self.chantier_id)
         self.assertEqual(t["priority"], 0)
         self.assertEqual(t["attempts"], 0)
+
+    def test_add_task_accepte_une_duree_par_critere_en_minutes_claude(self):
+        # brief t-27 : l'estimation vit sur le critère, en minutes-Claude, jamais sur la
+        # tâche entière.
+        t = chantier.add_task(
+            self.chantier_id,
+            "titre",
+            "prompt",
+            checklist=[{"label": "lire le code", "dureeMin": 15}],
+        )
+        self.assertEqual(
+            t["checklist"],
+            [{"id": "c1", "label": "lire le code", "done": False, "dureeMin": 15}],
+        )
+
+    def test_add_task_sans_duree_reste_none_pas_zero(self):
+        # Un critère sans estimation ne doit jamais se lire comme "zéro minute" : les 349
+        # critères existants sans durée doivent continuer de fonctionner (c8).
+        t = chantier.add_task(self.chantier_id, "titre", "prompt", checklist=["sans estimation"])
+        self.assertIsNone(t["checklist"][0]["dureeMin"])
 
     def test_add_task_unknown_chantier_raises(self):
         with self.assertRaises(chantier.ChantierError):
@@ -242,26 +265,28 @@ class TestChecklistHorsConvention(unittest.TestCase):
 
     def test_aucun_label_trop_long_rend_liste_vide(self):
         checklist = [
-            {"id": "c1", "label": "ok", "done": False},
-            {"id": "c2", "label": "toujours ok", "done": False},
+            {"id": "c1", "label": "ok", "done": False, "dureeMin": None},
+            {"id": "c2", "label": "toujours ok", "done": False, "dureeMin": None},
         ]
         self.assertEqual(chantier.checklist_hors_convention(checklist), [])
 
     def test_un_label_trop_long_est_signale_avec_sa_longueur_reelle(self):
-        checklist = [{"id": "c1", "label": "x" * 63, "done": False}]
+        checklist = [{"id": "c1", "label": "x" * 63, "done": False, "dureeMin": None}]
         self.assertEqual(
             chantier.checklist_hors_convention(checklist), [{"id": "c1", "length": 63}]
         )
 
     def test_la_limite_pile_au_seuil_ne_declenche_rien(self):
         checklist = [
-            {"id": "c1", "label": "x" * chantier.CHECKLIST_LABEL_MAX, "done": False}
+            {"id": "c1", "label": "x" * chantier.CHECKLIST_LABEL_MAX, "done": False,
+             "dureeMin": None}
         ]
         self.assertEqual(chantier.checklist_hors_convention(checklist), [])
 
     def test_un_cran_au_dessus_du_seuil_declenche(self):
         checklist = [
-            {"id": "c1", "label": "x" * (chantier.CHECKLIST_LABEL_MAX + 1), "done": False}
+            {"id": "c1", "label": "x" * (chantier.CHECKLIST_LABEL_MAX + 1), "done": False,
+             "dureeMin": None}
         ]
         self.assertEqual(
             chantier.checklist_hors_convention(checklist),
@@ -269,10 +294,34 @@ class TestChecklistHorsConvention(unittest.TestCase):
         )
 
     def test_ne_modifie_pas_la_checklist_recue(self):
-        checklist = [{"id": "c1", "label": "x" * 70, "done": False}]
+        checklist = [{"id": "c1", "label": "x" * 70, "done": False, "dureeMin": None}]
         avant = [dict(item) for item in checklist]
         chantier.checklist_hors_convention(checklist)
         self.assertEqual(checklist, avant)
+
+
+class TestChecklistSansDuree(unittest.TestCase):
+    """checklist_sans_duree() : pure, comme checklist_hors_convention() (brief t-27)."""
+
+    def test_aucune_absence_rend_liste_vide(self):
+        checklist = [
+            {"id": "c1", "label": "a", "done": False, "dureeMin": 10},
+            {"id": "c2", "label": "b", "done": False, "dureeMin": 5},
+        ]
+        self.assertEqual(chantier.checklist_sans_duree(checklist), [])
+
+    def test_signale_chaque_item_sans_duree(self):
+        checklist = [
+            {"id": "c1", "label": "a", "done": False, "dureeMin": 10},
+            {"id": "c2", "label": "b", "done": False, "dureeMin": None},
+        ]
+        self.assertEqual(chantier.checklist_sans_duree(checklist), [{"id": "c2"}])
+
+    def test_un_item_sans_la_cle_du_tout_compte_comme_sans_duree(self):
+        # Un critère créé avant t-27 n'a jamais eu cette clé : absente, pas seulement
+        # None, doit être tolérée à l'identique (c8).
+        checklist = [{"id": "c1", "label": "vieux critère", "done": False}]
+        self.assertEqual(chantier.checklist_sans_duree(checklist), [{"id": "c1"}])
 
 
 class TestDependConfinedToChantier(ChantierTestCase):
@@ -456,6 +505,209 @@ class TestTaskEdits(ChantierTestCase):
         # le refus est reel, pas cosmetique : le prompt original n'a pas bouge
         state = store.load()
         self.assertEqual(state["taches"][self.task_id]["prompt"], "prompt")
+
+
+class TestChecklistGrowth(ChantierTestCase):
+    """add_checklist_item / split_checklist_item / reword_checklist_item (brief t-22).
+
+    Ce que ces trois fonctions ouvrent à l'exécutante elle-même : elle découvre en
+    travaillant qu'un critère en valait deux, ou qu'un pan de travail n'avait pas été
+    prévu. Ce qu'elles n'ouvrent JAMAIS, et c'est le cœur du contrat : aucune des trois
+    ne peut faire disparaître un id existant, voir TestChecklistNeverShrinks plus bas.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=["premier critère"]
+        )["id"]
+
+    def test_add_appends_a_fresh_id_at_the_end(self):
+        t = chantier.add_checklist_item(self.task_id, "second critère")
+        self.assertEqual(
+            t["checklist"],
+            [
+                {"id": "c1", "label": "premier critère", "done": False, "dureeMin": None},
+                {"id": "c2", "label": "second critère", "done": False, "dureeMin": None},
+            ],
+        )
+
+    def test_add_ne_touche_pas_aux_items_existants(self):
+        chantier.check(self.task_id, "c1")
+        t = chantier.add_checklist_item(self.task_id, "second critère")
+        self.assertEqual(
+            t["checklist"][0],
+            {"id": "c1", "label": "premier critère", "done": True, "dureeMin": None},
+        )
+
+    def test_add_sur_tache_inconnue_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.add_checklist_item("t-99", "x")
+
+    def test_add_deux_fois_ne_reutilise_jamais_un_id(self):
+        chantier.add_checklist_item(self.task_id, "second")
+        t = chantier.add_checklist_item(self.task_id, "troisième")
+        self.assertEqual([i["id"] for i in t["checklist"]], ["c1", "c2", "c3"])
+
+    def test_split_garde_lid_original_sur_la_premiere_moitie(self):
+        t = chantier.split_checklist_item(self.task_id, "c1", "moitié a", "moitié b")
+        self.assertEqual(
+            t["checklist"][0], {"id": "c1", "label": "moitié a", "done": False, "dureeMin": None}
+        )
+        self.assertEqual(
+            t["checklist"][1], {"id": "c2", "label": "moitié b", "done": False, "dureeMin": None}
+        )
+
+    def test_split_repartit_la_duree_sans_la_dupliquer(self):
+        # brief t-27 : un split doit répartir la durée, pas la dupliquer -- les deux
+        # moitiés ne peuvent pas valoir chacune la durée entière de l'original.
+        chantier.set_checklist_duree(self.task_id, "c1", 20)
+        t = chantier.split_checklist_item(self.task_id, "c1", "moitié a", "moitié b")
+        self.assertEqual(t["checklist"][0]["dureeMin"], 10)
+        self.assertEqual(t["checklist"][1]["dureeMin"], 10)
+
+    def test_split_repartit_une_duree_impaire_sans_en_perdre(self):
+        chantier.set_checklist_duree(self.task_id, "c1", 21)
+        t = chantier.split_checklist_item(self.task_id, "c1", "moitié a", "moitié b")
+        self.assertEqual(
+            t["checklist"][0]["dureeMin"] + t["checklist"][1]["dureeMin"], 21
+        )
+
+    def test_split_dun_item_sans_duree_laisse_les_deux_moities_sans_duree(self):
+        t = chantier.split_checklist_item(self.task_id, "c1", "moitié a", "moitié b")
+        self.assertIsNone(t["checklist"][0]["dureeMin"])
+        self.assertIsNone(t["checklist"][1]["dureeMin"])
+
+    def test_split_dun_item_deja_coche_repart_a_false_sur_les_deux_moities(self):
+        # Un id fusionné coché ne prouve rien sur chacune des deux moitiés séparément :
+        # le garder aurait permis de gonfler le compteur sans travail réel derrière.
+        chantier.check(self.task_id, "c1")
+        t = chantier.split_checklist_item(self.task_id, "c1", "moitié a", "moitié b")
+        self.assertFalse(t["checklist"][0]["done"])
+        self.assertFalse(t["checklist"][1]["done"])
+
+    def test_split_ne_renumerote_pas_un_troisieme_item_deja_present(self):
+        chantier.add_checklist_item(self.task_id, "deuxième critère")
+        t = chantier.split_checklist_item(self.task_id, "c1", "moitié a", "moitié b")
+        # c2 (le "deuxième critère" ajouté avant le split) garde son id et son rang ; le
+        # fragment du split arrive après lui, en c3, jamais inséré devant.
+        self.assertEqual(t["checklist"][1]["id"], "c2")
+        self.assertEqual(t["checklist"][1]["label"], "deuxième critère")
+        self.assertEqual(
+            t["checklist"][2], {"id": "c3", "label": "moitié b", "done": False, "dureeMin": None}
+        )
+
+    def test_split_item_inconnu_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.split_checklist_item(self.task_id, "c-inconnu", "a", "b")
+
+    def test_reword_change_le_libelle_garde_lid_et_letat(self):
+        chantier.check(self.task_id, "c1")
+        t = chantier.reword_checklist_item(self.task_id, "c1", "libellé corrigé")
+        self.assertEqual(
+            t["checklist"][0],
+            {"id": "c1", "label": "libellé corrigé", "done": True, "dureeMin": None},
+        )
+
+    def test_reword_item_inconnu_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.reword_checklist_item(self.task_id, "c-inconnu", "x")
+
+    def test_reword_ne_touche_pas_a_la_duree(self):
+        chantier.set_checklist_duree(self.task_id, "c1", 12)
+        t = chantier.reword_checklist_item(self.task_id, "c1", "libellé corrigé")
+        self.assertEqual(t["checklist"][0]["dureeMin"], 12)
+
+
+class TestChecklistDuree(ChantierTestCase):
+    """set_checklist_duree() : la révision de l'estimation par l'exécutante (brief t-27,
+    c4). Le seul champ que reword/split ne couvrent pas : corriger une durée sans changer
+    ni le libellé ni l'état coché du critère."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=["premier critère"]
+        )["id"]
+
+    def test_pose_la_duree_en_minutes(self):
+        t = chantier.set_checklist_duree(self.task_id, "c1", 25)
+        self.assertEqual(t["checklist"][0]["dureeMin"], 25)
+
+    def test_ne_touche_ni_au_libelle_ni_a_letat(self):
+        chantier.check(self.task_id, "c1")
+        t = chantier.set_checklist_duree(self.task_id, "c1", 25)
+        self.assertEqual(t["checklist"][0]["label"], "premier critère")
+        self.assertTrue(t["checklist"][0]["done"])
+
+    def test_corrige_une_duree_deja_posee(self):
+        chantier.set_checklist_duree(self.task_id, "c1", 25)
+        t = chantier.set_checklist_duree(self.task_id, "c1", 8)
+        self.assertEqual(t["checklist"][0]["dureeMin"], 8)
+
+    def test_item_inconnu_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_duree(self.task_id, "c-inconnu", 10)
+
+    def test_tache_inconnue_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_duree("t-99", "c1", 10)
+
+    def test_duree_nulle_ou_negative_leve(self):
+        # Zéro ou négatif n'est pas une estimation, c'est une absence d'estimation
+        # déguisée : le champ existe déjà pour ça (None), inutile de le confondre avec 0.
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_duree(self.task_id, "c1", 0)
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_duree(self.task_id, "c1", -5)
+
+
+class TestChecklistNeverShrinks(ChantierTestCase):
+    """c4/c8 : rien, dans le contrat public de chantier.py, ne peut retirer un critère.
+
+    Une exécutante qui pourrait supprimer un critère pourrait se déclarer finie en
+    retirant celui qui la gêne ; le contrat le lui interdit formellement. Le refus doit
+    être PROUVÉ, pas seulement l'absence d'un verbe dans l'aide (brief t-22) : ce test
+    vérifie que la surface publique du module ne porte littéralement aucune fonction de
+    suppression, quel que soit le nom qu'elle prendrait.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=["a", "b", "c"]
+        )["id"]
+
+    def test_aucune_fonction_de_suppression_nexiste(self):
+        noms_interdits = (
+            "remove_checklist_item",
+            "delete_checklist_item",
+            "drop_checklist_item",
+            "remove_item",
+            "delete_item",
+        )
+        for nom in noms_interdits:
+            self.assertFalse(
+                hasattr(chantier, nom), f"chantier.{nom} ne doit pas exister (brief t-22)"
+            )
+
+    def test_add_split_reword_ne_font_jamais_baisser_le_nombre_ditems(self):
+        avant = len(store.load()["taches"][self.task_id]["checklist"])
+        chantier.add_checklist_item(self.task_id, "d")
+        chantier.split_checklist_item(self.task_id, "c2", "b1", "b2")
+        chantier.reword_checklist_item(self.task_id, "c1", "a corrigé")
+        après = len(store.load()["taches"][self.task_id]["checklist"])
+        self.assertGreater(après, avant)
+
+    def test_tous_les_ids_dorigine_survivent_a_un_ajout_et_un_decoupage(self):
+        ids_avant = {i["id"] for i in store.load()["taches"][self.task_id]["checklist"]}
+        chantier.add_checklist_item(self.task_id, "d")
+        chantier.split_checklist_item(self.task_id, "c2", "b1", "b2")
+        ids_après = {i["id"] for i in store.load()["taches"][self.task_id]["checklist"]}
+        self.assertTrue(ids_avant.issubset(ids_après))
 
 
 class TestPropagateFailures(unittest.TestCase):

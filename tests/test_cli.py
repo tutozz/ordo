@@ -356,7 +356,10 @@ class TestGrapheVerbs(CliTestCase):
         )
         self.assertEqual(data["dependsOn"], [t1])
         self.assertEqual(data["touches"], ["db"])
-        self.assertEqual(data["checklist"], [{"id": "c1", "label": "tests verts", "done": False}])
+        self.assertEqual(
+            data["checklist"],
+            [{"id": "c1", "label": "tests verts", "done": False, "dureeMin": None}],
+        )
 
     def test_add_avertit_sur_un_label_de_checklist_trop_long(self):
         cid = self._chantier()
@@ -367,6 +370,68 @@ class TestGrapheVerbs(CliTestCase):
         self.assertEqual(code, 0)
         self.assertIn("WARNING", err)
         self.assertIn("63", err)
+
+    def test_add_check_avec_suffixe_minutes_pose_la_duree(self):
+        # brief t-27 : syntaxe "label:minutes", immunisée contre tout réordonnancement
+        # puisque la durée reste attachée à son propre --check plutôt que de s'apparier
+        # par position avec une option séparée.
+        cid = self._chantier()
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "lire le code:20", "--json"]
+        )
+        self.assertEqual(
+            data["checklist"],
+            [{"id": "c1", "label": "lire le code", "done": False, "dureeMin": 20}],
+        )
+
+    def test_add_check_sans_suffixe_reste_sans_duree(self):
+        cid = self._chantier()
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "sans estimation", "--json"]
+        )
+        self.assertIsNone(data["checklist"][0]["dureeMin"])
+
+    def test_add_check_avec_suffixe_non_numerique_reste_dans_le_libelle(self):
+        # ":inconnu" n'est pas des minutes : le libellé est gardé intact, pas coupé à tort.
+        cid = self._chantier()
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "chapitre:trois", "--json"]
+        )
+        self.assertEqual(data["checklist"][0]["label"], "chapitre:trois")
+        self.assertIsNone(data["checklist"][0]["dureeMin"])
+
+    def test_add_plusieurs_check_avec_et_sans_duree_ne_se_meprennent_jamais(self):
+        # Le piège explicitement signalé par le brief : --check répété plusieurs fois, une
+        # option séparée qui s'apparierait par position serait fragile à l'ordre. Ici
+        # chaque durée reste collée à SON libellé, quel que soit l'ordre des --check.
+        cid = self._chantier()
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p",
+             "--check", "sans duree", "--check", "avec duree:12", "--check", "encore sans",
+             "--json"]
+        )
+        self.assertEqual(
+            [(i["label"], i["dureeMin"]) for i in data["checklist"]],
+            [("sans duree", None), ("avec duree", 12), ("encore sans", None)],
+        )
+
+    def test_add_avertit_quand_un_critere_na_pas_de_duree(self):
+        # même régime que l'avertissement des 40 caractères : jamais bloquant, juste dit.
+        cid = self._chantier()
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "sans estimation"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", err)
+        self.assertIn("c1", err)
+
+    def test_add_najoute_aucun_avertissement_de_duree_quand_tout_est_estime(self):
+        cid = self._chantier()
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "estime:5"]
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("duration", err.lower())
         self.assertNotIn("WARNING", out)
 
     def test_add_taches_le_label_trop_long_mais_ne_le_refuse_pas(self):
@@ -388,12 +453,15 @@ class TestGrapheVerbs(CliTestCase):
         self.assertNotIn("WARNING", out)
 
     def test_add_sans_label_trop_long_ne_dit_rien(self):
+        # brief t-27 : un critère sans durée déclenche désormais son propre avertissement
+        # (voir test_add_avertit_quand_un_critere_na_pas_de_duree) -- celui-ci ne prouve
+        # plus l'absence de TOUT avertissement, seulement l'absence du warning "40-char".
         cid = self._chantier()
         code, out, err = self._run(
             ["add", cid, "--title", "t", "--prompt", "p", "--check", "ok"]
         )
         self.assertEqual(code, 0)
-        self.assertEqual(err, "")
+        self.assertNotIn("char", err)
 
     def test_dep_refuse_sur_cycle(self):
         cid = self._chantier()
@@ -536,6 +604,32 @@ class TestGrapheVerbs(CliTestCase):
         code, out, err = self._run(["check", t1, "c-inconnu", "--doing"])
         self.assertNotEqual(code, 0)
 
+    def test_check_doing_rappelle_de_poser_une_duree_quand_il_nen_a_pas(self):
+        # brief t-27, c4/c9 : la révision est DÉDUCTIBLE de --doing, déjà obligatoire,
+        # jamais un geste séparé qu'on peut ne jamais lancer.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        code, out, err = self._run(["check", t1, "c1", "--doing"])
+        self.assertEqual(code, 0)
+        self.assertIn("no duration estimate", err)
+        self.assertIn(f"ordo checklist duree {t1} c1", err)
+
+    def test_check_doing_rappelle_de_revalider_une_duree_deja_posee(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        chantier.set_checklist_duree(t1, "c1", 15)
+        code, out, err = self._run(["check", t1, "c1", "--doing"])
+        self.assertEqual(code, 0)
+        self.assertIn("15", err)
+        self.assertIn(f"ordo checklist duree {t1} c1", err)
+
+    def test_check_doing_json_ne_porte_aucun_rappel(self):
+        # le contrat --json reste stable : le rappel est un confort humain, pas un champ.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        code, out, err = self._run(["check", t1, "c1", "--doing", "--json"])
+        self.assertEqual(err, "")
+
     def test_cancel_libere_currentItem(self):
         cid = self._chantier()
         t1 = self._tache(cid, checklist=["tests verts"])
@@ -550,7 +644,12 @@ class TestGrapheVerbs(CliTestCase):
         brief_path = prompt_mod.brief_executante(t1)
         contenu = Path(brief_path).read_text(encoding="utf-8")
         self.assertIn("--doing", contenu)
+        # La commande de déclaration est écrite item par item, concrète et copiable, et
+        # non sous une forme générique à compléter : une exécutante copie la commande
+        # prête et ignore celle où il reste un <item-id> à substituer, ce qui laissait
+        # currentItem vide sur toutes les tâches en cours.
         self.assertIn(f"ordo check {t1} c1 --doing", contenu)
+        self.assertIn(f"ordo check {t1} c1\n", contenu)
 
     def test_carte_model_expose_currentItem(self):
         cid = self._chantier()
@@ -559,6 +658,203 @@ class TestGrapheVerbs(CliTestCase):
         from ordo import carte as carte_mod
         node = carte_mod.model(cid)["nodes"][t1]
         self.assertEqual(node["currentItem"], "c1")
+
+
+# ---------------------------------------------------------------------------
+# Checklist : ajouter, découper, reformuler -- jamais supprimer (brief t-22)
+# ---------------------------------------------------------------------------
+
+
+class TestChecklistVerbs(CliTestCase):
+    def test_add_ajoute_un_critere_a_lid_frais(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        data = self._run_json(["checklist", "add", t1, "second critère", "--json"])
+        self.assertEqual(
+            data["checklist"][1],
+            {"id": "c2", "label": "second critère", "done": False, "dureeMin": None},
+        )
+
+    def test_add_journalise_sous_lauteur_par_defaut_ordo(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        self._run_json(["checklist", "add", t1, "second critère", "--json"])
+        entries = self._run_json(["journal", "show", cid, "--json"])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["auteur"], "ORDO")
+        self.assertIn("c2", entries[0]["texte"])
+
+    def test_add_journalise_sous_lauteur_demande(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        self._run_json(
+            ["checklist", "add", t1, "second critère", "--author", "ORCH", "--json"]
+        )
+        entries = self._run_json(["journal", "show", cid, "--json"])
+        self.assertEqual(entries[0]["auteur"], "ORCH")
+
+    def test_add_refuse_auteur_invalide(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(["checklist", "add", t1, "x", "--author", "AUTRE"])
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_add_avertit_au_dela_de_la_convention_40_caracteres(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        long_label = "x" * (chantier.CHECKLIST_LABEL_MAX + 1)
+        code, out, err = self._run(["checklist", "add", t1, long_label])
+        self.assertEqual(code, 0)
+        self.assertIn(f"{chantier.CHECKLIST_LABEL_MAX}-char", err)
+
+    def test_add_sous_la_convention_ne_previent_pas(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        code, out, err = self._run(["checklist", "add", t1, "court"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+    def test_split_garde_lid_original_et_cree_un_id_frais(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["fait deux choses à la fois"])
+        data = self._run_json(
+            ["checklist", "split", t1, "c1", "première moitié", "seconde moitié", "--json"]
+        )
+        self.assertEqual(
+            data["checklist"],
+            [
+                {"id": "c1", "label": "première moitié", "done": False, "dureeMin": None},
+                {"id": "c2", "label": "seconde moitié", "done": False, "dureeMin": None},
+            ],
+        )
+
+    def test_split_journalise_sous_lauteur_par_defaut_ordo(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["à découper"])
+        self._run_json(["checklist", "split", t1, "c1", "a", "b", "--json"])
+        entries = self._run_json(["journal", "show", cid, "--json"])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["auteur"], "ORDO")
+        self.assertIn("c1", entries[0]["texte"])
+        self.assertIn("c2", entries[0]["texte"])
+
+    def test_split_item_inconnu_refuse(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["a"])
+        code, out, err = self._run(["checklist", "split", t1, "c-inconnu", "a", "b"])
+        self.assertNotEqual(code, 0)
+
+    def test_reword_change_le_libelle_sans_toucher_lid(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["libellé faux"])
+        data = self._run_json(
+            ["checklist", "reword", t1, "c1", "libellé corrigé", "--json"]
+        )
+        self.assertEqual(
+            data["checklist"][0],
+            {"id": "c1", "label": "libellé corrigé", "done": False, "dureeMin": None},
+        )
+
+    def test_reword_ne_journalise_rien(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["libellé faux"])
+        self._run_json(["checklist", "reword", t1, "c1", "libellé corrigé", "--json"])
+        entries = self._run_json(["journal", "show", cid, "--json"])
+        self.assertEqual(entries, [])
+
+    def test_checklist_sans_action_affiche_aide(self):
+        code, out, err = self._run(["checklist"])
+        self.assertEqual(code, 0)
+        self.assertIn("add", out)
+        self.assertIn("split", out)
+        self.assertIn("reword", out)
+        self.assertIn("duree", out)
+
+    def test_duree_pose_lestimation_en_minutes(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        data = self._run_json(["checklist", "duree", t1, "c1", "20", "--json"])
+        self.assertEqual(data["checklist"][0]["dureeMin"], 20)
+
+    def test_duree_corrige_une_estimation_deja_posee(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        self._run_json(["checklist", "duree", t1, "c1", "20", "--json"])
+        data = self._run_json(["checklist", "duree", t1, "c1", "8", "--json"])
+        self.assertEqual(data["checklist"][0]["dureeMin"], 8)
+
+    def test_duree_ne_touche_ni_au_libelle_ni_a_letat(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        chantier.check(t1, "c1")
+        data = self._run_json(["checklist", "duree", t1, "c1", "20", "--json"])
+        self.assertEqual(data["checklist"][0]["label"], "premier")
+        self.assertTrue(data["checklist"][0]["done"])
+
+    def test_duree_item_inconnu_refuse(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        code, out, err = self._run(["checklist", "duree", t1, "c-inconnu", "20"])
+        self.assertNotEqual(code, 0)
+
+    def test_duree_valeur_non_positive_refuse(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        code, out, err = self._run(["checklist", "duree", t1, "c1", "0"])
+        self.assertNotEqual(code, 0)
+
+    def test_aucun_verbe_de_suppression_nexiste(self):
+        # Prouve le refus (brief t-22), ne se contente pas de son absence de l'aide :
+        # argparse rejette la sous-commande avant meme d'atteindre un dispatch quelconque.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["a"])
+        for candidat in ("remove", "delete", "drop", "rm"):
+            with self.assertRaises(SystemExit) as ctx:
+                self._run(["checklist", candidat, t1, "c1"])
+            self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_brief_explique_les_gestes_ouverts_et_le_refus_de_suppression(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        from ordo import prompt as prompt_mod
+        brief_path = prompt_mod.brief_executante(t1)
+        contenu = Path(brief_path).read_text(encoding="utf-8")
+        self.assertIn("ordo checklist add", contenu)
+        self.assertIn("ordo checklist split", contenu)
+        self.assertIn("ordo checklist reword", contenu)
+        self.assertIn("ordo checklist duree", contenu)
+        self.assertIn("cannot", contenu.lower())
+
+    def test_brief_demande_la_revision_de_chaque_estimation_pas_seulement_ne_lautorise(self):
+        # brief t-27, c9 : le geste doit être DEMANDÉ item par item, pas seulement rendu
+        # possible dans un paragraphe général -- même raison que --doing, ignoré trois fois
+        # sur trois quand documenté loin de l'action.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier", "second"])
+        chantier.set_checklist_duree(t1, "c1", 15)
+        from ordo import prompt as prompt_mod
+        brief_path = prompt_mod.brief_executante(t1)
+        contenu = Path(brief_path).read_text(encoding="utf-8")
+        # c1 porte déjà une estimation : le brief demande de la revérifier.
+        self.assertIn("estimate: 15", contenu)
+        self.assertIn(f"ordo checklist duree {t1} c1", contenu)
+        # c2 n'en porte aucune : le brief demande d'en poser une.
+        self.assertIn("no duration estimate yet", contenu)
+        self.assertIn(f"ordo checklist duree {t1} c2", contenu)
+
+    def test_la_demande_de_revision_precede_la_commande_doing_du_meme_item(self):
+        # déductible plutôt que volontaire (brief t-27) : la ligne de révision vit AVANT
+        # --doing, au moment où l'exécutante lit ce critère pour la première fois, jamais
+        # après, ni dans une section à part qu'on peut sauter.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        from ordo import prompt as prompt_mod
+        brief_path = prompt_mod.brief_executante(t1)
+        contenu = Path(brief_path).read_text(encoding="utf-8")
+        avant = contenu.index("no duration estimate yet")
+        apres = contenu.index(f"ordo check {t1} c1 --doing")
+        self.assertLess(avant, apres)
 
 
 # ---------------------------------------------------------------------------

@@ -135,8 +135,30 @@ what a whole campaign of this repository was written with before the rule existe
 Avoid the catch-all last item. "the full suite passes" as the fifth of five is where a third
 of the task hides; if the task ends with real verification work, say what that work is.
 
+**Order the items the way the work happens, and make the first one cheap.** Reconnaissance
+counts as work: reading the code, measuring what is there, listing the sites to change is
+often the first half hour, and a checklist that only starts after it shows nothing for that
+half hour. Name it - `Périmètre relevé`, `Sites de changement listés` - and the bar moves
+while the executor is still reading.
+
+Then watch for the opposite failure, which is subtler than an item that is merely too big:
+a checklist made of **conformance checks instead of steps**. `Aucun critère au-dessus de
+40 car`, `Accents mis partout`, `Aucun fourre-tout final` each bear on the whole job, so not
+one of them can be ticked before the end. Write five of those and the bar sits at zero for an
+hour, then jumps to full - the exact behaviour the bar exists to prevent. Both kinds belong
+in a checklist, but **steps come first**: one item per unit the executor finishes and leaves
+behind - a file, a campaign, a screen - and the conformance checks after them. If you cannot
+name those units, the task is not cut finely enough to be delegated yet.
+
 The executor ticks its items as it goes and declares the one it is attacking
 (`ordo check <task> <item>`, `--doing` for the current one), and the card shows both live.
+
+It can also **refine its own checklist** when the work turns out finer than you cut it:
+`ordo checklist add`, `split` and `reword`. There is deliberately no `remove` - an executor
+cannot make a criterion it failed to meet disappear. New items always take a fresh id in last
+position and nothing is ever renumbered, so an executor that read `c3` in its brief still
+ticks the right box. Adding and splitting reach the journal; rewording does not, since it
+changes no count.
 
 > Finer checklists shift model routing: past `HAIKU_CHECKLIST_MAX` items, a mechanical task
 > is routed to `sonnet` instead of `haiku`. That threshold counts cases to cross, which is a

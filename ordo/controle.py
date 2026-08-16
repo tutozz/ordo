@@ -56,6 +56,14 @@ WAKE_IDLE_AFTER_S = 900.0
 # usage.SEUIL_TOURS, gardé uniquement pour carte.py.
 SEUIL_CONTEXTE = usage.SEUIL_CONTEXTE
 
+# Durée sans mouvement de checklist au-delà de laquelle une tâche "running" devient
+# elle-même un motif de réveil (famille "checklist-silent" de wake_reasons()) : une
+# barre figée est aussi suspecte qu'un pane mort, juste moins visible puisque le pane,
+# lui, reste vivant et parfois même occupé. Nommée et surchargeable par variable
+# d'environnement, même convention que usage.SEUIL_CONTEXTE (ORDO_COMPACT_EVERY_CONTEXTE) :
+# une variable dédiée plutôt qu'une valeur cachée dans une expression.
+CHECKLIST_SILENT_AFTER_S = float(os.environ.get("ORDO_CHECKLIST_SILENT_AFTER_S") or 600)
+
 
 class ControleError(Exception):
     """Refus explicite d'une operation de controle (meme esprit que I8 : toute
@@ -93,6 +101,62 @@ def _sorted_tasks(state: dict, chantier_id: str) -> list[dict]:
         (t for t in state["taches"].values() if t["chantier"] == chantier_id),
         key=lambda t: t["id"],
     )
+
+
+def _checklist_signature(task: dict) -> list:
+    """Empreinte de l'état courant de la checklist d'une tâche : bouge dès qu'un item
+    change d'état (coché/décoché) ou que la checklist grandit (`ordo checklist add` /
+    `split`), jamais autrement. Sert uniquement de référence pour détecter un silence
+    (voir le cache `checklistWatch` maintenu par `_tick_one`), jamais pour autre chose.
+
+    Rend une LISTE de paires, pas un tuple : `checklistWatch` est persisté dans
+    state.json (JSON n'a pas de tuple) et relu à chaque tick via `store.locked()`, qui
+    repart de zéro depuis le disque -- une signature stockée sous forme de tuple
+    reviendrait en liste après ce voyage aller-retour, et `!=` compare le TYPE autant
+    que le contenu (`[["c1", True]] != (("c1", True),)` est toujours vrai en Python,
+    même à contenu identique). Un tel décalage de type aurait fait paraître la
+    checklist "changée" à CHAQUE tick, y compris quand rien ne bouge : bug réel trouvé
+    et corrigé pendant ce chantier (voir tests/test_controle.py, TestChecklistWatchCache).
+    """
+    return sorted([item["id"], item["done"]] for item in task["checklist"])
+
+
+# ===========================================================================
+# deduce_current_item
+# ===========================================================================
+
+
+def deduce_current_item(task: dict) -> str | None:
+    """Premier critère non coché qui suit, si aucun n'est déjà déclaré en cours sur
+    une tâche encore "running" -- ou None si la déduction ne doit rien poser.
+
+    Mesuré sur trois exécutantes réelles, dont deux lancées après un renforcement du
+    texte du brief leur demandant explicitement de déclarer `--doing` : aucune ne l'a
+    fait. Demander un geste de plus ne marche pas ; il faut déduire.
+
+    Trois garde-fous, dans l'ordre où ils sont vérifiés ici :
+      1. rien n'est déduit sur une tâche qui n'est pas "running" (état hors du champ
+         que la déduction a vocation à corriger : une tâche terminée ou bloquée n'a
+         plus personne pour "attaquer" un critère) ;
+      2. une déclaration explicite (`currentItem` déjà posé, par `ordo check --doing`)
+         gagne toujours et n'est jamais écrasée : la fonction rend None dès que
+         `currentItem` est déjà rempli, quel que soit l'état de la checklist ;
+      3. quand tous les critères sont cochés, il n'y a plus de suivant : la fonction
+         rend None plutôt que de figer le champ sur le dernier critère traité.
+
+    Appelée par `cli.py`'s `cmd_check()` juste après une coche réelle (ni `--doing`, ni
+    `--undo`) : voir son appel pour pourquoi ce n'est PAS le bon endroit pour décider
+    d'écraser `currentItem` -- décider "faut-il déduire" est pur, "que fait-on du
+    résultat" ne l'est pas et reste du ressort de l'appelant.
+    """
+    if task.get("state") != "running":
+        return None
+    if task.get("currentItem"):
+        return None
+    for item in task.get("checklist") or []:
+        if not item["done"]:
+            return item["id"]
+    return None
 
 
 # ===========================================================================
@@ -303,6 +367,15 @@ def wake_reasons(chantier_id: str) -> list[dict]:
          panes.TRUST_DIALOG_BLOCK_RAISON). Distincte de pane-mort (le pane est vivant,
          il attend une decision) et de derive-scope (aucune ecriture n'a eu lieu).
       7. tour-de-controle : rien n'a ete journalise depuis WAKE_IDLE_AFTER_S secondes.
+      8. checklist-silencieuse : chaque tâche "running" à checklist non vide dont la
+         checklist n'a pas bougé depuis CHECKLIST_SILENT_AFTER_S secondes (voir
+         _checklist_signature). La référence "depuis quand" vit dans le cache
+         ch["checklistWatch"], maintenu par _tick_one -- jamais recalculée ici, pour
+         que cette fonction reste une lecture pure : la mutation qui la remet à zéro
+         dès que la checklist bouge, et la conserve intacte tant qu'elle reste figée,
+         a déjà eu lieu au tick précédent. Une tâche sans checklist n'entre jamais dans
+         ce cache (sa barre ne peut pas bouger, le signal serait permanent) et
+         currentItem, quand la tâche en déclare un, est repris tel quel dans le détail.
 
     Un chantier qui n'est pas "open" ne produit jamais aucun motif (voir plus bas) :
     un chantier clos n'a plus vocation a reveiller personne, meme s'il porte encore
@@ -395,6 +468,36 @@ def wake_reasons(chantier_id: str) -> list[dict]:
             }
         )
 
+    for task in _sorted_tasks(state, chantier_id):
+        if task["state"] != "running" or not task["checklist"]:
+            continue
+        veille = (ch.get("checklistWatch") or {}).get(task["id"])
+        if veille is None:
+            continue
+        elapsed = _elapsed_seconds(veille.get("since"))
+        if elapsed is None or elapsed < CHECKLIST_SILENT_AFTER_S:
+            continue
+        detail = f"checklist unchanged for {elapsed:.0f} s"
+        courant = task.get("currentItem")
+        if courant:
+            detail += f", declared on {courant}"
+        reasons.append(
+            {
+                "kind": "checklist-silent",
+                "task": task["id"],
+                "detail": detail + _pane_attach_hint(task, ch),
+                # Clé de dédoublonnage distincte du détail affiché (voir _wake_key) :
+                # le détail porte une durée écoulée qui change à chaque tour tant que
+                # le silence continue, ce qui casserait la déduplication de wake_new()
+                # si elle s'appuyait dessus (le motif reviendrait "nouveau" à chaque
+                # appel). La signature, elle, reste fixe tant que la checklist ne
+                # bouge pas : c'est elle qui garantit un seul signal par période de
+                # silence, un nouveau signal légitime seulement quand la checklist
+                # repart puis se fige à nouveau (nouvelle signature, nouvelle clé).
+                "key": f"{task['id']}|{veille.get('signature')}",
+            }
+        )
+
     return reasons
 
 
@@ -409,7 +512,12 @@ WAKE_KINDS_JAMAIS_MARQUES = ("control-round",)
 
 
 def _wake_key(motif: dict) -> str:
-    return f"{motif.get('kind')}|{motif.get('task')}|{motif.get('detail')}"
+    # "key", quand le motif la porte, prime sur "detail" : voir checklist-silent dans
+    # wake_reasons(), seul motif pour l'instant à distinguer les deux (son détail
+    # affiché contient une durée qui varie à chaque tour, sa clé de dédoublonnage non).
+    # Absente pour les sept autres familles, qui gardent exactement leur comportement
+    # d'avant (repli sur "detail", inchangé).
+    return f"{motif.get('kind')}|{motif.get('task')}|{motif.get('key', motif.get('detail'))}"
 
 
 def wake_new(chantier_id: str) -> list[dict]:
@@ -600,6 +708,33 @@ def _tick_one(chantier_id: str) -> list[str]:
                 # discriminant blockedCause).
                 task["blockedCause"] = None
                 events.append(f"{t['id']} blocked: {raison}")
+
+        # Étape 3.5 : cache de silence de checklist, maintenu ICI et nulle part
+        # ailleurs -- wake_reasons() (famille "checklist-silent") ne fait que le
+        # relire, pour rester une lecture pure comme le reste de cette fonction.
+        # "since" ne bouge que si la signature de la checklist a changé depuis le
+        # tick précédent (nouvel item coché/décoché, checklist agrandie) : c'est ce
+        # qui fixe le point de référence sur le dernier MOUVEMENT de la checklist,
+        # jamais sur le lancement de la tâche (une tâche qui ne bouge jamais garde
+        # simplement la signature et le "since" posés à sa première observation
+        # running). Une tâche sans checklist n'entre jamais dans ce cache : sa barre
+        # ne peut pas bouger, un signal fondé dessus serait permanent.
+        ch = state["chantiers"][chantier_id]
+        watch = ch.setdefault("checklistWatch", {})
+        still_running = set()
+        for t in _sorted_tasks(state, chantier_id):
+            if t["state"] != "running" or not t["checklist"]:
+                continue
+            still_running.add(t["id"])
+            signature = _checklist_signature(t)
+            cached = watch.get(t["id"])
+            if cached is None or cached.get("signature") != signature:
+                watch[t["id"]] = {"signature": signature, "since": store.now()}
+        # Une tâche qui quitte "running" (finie, bloquée) ou perd sa checklist n'a
+        # plus besoin de cache : le laisser grossir userait la même dette que
+        # wakeSeen sans jamais être relu (voir WAKE_SEEN_MAX un peu plus haut).
+        for perime in [tid for tid in watch if tid not in still_running]:
+            del watch[perime]
 
         # Etape 4 : tache waiting dont la question est repondue -> reponse injectee
         # dans le pane (envoi effectif fait hors verrou, ci-dessous), tache reprise.

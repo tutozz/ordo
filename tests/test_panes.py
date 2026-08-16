@@ -944,6 +944,94 @@ class SendTests(PanesTestCase):
         self.assertTrue(ran, panes.capture(pane_id))
 
 
+class SendReadinessTests(PanesTestCase):
+    """c2, c3, c5, c6, c7 du brief t-59 : send(ready_timeout=...) attend activement que
+    la boîte de saisie existe avant d'écrire, plutôt que d'écrire dans un pane encore sur
+    son écran de démarrage -- le défaut mesuré derrière t-53 et t-57 (2026-08-16). Opt-in
+    (voir send()) : seul cli.py's _do_launch() le demande, jamais ordo say/ordo answer,
+    dont les tests de non-régression sont dans les classes existantes qui les couvrent
+    déjà (InputBoxMissingTests, SwallowedEnterRecoveryTests, ...), inchangées par ce
+    paramètre puisqu'elles n'appellent jamais send() avec ready_timeout. Un vrai `claude`
+    n'est jamais relancé ici (même consigne que WaitReadyTests) : le délai de démarrage
+    est simulé par un pane bash dont la boîte n'apparaît qu'après un `sleep`."""
+
+    def test_send_attend_puis_livre_sur_un_pane_devenu_pret_apres_un_delai(self):
+        """c6 : un pane qui ne montre sa boîte qu'après un délai -- exactement ce que
+        _do_launch() vise avec ready_timeout -- reçoit quand même le message, dès que la
+        boîte apparaît, pas d'échec prématuré, pas de perte."""
+        _, window = panes.ensure_session(self.session)
+        marker = panes.INPUT_BOX_MARKER
+        cmd = (
+            "bash --noprofile --norc -c "
+            f"'sleep 1.2; PS1=\"{marker} \" exec bash --noprofile --norc'"
+        )
+        pane_id = panes.spawn(window, HOME, cmd)
+        self.assertNotIn(
+            marker,
+            panes.capture(pane_id),
+            "le pane simulé ne doit pas encore montrer sa boîte de saisie",
+        )
+        sortie = f"FRESH_{uuid.uuid4().hex[:6]}"
+        debut = time.monotonic()
+        panes.send(pane_id, f"echo {sortie}", ready_timeout=5.0)
+        duree = time.monotonic() - debut
+        self.assertGreaterEqual(
+            duree, 1.0, "send() aurait dû attendre le délai simulé avant d'écrire"
+        )
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), sortie), timeout=3.0),
+            panes.capture(pane_id),
+        )
+
+    def test_send_najoute_aucune_latence_sur_un_pane_deja_vivant(self):
+        """c5 : régression -- le cas nominal d'ordo say/ordo answer, ready_timeout resté
+        à None (jamais passé par ces verbes), ne doit payer aucune attente supplémentaire
+        destinée au démarrage sur un pane déjà vivant dont la boîte est déjà là."""
+        _, window = panes.ensure_session(self.session)
+        pane_id = panes.spawn(window, HOME, TEST_SHELL)
+        self.assertTrue(_wait_for(lambda: panes.INPUT_BOX_MARKER in panes.capture(pane_id)))
+        marker = f"LIVE_{uuid.uuid4().hex[:6]}"
+        debut = time.monotonic()
+        panes.send(pane_id, f"echo {marker}")
+        duree = time.monotonic() - debut
+        self.assertLess(
+            duree,
+            panes.SEND_VERIFY_DELAY_S + 2.0,
+            "un pane déjà vivant ne doit pas payer l'attente destinée au démarrage",
+        )
+        self.assertTrue(
+            _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=3.0)
+        )
+
+    def test_wait_input_box_leve_seulement_apres_avoir_reellement_attendu(self):
+        """c3 : l'échec ne doit jamais survenir avant d'avoir attendu le plafond -- ni
+        sur un simple premier coup d'œil, ni avant le délai complet."""
+        _, window = panes.ensure_session(self.session)
+        # bash nu, jamais interactif au sens du marqueur : son PS1 par défaut ne
+        # contient jamais INPUT_BOX_MARKER, la boîte simulée n'apparaît donc jamais.
+        pane_id = panes.spawn(window, HOME, "bash --noprofile --norc")
+        debut = time.monotonic()
+        with self.assertRaises(RuntimeError) as ctx:
+            panes._wait_input_box(pane_id, 0.6)
+        duree = time.monotonic() - debut
+        self.assertGreaterEqual(
+            duree, 0.6, "l'échec ne doit jamais survenir avant le plafond complet"
+        )
+        self.assertIn(pane_id, str(ctx.exception))
+
+    def test_send_echoue_bruyamment_quand_le_pane_ne_devient_jamais_pret(self):
+        """c7 : `ordo launch` doit pouvoir savoir que la tâche n'a jamais démarré --
+        send(ready_timeout=...) lève, plutôt que de rendre un faux succès sur un pane
+        resté muet. Un timeout court et explicite ici (au lieu du SEND_READY_TIMEOUT_S de
+        production, 30s) reproduit exactement ce que _do_launch() demande, sans payer le
+        plafond réel dans ce test."""
+        _, window = panes.ensure_session(self.session)
+        pane_id = panes.spawn(window, HOME, "bash --noprofile --norc")
+        with self.assertRaises(RuntimeError) as ctx:
+            panes.send(pane_id, "echo n'arrivera jamais", ready_timeout=0.6)
+        self.assertIn(pane_id, str(ctx.exception))
+
+
 class StillUnsentDetectionTests(unittest.TestCase):
     """t-26 : teste panes._still_unsent() en isolation, sans tmux. La distinction entre
     file d'attente (soumis, différé -- 'Press up to edit queued messages') et texte

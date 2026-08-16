@@ -971,7 +971,30 @@ SEND_VERIFY_LINES = 20
 # a 5x spread between the fastest and slowest run alone, consistent with the variance
 # already documented elsewhere in this project. 1.0s matches docs/diagnostic-envoi.md's
 # own cas H, which used the same delay to catch the same failure.
+#
+# This alone is what t-53 and t-57 fell through (2026-08-16, t-59): both were freshly
+# spawned panes whose brief injection landed while claude's TUI was still on its startup
+# screen. A 1.0s post-write delay is correct for a pane that was ALREADY listening (t-26's
+# case), but a pane that has JUST been spawned is a different situation entirely, and
+# nothing waited for IT to be ready before writing at all -- see _wait_input_box() below,
+# which is send()'s actual fix for that gap.
 SEND_VERIFY_DELAY_S = 1.0
+
+# Ceiling _do_launch() (cli.py) passes to send()'s ready_timeout for the ONE call that
+# targets a pane it just spawned itself (cli.py:501) -- never send()'s own default (see
+# send()'s ready_timeout parameter: None, unconditionally, for every other caller,
+# because every other caller targets a pane already proven receptive by an earlier
+# successful send(), not one merely assumed ready). Measured 2026-08-16 (t-59) against
+# real freshly-spawned `claude` panes, `capture()`d every 0.2s from spawn() until
+# INPUT_BOX_MARKER appeared and stayed: three isolated launches (nothing else running)
+# reached it in 1.4s, 1.7s and 2.5s; four launched CONCURRENTLY -- approximating a
+# chantier starting several exécutantes back to back, the exact situation t-53 and t-57
+# were launched under -- pushed every one of the four to 4.9-5.8s. t-53 and t-57
+# themselves are reported to have still shown their startup screen a full ten to fifteen
+# real seconds in, under whatever load the machine carried that day. 30s matches
+# wait_ready()'s own PANE_READY_TIMEOUT_S, on the same reasoning: generous enough to
+# clear that worst case with real margin.
+SEND_READY_TIMEOUT_S = 30.0
 
 # How many (Ctrl-U, Backspace) pairs _clear_input() sends before every send() writes
 # anything. Each pair erases one logical line of the box back into the previous one
@@ -991,6 +1014,51 @@ CLEAR_FIELD_MAX_LINES = 80
 # was not verified to appear in every collapse) -- kept here only to name the cause
 # precisely in the RuntimeError a caller sees.
 PASTE_COLLAPSE_HINT = "paste again to expand"
+
+
+def _wait_input_box(pane_id: str, timeout: float) -> None:
+    """Bloque jusqu'à ce que pane_id montre une boîte de saisie, avant que send() n'écrive.
+
+    wait_ready() (voir plus haut) attend la bannière de démarrage de claude
+    (READY_MARKERS) avant que cli.py n'appelle send() -- mais c'est exactement ce que
+    t-53 et t-57 ont mesuré insuffisant : la bannière peut apparaître avant que la boîte
+    de saisie elle-même ne soit réellement rendue et prête à recevoir du texte, sous
+    charge (voir SEND_READY_TIMEOUT_S pour la mesure). Seul send() lui-même, au moment
+    précis où il écrit, peut vérifier que CETTE écriture-là a un destinataire -- d'où
+    l'appel ICI, jamais chez un appelant.
+
+    Appelée seulement quand `timeout` est fourni par send() (voir son paramètre
+    ready_timeout) : PAS sur tout appel de send(), seulement sur celui de _do_launch()
+    (cli.py:501), le seul qui vise un pane qu'il vient tout juste de créer lui-même. ordo
+    say et ordo answer, qui appellent send() des dizaines de fois par chantier sur un
+    pane déjà vivant depuis longtemps, ne passent jamais ici (c5 du brief t-59) --
+    mesuré : un pane déjà vivant dont la boîte a été avalée par un panneau plein écran
+    (InputBoxMissingTests) doit échouer aussi vite qu'avant cette fonction, pas attendre
+    un plafond pensé pour un démarrage qui, pour lui, n'a pas lieu d'être.
+
+    La même fenêtre bornée que la vérification post-écriture de send() (SEND_VERIFY_LINES),
+    pas capture(lines=0) comme wait_ready() : contrairement à la bannière, la boîte de
+    saisie vit toujours au bas du pane, jamais poussée hors d'une fenêtre récente par une
+    scrollback longue -- borner écarte tout marqueur d'une boîte passée, déjà soumise et
+    depuis longtemps remontée en scrollback, comme dans SEND_VERIFY_LINES.
+
+    Lève RuntimeError, en français, nommant le pane, si la boîte n'apparaît jamais avant
+    `timeout` : c'est le contrat du brief -- send() ne doit jamais écrire dans un pane
+    dont personne ne sait s'il écoute (c3), et l'échec ne doit jamais survenir avant
+    d'avoir réellement attendu le plafond, jamais sur un simple premier coup d'œil.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        texte = capture(pane_id, lines=SEND_VERIFY_LINES, join=True)
+        if INPUT_BOX_MARKER in texte:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"send failed: pane {pane_id} never showed an input box within "
+                f"{timeout:.0f}s -- the message was never written; the pane either "
+                "never started or is still stuck on its startup screen"
+            )
+        time.sleep(PANE_READY_POLL_INTERVAL_S)
 
 
 def _clear_input(pane_id: str) -> None:
@@ -1071,7 +1139,7 @@ def _still_unsent(apres: str, text: str) -> bool:
     return bool(contenu) and contenu.startswith(first_line)
 
 
-def send(pane_id: str, text: str) -> None:
+def send(pane_id: str, text: str, ready_timeout: float | None = None) -> None:
     """Type text into pane_id, then press enter, as two separate tmux calls (I6).
 
     A single send-keys call carrying both the literal text and C-m eats the
@@ -1118,12 +1186,26 @@ def send(pane_id: str, text: str) -> None:
     the OTHER way around, as evidence of FAILURE, which this diagnostic never ruled
     out: text that is STILL sitting in the box, unconfirmed, five real seconds after
     send() wrote it, is not decor, it is the message never having left.
+
+    ready_timeout (t-59), when given, blocks BEFORE any of that -- before even
+    _clear_input() -- until the pane actually shows an input box to write into, via
+    _wait_input_box() (see its own docstring for why it lives here and not in a caller).
+    None by default, meaning NO wait at all, byte-for-byte the same as before this
+    parameter existed: every caller except cli.py's _do_launch() (cli.py:501, the one
+    call that targets a pane it just spawned itself) leaves this at None, since ordo say
+    and ordo answer only ever target a pane already proven receptive by an earlier
+    successful send() -- measured 2026-08-16 (t-59): passing SEND_READY_TIMEOUT_S here
+    unconditionally, for every caller, turned a pane whose box a full-screen panel had
+    swallowed (already covered by InputBoxMissingTests) from a ~1s failure into a ~30s
+    one, which is exactly the "ne casse pas l'envoi sur un pane vivant" c5 forbids.
     """
     _reject_self(pane_id)
     if _is_escape(text):
         raise ValueError(
             "refused: Escape would interrupt the executor's current turn"
         )
+    if ready_timeout is not None:
+        _wait_input_box(pane_id, ready_timeout)
     _clear_input(pane_id)
     _run(["send-keys", "-t", pane_id, "-l", text])
     _run(["send-keys", "-t", pane_id, "C-m"])

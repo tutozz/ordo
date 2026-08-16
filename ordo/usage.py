@@ -21,6 +21,16 @@ fait que croitre, donc il suffit de reprendre la ou on s'etait arrete.
 L'absence se dit ABSENTE, jamais zero. Une tache dont le transcript est introuvable n'a pas
 consomme zero jeton : on ne sait pas. Afficher 0 sur une executante qui tourne depuis vingt
 minutes serait un mensonge, et exactement le genre que ce depot passe son temps a traquer.
+
+UN TOUR N'EST PAS UNE LIGNE. Claude Code écrit un même tour d'assistant sur plusieurs
+lignes, une par bloc de contenu -- texte, réflexion, appel d'outil -- et chacune RÉPÈTE le
+même `usage`. Additionner les lignes compte donc le même tour autant de fois qu'il a de
+blocs. Mesure sur les soixante transcripts réels de ce dépôt : la sortie était comptée deux
+fois (+102 %), le cache relu +59 %, le nombre de tours +68 %. Le dédoublonnage se fait sur
+`message.id`, et il suffit de retenir le DERNIER vu : vérifié sur ces mêmes soixante
+transcripts, les lignes d'un même tour se suivent toujours. Retenir le dernier plutôt que
+tous garde l'état constant, ce qu'un serveur qui tourne des jours sur des dizaines de
+sessions ne peut pas se permettre de perdre.
 """
 
 from __future__ import annotations
@@ -78,6 +88,13 @@ def _vide() -> dict:
     return {"input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0, "turns": 0}
 
 
+# Valeur du « dernier identifiant vu » quand il n'y en a pas encore. None ne convient pas :
+# un transcript écrit par une version qui ne pose pas d'`id` porterait None sur chaque
+# ligne, et tous ses tours seraient pris pour des doublons du premier. Absence
+# d'identifiant ne veut pas dire doublon.
+_AUCUN = object()
+
+
 def _avaler(entree: dict, chemin: Path) -> None:
     """Lit ce qui a ete ajoute depuis la derniere fois et l'additionne aux totaux.
 
@@ -93,6 +110,7 @@ def _avaler(entree: dict, chemin: Path) -> None:
     if taille < entree["offset"]:
         entree["offset"] = 0
         entree["totaux"] = _vide()
+        entree["dernier"] = _AUCUN
     if taille == entree["offset"]:
         return
     try:
@@ -124,6 +142,13 @@ def _avaler(entree: dict, chemin: Path) -> None:
         u = message.get("usage")
         if not isinstance(u, dict):
             continue
+        # Le même tour arrive sur plusieurs lignes consécutives qui répètent son `usage` :
+        # seule la première compte. Un tour sans identifiant compte toujours, faute de quoi
+        # un transcript sans `id` disparaîtrait entier des compteurs.
+        identifiant = message.get("id")
+        if identifiant is not None and identifiant == entree["dernier"]:
+            continue
+        entree["dernier"] = _AUCUN if identifiant is None else identifiant
         vu = False
         for brut, nom in _CHAMPS.items():
             valeur = u.get(brut)
@@ -150,7 +175,7 @@ def pour(task: dict) -> dict | None:
         chemin = _trouver(session_id)
         if chemin is None:
             return None
-        entree = {"path": chemin, "offset": 0, "totaux": _vide()}
+        entree = {"path": chemin, "offset": 0, "totaux": _vide(), "dernier": _AUCUN}
         _CACHE[session_id] = entree
     _avaler(entree, entree["path"])
     return dict(entree["totaux"])

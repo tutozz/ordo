@@ -44,10 +44,12 @@ class UsageTestCase(unittest.TestCase):
                 f.write(json.dumps(tour) + "\n")
         return chemin
 
-    def _tour(self, out: int, cache_read: int = 0, cache_creation: int = 0, entree: int = 0):
+    def _tour(self, out: int, cache_read: int = 0, cache_creation: int = 0, entree: int = 0,
+              mid: str | None = None):
         return {
             "type": "assistant",
             "message": {
+                "id": mid,
                 "usage": {
                     "input_tokens": entree,
                     "output_tokens": out,
@@ -95,6 +97,59 @@ class TestLecture(UsageTestCase):
         # est plus sur que le deduire.
         self._transcript("s1", [self._tour(42)], projet="-un-chemin-totalement-different")
         self.assertEqual(usage.pour({"id": "t-01", "claudeSessionId": "s1"})["output"], 42)
+
+
+class TestTourEclate(UsageTestCase):
+    """Un tour d'assistant est ecrit sur PLUSIEURS lignes, une par bloc de contenu, et
+    chacune repete le meme `usage`. Additionner les lignes compte donc le meme tour
+    plusieurs fois.
+
+    Mesure sur soixante transcripts reels de ce depot : la sortie etait comptee DEUX fois
+    (+102%), le cache relu +59%, et le nombre de tours +68%. Un compteur de jetons qui se
+    trompe d'un facteur deux ne sert a rien -- il sert meme contre, puisqu'il donne
+    confiance en un chiffre faux.
+    """
+
+    def test_les_lignes_d_un_meme_tour_ne_comptent_qu_une_fois(self):
+        self._transcript("s1", [
+            self._tour(100, cache_read=5000, mid="msg_a"),
+            self._tour(100, cache_read=5000, mid="msg_a"),
+            self._tour(100, cache_read=5000, mid="msg_a"),
+        ])
+        u = usage.pour({"id": "t-01", "claudeSessionId": "s1"})
+        self.assertEqual(u["output"], 100)
+        self.assertEqual(u["cacheRead"], 5000)
+        self.assertEqual(u["turns"], 1)
+
+    def test_deux_tours_distincts_comptent_deux_fois(self):
+        # Le garde-fou du garde-fou : dedoublonner ne doit pas avaler un vrai tour.
+        self._transcript("s1", [
+            self._tour(100, mid="msg_a"),
+            self._tour(70, mid="msg_b"),
+        ])
+        u = usage.pour({"id": "t-01", "claudeSessionId": "s1"})
+        self.assertEqual(u["output"], 170)
+        self.assertEqual(u["turns"], 2)
+
+    def test_le_dedoublonnage_survit_a_la_lecture_incrementale(self):
+        # Le cas qui casse une solution naive : les lignes d'un meme tour tombent de part
+        # et d'autre de la frontiere de lecture. Le serveur relit toutes les trois
+        # secondes, donc cette frontiere tombe n'importe ou.
+        self._transcript("s1", [self._tour(100, cache_read=5000, mid="msg_a")])
+        premier = usage.pour({"id": "t-01", "claudeSessionId": "s1"})
+        self.assertEqual(premier["output"], 100)
+        self._transcript("s1", [self._tour(100, cache_read=5000, mid="msg_a")])
+        second = usage.pour({"id": "t-01", "claudeSessionId": "s1"})
+        self.assertEqual(second["output"], 100)
+        self.assertEqual(second["turns"], 1)
+
+    def test_un_tour_sans_identifiant_compte_quand_meme(self):
+        # Un transcript ecrit par une version qui ne pose pas d'id ne doit pas disparaitre
+        # des compteurs : absent d'identifiant ne veut pas dire doublon.
+        self._transcript("s1", [self._tour(10), self._tour(20)])
+        u = usage.pour({"id": "t-01", "claudeSessionId": "s1"})
+        self.assertEqual(u["output"], 30)
+        self.assertEqual(u["turns"], 2)
 
 
 class TestLectureIncrementale(UsageTestCase):

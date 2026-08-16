@@ -358,6 +358,43 @@ class TestGrapheVerbs(CliTestCase):
         self.assertEqual(data["touches"], ["db"])
         self.assertEqual(data["checklist"], [{"id": "c1", "label": "tests verts", "done": False}])
 
+    def test_add_avertit_sur_un_label_de_checklist_trop_long(self):
+        cid = self._chantier()
+        label = "x" * 63
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", label]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", err)
+        self.assertIn("63", err)
+        self.assertNotIn("WARNING", out)
+
+    def test_add_taches_le_label_trop_long_mais_ne_le_refuse_pas(self):
+        cid = self._chantier()
+        label = "x" * 63
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", label, "--json"]
+        )
+        self.assertEqual(data["checklist"][0]["label"], label)
+
+    def test_add_json_ne_produit_aucun_avertissement(self):
+        cid = self._chantier()
+        label = "x" * 63
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", label, "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARNING", err)
+        self.assertNotIn("WARNING", out)
+
+    def test_add_sans_label_trop_long_ne_dit_rien(self):
+        cid = self._chantier()
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "ok"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
     def test_dep_refuse_sur_cycle(self):
         cid = self._chantier()
         t1 = self._tache(cid)
@@ -471,6 +508,58 @@ class TestGrapheVerbs(CliTestCase):
         data = self._run_json(["check", t1, "c1", "--undo", "--json"])
         self.assertFalse(data["checklist"][0]["done"])
 
+    def test_check_doing_declare_l_item_attaque_sans_le_cocher(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts", "doc a jour"])
+        data = self._run_json(["check", t1, "c1", "--doing", "--json"])
+        self.assertEqual(data["currentItem"], "c1")
+        self.assertFalse(data["checklist"][0]["done"])
+
+    def test_check_libere_currentItem_quand_l_item_declare_est_coche(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run_json(["check", t1, "c1", "--doing", "--json"])
+        data = self._run_json(["check", t1, "c1", "--json"])
+        self.assertIsNone(data["currentItem"])
+        self.assertTrue(data["checklist"][0]["done"])
+
+    def test_check_d_un_autre_item_ne_libere_pas_currentItem(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts", "doc a jour"])
+        self._run_json(["check", t1, "c1", "--doing", "--json"])
+        data = self._run_json(["check", t1, "c2", "--json"])
+        self.assertEqual(data["currentItem"], "c1")
+
+    def test_check_doing_item_inconnu_refuse(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        code, out, err = self._run(["check", t1, "c-inconnu", "--doing"])
+        self.assertNotEqual(code, 0)
+
+    def test_cancel_libere_currentItem(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run_json(["check", t1, "c1", "--doing", "--json"])
+        data = self._run_json(["cancel", t1, "--json"])
+        self.assertIsNone(data["currentItem"])
+
+    def test_brief_explique_comment_declarer_l_item_en_cours(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        from ordo import prompt as prompt_mod
+        brief_path = prompt_mod.brief_executante(t1)
+        contenu = Path(brief_path).read_text(encoding="utf-8")
+        self.assertIn("--doing", contenu)
+        self.assertIn(f"ordo check {t1} c1 --doing", contenu)
+
+    def test_carte_model_expose_currentItem(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run_json(["check", t1, "c1", "--doing", "--json"])
+        from ordo import carte as carte_mod
+        node = carte_mod.model(cid)["nodes"][t1]
+        self.assertEqual(node["currentItem"], "c1")
+
 
 # ---------------------------------------------------------------------------
 # Plan
@@ -493,13 +582,14 @@ class TestPlanVerbs(CliTestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("c-99", err)
 
-    def _proposition(self, cid: str) -> str:
+    def _proposition(self, cid: str, checklist: list[str] | None = None) -> str:
         with store.locked() as state:
             pid = store.next_id(state, "proposition")
             state["propositions"][pid] = {
                 "id": pid, "chantier": cid,
                 "taches": [{"ref": "n1", "titre": "t", "prompt": "p",
-                            "dependsOn": [], "touches": [], "checklist": []}],
+                            "dependsOn": [], "touches": [],
+                            "checklist": checklist if checklist is not None else []}],
                 "state": "pending",
                 "proposedAt": store.now(), "deadline": "2099-01-01T00:00:00Z",
                 "decidedAt": None, "refus": None,
@@ -526,6 +616,30 @@ class TestPlanVerbs(CliTestCase):
         data = self._run_json(["reject", pid, "--reason", "hors scope", "--json"])
         self.assertEqual(data["state"], "rejected")
         self.assertEqual(data["refus"], "hors scope")
+
+    def test_accept_avertit_sur_un_label_de_checklist_trop_long(self):
+        cid = self._chantier()
+        pid = self._proposition(cid, checklist=["x" * 63])
+        code, out, err = self._run(["accept", pid])
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", err)
+        self.assertIn("63", err)
+        self.assertNotIn("WARNING", out)
+
+    def test_accept_json_ne_produit_aucun_avertissement(self):
+        cid = self._chantier()
+        pid = self._proposition(cid, checklist=["x" * 63])
+        code, out, err = self._run(["accept", pid, "--json"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARNING", err)
+        self.assertNotIn("WARNING", out)
+
+    def test_accept_sans_label_trop_long_ne_dit_rien(self):
+        cid = self._chantier()
+        pid = self._proposition(cid, checklist=["ok"])
+        code, out, err = self._run(["accept", pid])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
 
 
 # ---------------------------------------------------------------------------

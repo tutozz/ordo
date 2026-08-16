@@ -165,6 +165,22 @@ def _avertissement_multi_projet(state: dict) -> str | None:
     )
 
 
+def _avertissement_checklist(hors_convention: list[dict]) -> str | None:
+    """Alerte quand un ou plusieurs labels de checklist dépassent la convention de
+    60 caractères (chantier.CHECKLIST_LABEL_MAX).
+
+    Jamais un refus : la tâche existe déjà quand cette fonction est appelée, le label
+    n'est ni tronqué ni corrigé, seulement signalé à qui l'a rédigé trop long.
+    """
+    if not hors_convention:
+        return None
+    detail = ", ".join(f"{item['id']} ({item['length']} chars)" for item in hors_convention)
+    return (
+        f"WARNING: checklist label(s) exceed the {chantier.CHECKLIST_LABEL_MAX}-char "
+        f"convention: {detail}"
+    )
+
+
 def _trace_tmux(command: list[str]) -> None:
     """Callback installe sur panes.TRACE par --verbose (point L).
 
@@ -645,6 +661,9 @@ def cmd_add(args: argparse.Namespace) -> int:
     if args.json:
         _print_json(t)
         return 0
+    avertissement = _avertissement_checklist(chantier.checklist_hors_convention(t["checklist"]))
+    if avertissement:
+        print(avertissement, file=sys.stderr)
     print(f"{t['id']}  {t['titre']}  (depends on: {', '.join(t['dependsOn']) or '-'})")
     if not t["why"]:
         # Dit une fois, au moment ou la reponse est encore fraiche dans la tete de qui
@@ -779,11 +798,14 @@ def cmd_amend(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    t = chantier.check(args.task, args.item, done=not args.undo)
+    t = chantier.check(args.task, args.item, done=not args.undo, doing=args.doing)
     if args.json:
         _print_json(t)
         return 0
     item = next(i for i in t["checklist"] if i["id"] == args.item)
+    if args.doing:
+        print(f"{t['id']}: {item['id']} in progress")
+        return 0
     etat = "checked" if item["done"] else "unchecked"
     print(f"{t['id']}: {item['id']} {etat}")
     return 0
@@ -833,6 +855,21 @@ def cmd_accept(args: argparse.Namespace) -> int:
     if args.json:
         _print_json(prop)
         return 0
+    # plan.py reste pur (aucun print) : prop["taches"] porte encore le checklist brut du
+    # modèle (liste de chaînes), _materialize() ne le normalise que dans state["taches"],
+    # jamais dans la proposition elle-même. On refait ici le même calcul d'id (f"c{i}")
+    # que chantier._normalize_checklist et _materialize, préfixé du ref pour distinguer
+    # les tâches entre elles : deux tâches partagent sinon le même id "c1".
+    hors_convention = []
+    for tache in prop["taches"]:
+        checklist = [
+            {"id": f"{tache['ref']}:c{i}", "label": label}
+            for i, label in enumerate(tache.get("checklist") or [], start=1)
+        ]
+        hors_convention.extend(chantier.checklist_hors_convention(checklist))
+    avertissement = _avertissement_checklist(hors_convention)
+    if avertissement:
+        print(avertissement, file=sys.stderr)
     print(f"{prop['id']} accepted, {len(prop['taches'])} task(s) materialized")
     return 0
 
@@ -2098,10 +2135,17 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p.add_argument("--prompt", required=True)
     p.set_defaults(func=cmd_amend)
 
-    p = verbs.add_parser("check", parents=[json_parent], help="check a checklist item")
+    p = verbs.add_parser(
+        "check", parents=[json_parent], help="check a checklist item, or declare it in progress"
+    )
     p.add_argument("task")
     p.add_argument("item")
     p.add_argument("--undo", action="store_true", help="uncheck instead of check")
+    p.add_argument(
+        "--doing",
+        action="store_true",
+        help="declare the item as the one currently being worked on, without checking it",
+    )
     p.set_defaults(func=cmd_check)
 
     # Plan

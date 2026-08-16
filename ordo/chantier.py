@@ -78,6 +78,27 @@ def _normalize_checklist(items: Iterable) -> list[dict]:
     return normalized
 
 
+# Longueur maximale conventionnelle d'un label de checklist. Un plafond, jamais un refus
+# (voir checklist_hors_convention) : la convention vaut pour la lisibilité d'une carte ou
+# d'un plan, pas pour la validité d'une tâche, et rien dans Ordo ne doit la faire respecter
+# de force.
+CHECKLIST_LABEL_MAX = 60
+
+
+def checklist_hors_convention(checklist: Iterable[dict]) -> list[dict]:
+    """Items d'une checklist déjà normalisée dont le label dépasse CHECKLIST_LABEL_MAX.
+
+    Pure et sans effet de bord : ne tronque rien, ne rejette rien, se contente de mesurer.
+    C'est à l'appelant (CLI, matérialisation d'un plan) de décider s'il en fait un
+    avertissement -- jamais un refus, la convention ne bloque personne.
+    """
+    return [
+        {"id": item["id"], "length": len(item["label"])}
+        for item in checklist
+        if len(item["label"]) > CHECKLIST_LABEL_MAX
+    ]
+
+
 def _session_unique(state: dict, slug: str, chantier_id: str) -> str:
     """Point A : nom de session tmux, unique par construction.
 
@@ -334,6 +355,7 @@ def add_task(
             "dependsOn": list(depends_on),
             "touches": list(touches),
             "checklist": _normalize_checklist(checklist),
+            "currentItem": None,
             "priority": 0,
             "attempts": 0,
             "model": None,
@@ -386,6 +408,7 @@ def cancel(task_id: str) -> dict:
             raise ChantierError(f"cancel refused: {task_id} is already {task['state']}")
         task["state"] = "cancelled"
         task["finishedAt"] = store.now()
+        task["currentItem"] = None
     return task
 
 
@@ -413,13 +436,29 @@ def amend(task_id: str, prompt: str) -> dict:
     return task
 
 
-def check(task_id: str, item_id: str, done: bool = True) -> dict:
-    """Coche ou decoche un item de la checklist d'une tache."""
+def check(task_id: str, item_id: str, done: bool = True, doing: bool = False) -> dict:
+    """Coche ou décoche un item de la checklist d'une tâche, ou déclare l'item attaqué.
+
+    doing=True pose task["currentItem"] = item_id SANS toucher à item["done"] : c'est le
+    "je m'y mets", distinct du "j'ai fini" (done). Sans lui, la carte ne montre qu'un
+    compteur ("checks 2/5") qui n'avance qu'à la fin de chaque item, et rien ne dit sur
+    quoi l'exécutante travaille entre deux coches.
+
+    doing=False (l'usage normal) coche ou décoche l'item comme avant, et libère
+    currentItem si l'item ainsi coché/décoché est celui déclaré en cours : une fois
+    l'item fini, il n'y a plus d'item "en cours" tant qu'un nouveau n'est pas déclaré.
+    Cocher un AUTRE item que celui déclaré ne touche pas currentItem.
+    """
     with store.locked() as state:
         task = _get_task(state, task_id)
         for item in task["checklist"]:
             if item["id"] == item_id:
-                item["done"] = done
+                if doing:
+                    task["currentItem"] = item_id
+                else:
+                    item["done"] = done
+                    if task.get("currentItem") == item_id:
+                        task["currentItem"] = None
                 break
         else:
             raise ChantierError(

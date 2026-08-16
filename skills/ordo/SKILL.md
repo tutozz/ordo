@@ -101,8 +101,69 @@ ordo plan <campaign> < plan.txt
 ordo accept <proposal>
 ```
 
+Keep each `--check` label to **60 characters max**, and aim for **3 to 5 items per task**.
+A verifiable post-condition, not an explanation - whatever does not fit in 60 characters is
+really two criteria. The executor ticks its own items as it goes (`ordo check <task>
+<item>`), and the map shows that progress live on the card while the task is still running:
+a checklist of five short items reads as advancement, one long item never does.
+
 An undecided proposal is **accepted automatically after 45 s**. Say it at the moment you
 propose, otherwise the human thinks you are waiting.
+
+### A title prefix creates a phase. Name it in the same breath.
+
+**`ordo add --title "6.1 ..."` creates phase 6 whether you meant to or not.** The prefix is
+the only thing that groups the graph, so a prefix nobody declared produces a phase with no
+name and no reason, sitting in the human's map next to the ones you explained. They cannot
+tell your oversight from a deliberate choice.
+
+So: **before the `ordo add` that first uses a prefix, run the `ordo group` for it.** Not
+after, not later. The two are one gesture with two halves, and the second half is the one
+that gets forgotten - including by orchestrators who have just finished writing this rule
+for themselves.
+
+There is a check, and it costs one command. An un-named phase is not invisible: it carries
+the default label `Phase <key>`. After any batch of `ordo add`, run:
+
+```bash
+ordo map <campaign> --json | grep -o '"label": "Phase [0-9]*"'
+```
+
+Every line it prints is a phase you created and never explained. **Empty output is the only
+acceptable result.**
+
+This is not a style rule. A phase labelled `Phase 6` tells the human that six phases exist
+and that you could not say what the sixth is for - which is exactly what they would conclude
+if you had thought about it and had nothing to say.
+
+### The graph is edited, not appended to
+
+A campaign is not planned once. The human adds a concern mid-flight, a diagnosis kills a
+premise, a task turns out to belong to another phase. **Each of those is an edit to the whole
+graph, not an append at the end** - and treating it as an append is what turns a readable
+plan into a heap nobody can read, yours included after a restart.
+
+So each time you add, cancel or re-scope a task, re-read the whole graph:
+
+- **A phase whose tasks are all cancelled must go.** It is not "announced, not cut yet", it
+  is a leftover, and it costs vertical space on the human's screen for nothing. There is no
+  verb that deletes a phase: a phase stops existing when nothing references its key any
+  more, so move the surviving tasks and drop the declared label.
+- **A cancelled task's dependants are orphans.** `ordo ready --why` shows what waits on what.
+  Re-point them at whatever replaces the cancelled task, or the graph waits forever on
+  something that will never run.
+- **A task added later rarely belongs at the end.** Give it the phase prefix of the work it
+  actually belongs to, not the next free number. The prefix is permanent - there is no rename
+  - so a wrong prefix is a wrong phase for the rest of the campaign.
+- **Two tasks writing the same file must be ordered**, with `--depends`, even when nothing
+  functional links them. Executors are not isolated in worktrees: concurrent writes to one
+  file lose work. Say so in the `--why`, so the dependency does not read as a mistake later.
+- **Re-read the phase `--why` after the edit.** If it now describes something the phase no
+  longer contains, rewrite it. A stale explanation is worse than none: it is believed.
+
+The test is the one you apply to your messages: could a human coming back in two hours read
+this graph and see what is being built, in what order, and why? If not, the graph is the
+problem, not their attention.
 
 Number your titles by phase (`0.1`, `0.2`, `1.1`): that prefix is what groups the graph.
 Then name the phases and say why each task exists, see "Making your split readable" below.

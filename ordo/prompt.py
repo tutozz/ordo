@@ -13,6 +13,7 @@ l'implementation interne de report.py.
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 from . import chantier, store
@@ -110,16 +111,41 @@ def _section_zones(task: dict) -> str:
     return "## Declared zones\nYou touch only this:\n" + contenu
 
 
-def _section_checklist(task: dict) -> str:
+def _section_checklist(task_id: str, task: dict) -> str:
+    """Dit de cocher tout de suite, commande prête à copier, avant de rappeler le filet.
+
+    L'ancien texte ne mentionnait la checklist qu'au moment du rapport final : rien ne
+    bougeait avant, personne ne voyait l'avancement pendant que la tâche tournait.
+    ORDO_HOME devant la commande, shlex.quote sur le home, même raison qu'à
+    carte.py:731-734 : un home peut contenir une espace, et une commande affichée puis
+    copiée telle quelle doit marcher au premier essai.
+
+    `--doing` est expliqué AVANT la liste des items à cocher, pas après : sans lui, une
+    exécutante n'utilise jamais un verbe qu'on ne lui a pas donné (elle ne le devine pas),
+    et l'humain qui regarde la carte ne voit qu'un compteur ("checks 2/5") qui n'avance
+    qu'à la toute fin de chaque item, sans jamais dire sur quoi la session travaille entre
+    deux coches ni si elle avance ou si elle patine.
+    """
     checklist = task.get("checklist") or []
     if not checklist:
         return "## Checklist\n(no item to check for this task)"
-    lignes = [f"- {item['id']}: {item['label']}" for item in checklist]
+    home = shlex.quote(str(store.home()))
+    lignes = [
+        f"- {item['id']}: {item['label']}\n"
+        f"  ORDO_HOME={home} ordo check {task_id} {item['id']}"
+        for item in checklist
+    ]
     return (
         "## Checklist\n"
-        "In your report, field \"checked\", tick the identifiers you actually satisfy "
-        "(a wrongly ticked item blocks the tasks that depend on it):\n"
+        "Before starting an item, declare it so the human sees what you are actively "
+        "working on, not just a counter that never moves between two checks:\n"
+        f"  ORDO_HOME={home} ordo check {task_id} <item-id> --doing\n\n"
+        "Tick each item AS SOON AS you have actually verified it, immediately, do not "
+        "wait for the end of the task. Run the exact command below it (a wrongly ticked "
+        "item blocks the tasks that depend on it):\n"
         + "\n".join(lignes)
+        + "\n\nThe report's \"checked\" field, described below, still stands at the end "
+        "as a safety net: ticking the same item twice has no effect."
     )
 
 
@@ -207,7 +233,7 @@ def brief_executante(task_id: str) -> str:
         _section_entete(task_id, task, ch, report_path),
         _section_fond(task, ch),
         _section_zones(task),
-        _section_checklist(task),
+        _section_checklist(task_id, task),
         _section_protocole_rapport(task_id, report_path),
         _section_discipline_contexte(),
         _section_interdits(),

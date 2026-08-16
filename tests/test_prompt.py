@@ -203,7 +203,11 @@ class TestBriefExecutante(PromptTestCase):
         tid = self._task(cid)
         chemin = prompt.brief_executante(tid)
         contenu = Path(chemin).read_text(encoding="utf-8")
-        self.assertIn("self-valid", contenu.lower())
+        # La phrase ENTIÈRE, et dans la liste des interdits : "self-valid" seul apparaît
+        # aussi dans le rappel de rôle de l'orchestratrice plus bas dans ce même module,
+        # si bien qu'altérer l'interdit laissait le test vert -- il ne prouvait rien, ce
+        # que le contrôle de mutation (INT2) a fini par dire.
+        self.assertIn("You never self-validate.", contenu)
 
     def test_irreversible_sans_question_interdit_dans_le_brief(self):
         # troisieme interdit, dicte par le mode tmux : rien d'irreversible ni d'externe

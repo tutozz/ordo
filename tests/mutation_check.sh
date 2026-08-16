@@ -695,10 +695,10 @@ run_case "INT2" "interdit : autovalidation" \
 # ---------------------------------------------------------------------------
 S="$WORKDIR/s15"; R="$WORKDIR/r15"
 cat >"$S" <<'ORDO_EOF'
-        "3. Nothing irreversible or external without asking through the report: no "
+        "6. Nothing irreversible or external without asking through the report: no "
 ORDO_EOF
 cat >"$R" <<'ORDO_EOF'
-        "3. Nothing special or external without asking through the report: no "
+        "6. Nothing special or external without asking through the report: no "
 ORDO_EOF
 run_case "INT3" "interdit : acte irreversible sans question" \
     "tests.test_prompt.TestBriefExecutante.test_irreversible_sans_question_interdit_dans_le_brief" \

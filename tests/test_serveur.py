@@ -228,9 +228,20 @@ class TestServeurVivant(ServeurVivantTestCase):
         # pese des centaines de kilo-octets, et n'a rien a faire dans un menu.
         data = json.loads(self._get("/api/state").read())
         c = data["campaigns"][0]
-        for cle in ("home", "id", "slug", "state", "total", "done", "running"):
+        for cle in ("home", "id", "slug", "state", "total", "done", "running", "ready"):
             self.assertIn(cle, c)
         self.assertNotIn("tasks", c)
+
+    def _tache(self, titre, depends_on=()):
+        """Ajoute une tâche au chantier unique de self.home. Rend la tâche créée."""
+        precedent = os.environ["ORDO_HOME"]
+        os.environ["ORDO_HOME"] = self.home
+        try:
+            with store.locked() as state:
+                cid = next(iter(state["chantiers"]))
+            return chantier.add_task(cid, titre, "prompt", depends_on=depends_on)
+        finally:
+            os.environ["ORDO_HOME"] = precedent
 
     def _question(self, texte, pour_humain=True, reponse=None):
         """Pose une question dans le home servi. Rend (chantier, question)."""
@@ -263,6 +274,25 @@ class TestServeurVivant(ServeurVivantTestCase):
     def test_un_chantier_sans_question_annonce_zero(self):
         data = json.loads(self._get("/api/state").read())
         self.assertEqual(data["campaigns"][0]["asking"], 0)
+
+    def test_un_chantier_sans_tache_n_a_rien_de_lancable(self):
+        data = json.loads(self._get("/api/state").read())
+        self.assertEqual(data["campaigns"][0]["ready"], 0)
+
+    def test_le_menu_dit_combien_de_taches_sont_lancables(self):
+        # C'est le chiffre qui distingue une campagne à l'arrêt d'une campagne qui avance :
+        # sans lui, une colonne sans exécutante ne dit pas si quelque chose peut repartir.
+        self._tache("première")
+        data = json.loads(self._get("/api/state").read())
+        self.assertEqual(data["campaigns"][0]["ready"], 1)
+
+    def test_une_tache_dont_la_dependance_n_est_pas_faite_ne_compte_pas_lancable(self):
+        a = self._tache("a")
+        self._tache("b", depends_on=[a["id"]])
+        data = json.loads(self._get("/api/state").read())
+        # a est lançable, b non : sa dépendance n'est pas encore "done". Le compte doit
+        # venir de chantier.ready(), pas d'un total de tâches "queued".
+        self.assertEqual(data["campaigns"][0]["ready"], 1)
 
     def test_le_detail_d_un_chantier_sert_la_vue_complete(self):
         data = json.loads(self._get("/api/state").read())

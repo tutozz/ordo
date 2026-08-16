@@ -242,6 +242,12 @@ def _resume_home(home: str) -> tuple[list[dict], dict | None]:
                     "total": len(taches),
                     "done": sum(1 for t in taches if t["state"] == "done"),
                     "running": sum(1 for t in taches if t["state"] == "running"),
+                    # Ce qui pourrait partir tout de suite. chantier.ready() sait déjà lire
+                    # les dépendances satisfaites ; le refaire ici dupliquerait cette règle
+                    # et finirait par diverger d'elle. Le compte seul, comme "asking" : une
+                    # colonne qui affiche zéro exécutante ET zéro lançable est une campagne
+                    # qui attend son orchestratrice, pas une campagne qui avance en silence.
+                    "ready": len(chantier.ready(ch["id"])),
                     "createdAt": ch.get("createdAt"),
                 })
             return resume, None

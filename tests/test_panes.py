@@ -14,6 +14,7 @@ Run: python3 -m unittest tests.test_panes
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -29,9 +30,15 @@ SESSION_PREFIX = "ordo-test-panes-"
 HOME = os.path.expanduser("~")
 # A plain, deterministic shell: --noprofile --norc skips the user's rc
 # files, so tests are not at the mercy of a custom prompt (starship, a
-# themed PS1, aliases) turning a predictable "bash-3.2$ " prompt into
-# something a substring check cannot anticipate.
-TEST_SHELL = "bash --noprofile --norc"
+# themed PS1, aliases) turning a predictable prompt into something a
+# substring check cannot anticipate. PS1 is still set here, explicitly and
+# deterministically, to panes.INPUT_BOX_MARKER: send() (task D,
+# docs/diagnostic-envoi.md) now re-reads every pane it writes to and raises
+# if that marker is gone, so every bash pane this suite spawns needs to show
+# it too -- the same simulate-the-real-marker-in-bash technique WaitReadyTests
+# already uses for READY_MARKERS / TRUST_DIALOG_MARKERS, applied once here
+# instead of once per test.
+TEST_SHELL = f'PS1="{panes.INPUT_BOX_MARKER} " bash --noprofile --norc'
 
 
 def _tmux_version() -> tuple[int, int] | None:
@@ -66,6 +73,20 @@ def _wait_for(predicate, timeout=3.0, interval=0.1):
         time.sleep(interval)
         result = predicate()
     return result
+
+
+def _send_brut(pane_id: str, text: str) -> None:
+    """send-keys direct, sans passer par panes.send() ni sa vérification (task D).
+
+    Réservé aux tests qui SIMULENT du texte de panes.py lui-même (marqueurs de
+    wait_ready(), du dialogue de confiance) via un simple echo dans un pane bash : ce
+    texte, une fois échoué, satisferait la propre vérification post-écriture de
+    panes.send() (ou, pour le dialogue de confiance, la ferait au contraire échouer à
+    tort avant même d'atteindre le code que le test veut exercer). Deux appels
+    séparés, comme send() lui-même (invariant I6) : un seul combiné avalerait C-m.
+    """
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=True)
 
 
 def _line_present(captured: str, marker: str) -> bool:
@@ -810,7 +831,10 @@ class WaitReadyTests(PanesTestCase):
     def test_wait_ready_returns_confiance_when_trust_dialog_appears(self):
         _, window = panes.ensure_session(self.session)
         pane_id = panes.spawn(window, HOME, TEST_SHELL)
-        panes.send(
+        # _send_brut, pas panes.send() : ce texte simule le dialogue de confiance pour
+        # tester wait_ready(), et satisferait sinon la propre vérification de send()
+        # (task D) avant même d'atteindre le code que ce test veut exercer.
+        _send_brut(
             pane_id,
             "sleep 0.4; echo 'Quick safety check: Is this a project you trust?'",
         )
@@ -818,12 +842,12 @@ class WaitReadyTests(PanesTestCase):
         self.assertEqual(etat, panes.PANE_ETAT_CONFIANCE)
 
     def test_wait_ready_prefers_confiance_when_both_markers_present(self):
-        # Decision produit : Ordo n'approuve jamais un dossier automatiquement.
-        # Si le pane porte les deux motifs a la fois (ecran de transition,
-        # ambiguite quelconque), le dialogue de confiance doit toujours gagner.
+        # Décision produit : Ordo n'approuve jamais un dossier automatiquement.
+        # Si le pane porte les deux motifs à la fois (écran de transition,
+        # ambiguïté quelconque), le dialogue de confiance doit toujours gagner.
         _, window = panes.ensure_session(self.session)
         pane_id = panes.spawn(window, HOME, TEST_SHELL)
-        panes.send(
+        _send_brut(  # cf. commentaire ci-dessus
             pane_id,
             "echo 'Claude Code v2.1.226'; echo 'Quick safety check: ...'",
         )
@@ -918,6 +942,78 @@ class SendTests(PanesTestCase):
 
         ran = _wait_for(lambda: _line_present(panes.capture(pane_id), marker), timeout=3.0)
         self.assertTrue(ran, panes.capture(pane_id))
+
+
+class InputBoxMissingTests(PanesTestCase):
+    """Task D of docs/diagnostic-envoi.md's découpage : send() doit relire le pane et
+    échouer bruyamment quand la boîte de saisie n'y est plus, au lieu d'écrire dans le
+    vide. Un vrai `claude` n'est jamais relancé ici (même consigne que WaitReadyTests) :
+    le panneau plein écran mesuré sur /cost est reproduit fidèlement par un pane bash qui
+    avale tout ce qu'il reçoit dès un premier déclencheur, sans plus jamais remontrer de
+    prompt ni exécuter la moindre commande -- même mécanique que le vrai panneau (assez
+    de contenu neuf pour repousser l'ancien prompt hors de la fenêtre que send() relit,
+    même technique que test_wait_ready_finds_marker_pushed_to_the_top_of_a_tall_pane
+    ci-dessus), jamais un décor superficiel.
+
+    La preuve est un TÉMOIN SUR DISQUE, jamais le texte à l'écran : le diagnostic explique
+    pourquoi ce piège ne rougit pas (le texte envoyé peut rester visible, simplement échoé
+    par le terminal, sans jamais avoir été exécuté comme commande).
+    """
+
+    def _pane_qui_avale_tout(self) -> str:
+        """Un pane sain au départ, dont l'entrée est définitivement avalée dès la
+        première ligne reçue : le `read` la consomme, une soixantaine de lignes non
+        vides simulent le panneau qui remplit l'écran et repousse l'ancien prompt hors
+        de SEND_VERIFY_LINES, puis `cat > /dev/null` n'exécute plus jamais rien de ce
+        qu'il reçoit."""
+        _, window = panes.ensure_session(self.session)
+        cmd = (
+            "bash --noprofile --norc -c "
+            "'printf \"%s \"; read -r _; "
+            "for i in $(seq 1 60); do echo panel-line-$i; done; "
+            "exec cat > /dev/null'" % panes.INPUT_BOX_MARKER
+        )
+        pane_id = panes.spawn(window, HOME, cmd)
+        self.assertTrue(
+            _wait_for(lambda: panes.INPUT_BOX_MARKER in panes.capture(pane_id)),
+            "le pane simulé devrait démarrer avec sa boîte de saisie visible",
+        )
+        # Déclencheur envoyé en tmux brut, jamais via panes.send() : ce test existe
+        # justement pour prouver ce que fait send(), il ne doit pas en présupposer le
+        # comportement dans sa propre mise en place.
+        _send_brut(pane_id, "declenche")
+        self.assertTrue(
+            _wait_for(
+                lambda: panes.INPUT_BOX_MARKER
+                not in panes.capture(pane_id, lines=panes.SEND_VERIFY_LINES),
+                timeout=3.0,
+            ),
+            "le pane simulé devrait avoir perdu sa boîte de saisie après le déclencheur",
+        )
+        return pane_id
+
+    def test_send_raises_when_input_box_is_gone(self):
+        pane_id = self._pane_qui_avale_tout()
+        with self.assertRaises(RuntimeError) as ctx:
+            panes.send(pane_id, "echo n'arrivera jamais")
+        self.assertIn(pane_id, str(ctx.exception))
+
+    def test_send_leaves_no_witness_on_disk_when_input_box_is_gone(self):
+        """Le critère de preuve du brief : jamais le texte à l'écran, toujours un témoin
+        sur disque. send() a bien écrit les octets dans le pty (les deux appels
+        send-keys ont réussi), mais `cat > /dev/null` les avale sans jamais les exécuter
+        : le témoin ne doit donc jamais apparaître, aussi longtemps qu'on attend."""
+        pane_id = self._pane_qui_avale_tout()
+        temoin = Path(tempfile.mkdtemp()) / "temoin-t11"
+        with self.assertRaises(RuntimeError):
+            panes.send(pane_id, f"touch {temoin}")
+        # Le même délai que celui que send() vient d'attendre en interne : si le témoin
+        # devait un jour apparaître, il en aurait largement eu le temps.
+        time.sleep(panes.SEND_VERIFY_DELAY_S)
+        self.assertFalse(
+            temoin.exists(),
+            "le message écrit dans le vide n'aurait jamais dû atteindre le disque",
+        )
 
 
 class SelfTargetTests(PanesTestCase):

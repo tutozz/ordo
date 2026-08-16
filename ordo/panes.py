@@ -926,6 +926,54 @@ def _is_escape(text: str) -> bool:
     return "\x1b" in text or text.strip() in {"Escape", "escape", "C-["}
 
 
+# Character send() looks for, right after writing, to confirm the target pane still
+# shows an interactive prompt instead of having swallowed the message whole (see
+# send()). Measured 2026-08-16 on real claude panes (t-11, docs/diagnostic-envoi.md
+# task D): "❯" (U+276F) frames the input line in every state a message actually lands
+# in -- idle and bare, or mid-tool with our own message freshly queued behind an
+# earlier one ("❯ Press up to edit queued messages", the delayed-not-lost state of the
+# diagnostic's cas B, still healthy). It is absent from the one confirmed failure state
+# beyond the trust dialog: a full-screen slash-command panel (measured on /cost) that
+# replaces the box outright and fills the pane with unrelated content, none of it
+# containing this character. /compact itself was re-measured for this task, twice, once
+# against an empty session and once against a real one with turns to compact -- neither
+# run opened a panel: /compact renders inline ("⎿ Compacted (ctrl+o to see full
+# summary)"), the box never leaves. Deliberately distinct from the ASCII ">" the trust
+# dialog's own menu uses ("> 1. Yes, I trust this folder", TRUST_DIALOG_MARKERS above):
+# the two checks below can never be confused with one another, though TRUST_DIALOG_MARKERS
+# is still checked first, for an error naming the actual cause instead of the generic one.
+INPUT_BOX_MARKER = "❯"
+
+# How many of the most recent captured lines send() scans for INPUT_BOX_MARKER /
+# TRUST_DIALOG_MARKERS. Bounded on purpose, unlike wait_ready()'s lines=0 -- and here
+# it is not a performance choice (capture()'s underlying tmux call is always -S -, the
+# full scrollback, regardless of what `lines` is sliced down to afterwards): it is a
+# correctness one. INPUT_BOX_MARKER is a single character that reappears throughout a
+# session's entire prior transcript, once per message anyone ever sent ("❯ <that
+# message>" stays in scrollback forever after being submitted). Scanning the full
+# history the way wait_ready() does would make the check trivially always pass in any
+# session with even one prior turn -- finding some OLD "❯" proves nothing about whether
+# the box is there NOW. Bounding the tail is what keeps this check about the CURRENT
+# state, but it must stay UNDER PANE_MIN_USABLE_ROWS (the floor every pane's real,
+# CURRENTLY VISIBLE height already clears): a full-screen panel or dialog fills that
+# whole visible height with fresh content the instant it takes over, so a window
+# narrower than the floor is guaranteed to land entirely inside it, never reaching back
+# into pre-panel scrollback, on even the most tightly tiled pane this module allows.
+# Same value busy() already scans (its own tail window, same reasoning), comfortably
+# above the trust dialog's own footprint (~15 lines end to end, TRUST_DIALOG_MARKERS
+# above) and 10 lines under the floor for margin.
+SEND_VERIFY_LINES = 20
+
+# Delay send() waits after writing, before re-reading the pane (see send()). Must clear
+# the slowest measured time for a full-screen panel to finish replacing the box: three
+# back-to-back runs of /cost sent into an already-ready pane measured the border
+# disappearing at 0.09s, 0.14s and 0.51s after send-keys (2026-08-16, tmux 3.7b) -- over
+# a 5x spread between the fastest and slowest run alone, consistent with the variance
+# already documented elsewhere in this project. 1.0s matches docs/diagnostic-envoi.md's
+# own cas H, which used the same delay to catch the same failure.
+SEND_VERIFY_DELAY_S = 1.0
+
+
 def send(pane_id: str, text: str) -> None:
     """Type text into pane_id, then press enter, as two separate tmux calls (I6).
 
@@ -937,6 +985,24 @@ def send(pane_id: str, text: str) -> None:
     Escape is refused outright. It interrupts the executante's current
     turn, and there is no legitimate reason to interrupt one from Ordo: if
     it is going the wrong way, it gets talked to, never cut off.
+
+    After both keys are sent, the pane is re-read and checked before returning
+    (task D of docs/diagnostic-envoi.md's découpage). The two send-keys calls above
+    succeeding only proves tmux delivered the bytes to the pane's pty -- not that
+    anything on the other end was listening. Measured twice: a full-screen slash-
+    command panel (e.g. /cost) can silently replace the input box and swallow every
+    message sent afterward without a trace, and the tmux trust dialog throws the typed
+    text away outright and reads C-m as confirming "Yes, I trust this folder" instead.
+    Both leave the pane alive and busy() reading idle -- nothing else in this module
+    would ever notice. A caller that gets RuntimeError here knows its message did NOT
+    land, instead of believing a write that went into the void.
+
+    The proof is never on-screen text: the diagnostic that motivated this found the
+    opposite check ("does my own message's text appear on screen?") to be pure decor --
+    text can sit visibly in a still-unsubmitted box, or get echoed by the terminal
+    without ever being interpreted as a command, either way looking like success. This
+    checks for signs of the pane itself instead: TRUST_DIALOG_MARKERS first, for a
+    message naming the actual cause, then INPUT_BOX_MARKER for the general case.
     """
     _reject_self(pane_id)
     if _is_escape(text):
@@ -945,6 +1011,20 @@ def send(pane_id: str, text: str) -> None:
         )
     _run(["send-keys", "-t", pane_id, "-l", text])
     _run(["send-keys", "-t", pane_id, "C-m"])
+    time.sleep(SEND_VERIFY_DELAY_S)
+    apres = capture(pane_id, lines=SEND_VERIFY_LINES, join=True)
+    if any(marker in apres for marker in TRUST_DIALOG_MARKERS):
+        raise RuntimeError(
+            f"send failed: pane {pane_id} shows the tmux trust dialog after send() "
+            "wrote to it -- the text was thrown away and C-m likely just confirmed "
+            "'Yes, I trust this folder' instead of submitting the message"
+        )
+    if INPUT_BOX_MARKER not in apres:
+        raise RuntimeError(
+            f"send failed: pane {pane_id} has no input box after send() wrote to it "
+            "(a full-screen panel is likely showing instead, e.g. a slash command); "
+            "the message was written into the void, not delivered"
+        )
 
 
 def alive(pane_id: str) -> bool:

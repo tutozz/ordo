@@ -136,6 +136,35 @@ This is not a style rule. A phase labelled `Phase 6` tells the human that six ph
 and that you could not say what the sixth is for - which is exactly what they would conclude
 if you had thought about it and had nothing to say.
 
+### One writer per file, checked before every `ordo add`
+
+Executors are **not** isolated in git worktrees. Two of them writing the same file at the
+same time lose work, and the loss is silent: the file still imports, the suite still passes,
+and a module quietly reverted looks exactly like a module that never changed.
+
+So before every `ordo add`, list what every unfinished task already claims:
+
+```bash
+ordo map <campaign> --json | python3 -c "import json,sys; [print(n['id'], n['touches']) for n in json.load(sys.stdin)['nodes'].values() if n['state'] not in ('done','cancelled')]"
+```
+
+If your new task's `--touches` intersects any line, you have two choices and only two:
+**`--depends` on that task**, or **change the split** so the zones are disjoint. Never launch
+both and hope. Write the reason in the `--why` - "same file as t-07, serialised" - so the
+dependency does not read later as a mistake to clean up.
+
+`--touches` is what makes this work, so declare it honestly and completely. A task whose
+prompt tells it to edit `controle.py` while `--touches` says `usage.py` defeats the check
+and gets reported as scope drift after the damage. That mistake has already been made in
+this repository, by an orchestrator writing this very file.
+
+The same rule applies to what you tell an executor to do about git. An executor that runs
+`git stash`, `git checkout --`, `git reset` or `git add -A` takes away the uncommitted work
+of every other session in the tree. Their briefs forbid it; do not ask for it, and if you
+need a clean state, ask for a copy aside instead of a rewind. And **commit early**: work
+that is not committed is one careless command away from being gone, with nothing to show it
+ever existed.
+
 ### The graph is edited, not appended to
 
 A campaign is not planned once. The human adds a concern mid-flight, a diagnosis kills a
@@ -156,8 +185,8 @@ So each time you add, cancel or re-scope a task, re-read the whole graph:
   actually belongs to, not the next free number. The prefix is permanent - there is no rename
   - so a wrong prefix is a wrong phase for the rest of the campaign.
 - **Two tasks writing the same file must be ordered**, with `--depends`, even when nothing
-  functional links them. Executors are not isolated in worktrees: concurrent writes to one
-  file lose work. Say so in the `--why`, so the dependency does not read as a mistake later.
+  functional links them. This is not a precaution, it is the most expensive failure of this
+  whole tool - see "One writer per file" below.
 - **Re-read the phase `--why` after the edit.** If it now describes something the phase no
   longer contains, rewrite it. A stale explanation is worse than none: it is believed.
 

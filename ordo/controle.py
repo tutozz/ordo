@@ -664,8 +664,24 @@ def _tick_one(chantier_id: str) -> list[str]:
             raw = report_raw.get(t["id"])
             if raw is None:
                 continue
+            # Faits machine (t-34) : cochés AVANT l'application du rapport, pour
+            # diffèrer avec l'état d'après et savoir EXACTEMENT quels items viennent de
+            # basculer -- report.apply() ne rend qu'une liste de phrases toutes faites,
+            # jamais les identifiants cochés sous une forme réutilisable ici.
+            coches_avant = {item["id"] for item in task["checklist"] if item["done"]}
             events.extend(report.apply(state, t["id"], raw))
             fresh = state["taches"][t["id"]]
+            coches_apres = {item["id"] for item in fresh["checklist"] if item["done"]}
+            for item_id in sorted(coches_apres - coches_avant):
+                journal.enregistrer_evenement(
+                    chantier_id, "checklist-coche", tache=t["id"], item=item_id,
+                    at=fresh["lastReportAt"],
+                )
+            if fresh["state"] == "blocked" and fresh.get("error"):
+                journal.enregistrer_evenement(
+                    chantier_id, "tache-bloquee", tache=t["id"], cause=fresh["error"],
+                    at=fresh["lastReportAt"],
+                )
             if fresh["state"] == "waiting":
                 # Piege connu : report.apply() fait passer la tache en "waiting" mais
                 # ne cree AUCUNE entree dans state["questions"]. C'est le travail de
@@ -720,6 +736,9 @@ def _tick_one(chantier_id: str) -> list[str]:
                 # discriminant blockedCause).
                 task["blockedCause"] = None
                 events.append(f"{t['id']} blocked: {raison}")
+                journal.enregistrer_evenement(
+                    chantier_id, "tache-bloquee", tache=t["id"], cause=raison,
+                )
 
         # Étape 3.5 : cache de silence de checklist, maintenu ICI et nulle part
         # ailleurs -- wake_reasons() (famille "checklist-silent") ne fait que le
@@ -808,8 +827,23 @@ def _tick_one(chantier_id: str) -> list[str]:
     # rapports fraichement appliques a l'etape 2 (scope_drift/fausse_completion font
     # chacune leur propre store.load(), qui ne verrait pas des mutations encore en
     # memoire dans un state non sauvegarde).
+    # Fait machine (t-34) : une dérive déjà journalisée ne se réécrit jamais -- sans ce
+    # garde, scope_drift() (pure recomputation, sans mémoire d'un tour à l'autre) ferait
+    # réapparaître la MÊME dérive à chaque tick tant que le fichier fautif reste touché,
+    # noyant le journal machine d'autant de lignes identiques que de tours écoulés.
+    derives_deja_journalisees = {
+        (e.get("tache"), e.get("touche"))
+        for e in journal.lire_evenements(chantier_id, "derive-perimetre")
+    }
     for drift in scope_drift(chantier_id):
         events.append(f"scope drift {drift['task']}: {drift['detail']}")
+        cle = (drift["task"], drift["touched"])
+        if cle not in derives_deja_journalisees:
+            journal.enregistrer_evenement(
+                chantier_id, "derive-perimetre", tache=drift["task"],
+                touche=drift["touched"], zones_declarees=list(drift["declared"]),
+                detail=drift["detail"],
+            )
     for fc in fausse_completion(chantier_id):
         if fc["kind"] != "unavailable":
             events.append(f"false completion: {fc['detail']}")
@@ -917,6 +951,9 @@ def _compacter(chantier_id: str) -> list[str]:
             continue
         envoyes.append((task_id, tours))
         events.append(f"{task_id} compacted at turn {tours}, context {contexte}")
+        journal.enregistrer_evenement(
+            chantier_id, "compaction", tache=task_id, tour=tours, contexte=contexte,
+        )
 
     if envoyes:
         with store.locked() as etat:

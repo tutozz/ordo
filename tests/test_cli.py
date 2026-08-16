@@ -40,7 +40,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ordo import capteur, chantier, cli, plan, store
+from ordo import capteur, chantier, cli, journal, plan, store
 
 ORDO_BIN = str(Path(__file__).resolve().parent.parent / "bin" / "ordo")
 
@@ -629,6 +629,71 @@ class TestGrapheVerbs(CliTestCase):
         t1 = self._tache(cid, checklist=["tests verts"])
         code, out, err = self._run(["check", t1, "c1", "--doing", "--json"])
         self.assertEqual(err, "")
+
+    def test_check_doing_journalise_un_evenement_date(self):
+        # Source de vérité de chantier.duree_mesuree_par_critere (brief t-36) : chaque
+        # --doing doit être daté dans le journal machine, en direct, pas seulement dans
+        # task["currentItem"] qui ne garde aucune trace une fois l'item coché.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run(["check", t1, "c1", "--doing"])
+        evenements = journal.lire_evenements(cid, "checklist-doing")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["item"], "c1")
+        self.assertIn("at", evenements[0])
+
+    def test_check_journalise_un_evenement_date(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run(["check", t1, "c1", "--doing"])
+        self._run(["check", t1, "c1"])
+        evenements = journal.lire_evenements(cid, "checklist-coche")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["item"], "c1")
+
+    def test_check_repete_sur_un_item_deja_coche_ne_double_journalise_pas(self):
+        # chantier.check() est idempotent (recocher un item déjà coché "n'a aucun effet",
+        # voir le protocole de rapport) : un second `ordo check` sur le même item ne doit
+        # PAS écrire un second "checklist-coche", qui écraserait la durée déjà mesurée par
+        # l'écart quasi nul entre les deux coches.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run(["check", t1, "c1"])
+        self._run(["check", t1, "c1"])
+        evenements = journal.lire_evenements(cid, "checklist-coche")
+        self.assertEqual(len(evenements), 1)
+
+    def test_check_undo_ne_journalise_rien(self):
+        # Décocher n'est jamais une fin de critère : le journaliser fausserait la mesure
+        # (une prochaine coche du même item semblerait n'avoir pris aucun temps).
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        self._run(["check", t1, "c1"])
+        self._run(["check", t1, "c1", "--undo"])
+        self.assertEqual(journal.lire_evenements(cid), [
+            e for e in journal.lire_evenements(cid) if e["type"] != "checklist-decoche"
+        ])
+        types = [e["type"] for e in journal.lire_evenements(cid)]
+        self.assertEqual(types.count("checklist-coche"), 1)
+
+    def test_check_deduit_le_suivant_journalise_aussi_son_doing(self):
+        # La déclaration automatique de l'item suivant (déduite après une coche réelle,
+        # voir cmd_check) est elle aussi une déclaration --doing en bonne et due forme :
+        # sans son propre événement, la durée du deuxième critère resterait invisible.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier", "second"])
+        with store.locked() as state:
+            state["taches"][t1]["state"] = "running"
+        self._run(["check", t1, "c1", "--doing"])
+        self._run(["check", t1, "c1"])
+        types_et_items = [
+            (e["type"], e["item"]) for e in journal.lire_evenements(cid)
+            if e["type"] in ("checklist-doing", "checklist-coche")
+        ]
+        self.assertIn(("checklist-coche", "c1"), types_et_items)
+        self.assertIn(("checklist-doing", "c2"), types_et_items)
 
     def test_cancel_libere_currentItem(self):
         cid = self._chantier()

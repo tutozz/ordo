@@ -6,6 +6,7 @@ vrai ~/.claude/ordo.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -300,6 +301,151 @@ class TestBrief(JournalTestCase):
         self.assertTrue(
             i_objectif < i_graphe < i_rapports < i_capteur < i_decisions < i_messages
         )
+
+
+class TestEnregistrerEvenement(JournalTestCase):
+    """journal.enregistrer_evenement() : le journal machine, à côté du Markdown (t-34).
+
+    Chaque test vérifie une des trois exigences du brief : une ligne = un fait autonome
+    (c5), une écriture ne doit jamais casser une campagne (c6), ce qui est écrit se relit
+    (c7, testé dans TestLireEvenements). Le Markdown existant (c4) est vérifié ici en
+    négatif : écrire un événement ne doit jamais toucher le fichier .md.
+    """
+
+    def test_creates_a_separate_jsonl_file(self):
+        cid = self._chantier()
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=12, contexte=160000)
+        path = store.home() / "journal" / f"{cid}.jsonl"
+        self.assertTrue(path.exists())
+
+    def test_never_touches_the_markdown_journal(self):
+        # c4 : le Markdown existant reste EXACTEMENT comme il est, on ajoute à côté.
+        cid = self._chantier()
+        journal.write(cid, "ORDO", "fait humain")
+        md_avant = (store.home() / "journal" / f"{cid}.md").read_text(encoding="utf-8")
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=12, contexte=160000)
+        md_apres = (store.home() / "journal" / f"{cid}.md").read_text(encoding="utf-8")
+        self.assertEqual(md_avant, md_apres)
+
+    def test_writes_one_self_contained_json_object_per_call(self):
+        # c5 : une ligne compréhensible seule, sans renvoyer à la précédente. On y
+        # retrouve l'horodatage, le chantier et le type sans avoir à deviner.
+        cid = self._chantier()
+        journal.enregistrer_evenement(cid, "checklist-coche", tache="t-01", item="c1")
+        journal.enregistrer_evenement(cid, "checklist-coche", tache="t-01", item="c2")
+        raw = (store.home() / "journal" / f"{cid}.jsonl").read_text(encoding="utf-8")
+        lignes = raw.splitlines()
+        self.assertEqual(len(lignes), 2)
+        for ligne in lignes:
+            evt = json.loads(ligne)  # leve si une ligne n'est pas un objet JSON autonome
+            self.assertEqual(evt["chantier"], cid)
+            self.assertEqual(evt["type"], "checklist-coche")
+            self.assertRegex(evt["at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(json.loads(lignes[0])["item"], "c1")
+        self.assertEqual(json.loads(lignes[1])["item"], "c2")
+
+    def test_returns_true_on_success(self):
+        cid = self._chantier()
+        self.assertTrue(journal.enregistrer_evenement(cid, "compaction", tache="t-01"))
+
+    def test_unreadable_destination_does_not_raise_and_returns_false(self):
+        # c6 : un fichier illisible (ici, un répertoire à la place du fichier attendu)
+        # ne doit jamais faire tomber une campagne.
+        cid = self._chantier()
+        (store.home() / "journal" / f"{cid}.jsonl").mkdir()
+        resultat = journal.enregistrer_evenement(cid, "compaction", tache="t-01")
+        self.assertFalse(resultat)
+
+    def test_non_json_serializable_field_does_not_raise_and_returns_false(self):
+        # passe adverse : un échec de sérialisation JSON (TypeError, ex. un set passé
+        # par erreur) n'est ni un OSError ni couvert par le test précédent -- même
+        # exigence c6, un mécanisme d'échec différent.
+        cid = self._chantier()
+        resultat = journal.enregistrer_evenement(cid, "compaction", tache="t-01", zones={"a"})
+        self.assertFalse(resultat)
+        path = store.home() / "journal" / f"{cid}.jsonl"
+        self.assertFalse(path.exists() and path.read_text(encoding="utf-8").strip())
+
+    def test_write_failure_is_signalled_in_the_markdown_journal(self):
+        # "et le signale" (exigence 2) : l'échec n'est pas silencieux, il est visible sur
+        # le canal Markdown déjà fiable, en best-effort.
+        cid = self._chantier()
+        (store.home() / "journal" / f"{cid}.jsonl").mkdir()
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01")
+        md = (store.home() / "journal" / f"{cid}.md").read_text(encoding="utf-8")
+        self.assertIn("machine journal", md)
+
+
+class TestLireEvenements(JournalTestCase):
+    def test_empty_when_no_file(self):
+        cid = self._chantier()
+        self.assertEqual(journal.lire_evenements(cid), [])
+
+    def test_unreadable_destination_does_not_raise_and_returns_empty(self):
+        # c6, côté lecture : un contrôle qui relit ce fichier à chaque tick pour
+        # dédoublonner (voir controle.py) ne doit jamais faire tomber une campagne pour
+        # la seule raison que le fichier est devenu illisible entre deux ticks.
+        cid = self._chantier()
+        (store.home() / "journal" / f"{cid}.jsonl").mkdir()
+        self.assertEqual(journal.lire_evenements(cid), [])
+
+    def test_roundtrips_values_exactly(self):
+        # c7 : le test qui compte, on relit ce qu'on a ecrit et on retrouve les memes
+        # valeurs, types compris (chaine, entier, liste).
+        cid = self._chantier()
+        journal.enregistrer_evenement(
+            cid, "derive-perimetre", tache="t-01", touche="ordo/cli.py",
+            zones_declarees=["ordo/journal.py", "ordo/controle.py"], detail="hors zone",
+        )
+        evenements = journal.lire_evenements(cid)
+        self.assertEqual(len(evenements), 1)
+        evt = evenements[0]
+        self.assertEqual(evt["tache"], "t-01")
+        self.assertEqual(evt["touche"], "ordo/cli.py")
+        self.assertEqual(evt["zones_declarees"], ["ordo/journal.py", "ordo/controle.py"])
+        self.assertEqual(evt["detail"], "hors zone")
+
+    def test_preserves_write_order(self):
+        cid = self._chantier()
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=1)
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=2)
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=3)
+        tours = [e["tour"] for e in journal.lire_evenements(cid)]
+        self.assertEqual(tours, [1, 2, 3])
+
+    def test_filters_by_type_evenement(self):
+        cid = self._chantier()
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=1)
+        journal.enregistrer_evenement(cid, "tache-bloquee", tache="t-01", cause="pane mort")
+        seulement_compactions = journal.lire_evenements(cid, "compaction")
+        self.assertEqual(len(seulement_compactions), 1)
+        self.assertEqual(seulement_compactions[0]["type"], "compaction")
+
+    def test_skips_a_line_that_is_valid_json_but_not_an_object(self):
+        # passe adverse : une ligne JSON valide mais pas un objet (ex. un nombre isolé)
+        # ne doit pas faire lever evt.get("type") plus bas ; elle est ignorée comme une
+        # ligne corrompue.
+        cid = self._chantier()
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=1)
+        path = store.home() / "journal" / f"{cid}.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write("42\n")
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=2)
+        tours = [e["tour"] for e in journal.lire_evenements(cid)]
+        self.assertEqual(tours, [1, 2])
+
+    def test_skips_a_corrupt_line_without_raising(self):
+        # une ecriture interrompue par un crash peut laisser une ligne tronquee au milieu
+        # du fichier : elle est ignoree, elle ne doit jamais faire echouer la relecture
+        # des lignes valides qui l'entourent (meme esprit que journal.read()).
+        cid = self._chantier()
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=1)
+        path = store.home() / "journal" / f"{cid}.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write('{"at": "2026-08-16T12:00:00Z", "chantier": "' + cid + '", tronque\n')
+        journal.enregistrer_evenement(cid, "compaction", tache="t-01", tour=2)
+        tours = [e["tour"] for e in journal.lire_evenements(cid)]
+        self.assertEqual(tours, [1, 2])
 
 
 if __name__ == "__main__":

@@ -835,7 +835,35 @@ def cmd_amend(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    # Lu AVANT la mutation, seulement pour savoir si CE check est une vraie transition
+    # (brief t-36) : chantier.check() est idempotent, recocher un item déjà coché n'a
+    # "aucun effet" sur son état (voir le filet de sécurité du protocole de rapport), mais
+    # journaliser quand même un second "checklist-coche" fausserait la mesure -- il
+    # écraserait la durée déjà mesurée par une valeur quasi nulle (l'écart entre les deux
+    # coches), sans que rien ne signale la perte.
+    deja_coche = False
+    if not args.doing and not args.undo:
+        etat_avant = store.load()
+        tache_avant = etat_avant["taches"].get(args.task)
+        item_avant = next(
+            (i for i in (tache_avant or {}).get("checklist", []) if i["id"] == args.item),
+            None,
+        )
+        deja_coche = bool(item_avant and item_avant.get("done"))
     t = chantier.check(args.task, args.item, done=not args.undo, doing=args.doing)
+    # Journal machine (t-34) : datation réelle de CE check, en direct, brief t-36 -- seule
+    # source de vérité pour mesurer un jour la durée individuelle de chaque critère plutôt
+    # que de diviser la durée totale de la tâche par leur nombre (voir
+    # chantier.duree_mesuree_par_critere). --undo ne journalise rien : décocher n'est
+    # jamais une fin de critère, ce serait fausser toute mesure ultérieure sur cet item.
+    if args.doing:
+        journal.enregistrer_evenement(
+            t["chantier"], "checklist-doing", tache=args.task, item=args.item,
+        )
+    elif not args.undo and not deja_coche:
+        journal.enregistrer_evenement(
+            t["chantier"], "checklist-coche", tache=args.task, item=args.item,
+        )
     # Déduction du critère en cours : seulement après une coche réelle (ni --doing, qui
     # déclare déjà explicitement le sien, ni --undo, qui décoche et n'est jamais une
     # "attaque" d'un nouveau critère). Import local et défensif, même raison qu'ailleurs
@@ -851,6 +879,9 @@ def cmd_check(args: argparse.Namespace) -> int:
             suivant = controle.deduce_current_item(t)
             if suivant:
                 t = chantier.check(args.task, suivant, doing=True)
+                journal.enregistrer_evenement(
+                    t["chantier"], "checklist-doing", tache=args.task, item=suivant,
+                )
     if args.json:
         _print_json(t)
         return 0

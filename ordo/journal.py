@@ -12,7 +12,9 @@ dense : il remplace six heures de transcript, il ne les recopie pas.
 
 from __future__ import annotations
 
+import json
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from . import chantier, store
@@ -107,6 +109,103 @@ def read(chantier_id: str, limit: int | None = None) -> list[dict]:
     if limit is not None:
         entries = entries[-limit:]
     return entries
+
+
+# ===========================================================================
+# Journal machine (t-34) : un fait par ligne JSON, à côté du Markdown ci-dessus.
+# ===========================================================================
+#
+# Le Markdown ci-dessus (write/read/brief) sert un lecteur : l'humain qui reprend un
+# chantier à froid, et il en dit assez pour ça. Une campagne d'optimisation qui veut
+# trier, compter ou croiser des faits (quel modèle tient quelle tâche, combien de
+# tentatives avant succès, quelles dérives de périmètre) ne peut rien faire d'un
+# paragraphe de prose sans le reparser au jugé. Ce qui suit écrit les MÊMES familles de
+# faits que _tick_one() journalise déjà en texte libre (voir ordo/controle.py), mais
+# sous une forme qu'une machine relit sans deviner : un objet JSON complet par ligne,
+# ajouté au fichier .jsonl du chantier, jamais au .md qui reste inchangé.
+#
+# Le chantier n'est PAS revalidé à chaque appel (pas de store.load() ici) : les seuls
+# appelants de ce module (controle.py) ont déjà résolu le chantier plus haut dans le
+# même tick via _get_chantier(). Revalider à chaque événement coûterait une lecture de
+# state.json par fait journalisé, pour une garantie que l'appelant a déjà.
+
+
+def _evenements_path(chantier_id: str) -> Path:
+    return store.home() / "journal" / f"{chantier_id}.jsonl"
+
+
+def enregistrer_evenement(chantier_id: str, type_evenement: str, **champs: object) -> bool:
+    """Ajoute un fait structuré, une ligne JSON autonome, au journal machine du chantier.
+
+    Chaque ligne porte tout ce qu'il faut pour se comprendre seule, des mois plus tard,
+    hors de son contexte : l'horodatage ("at"), le chantier, le type du fait, et les
+    champs propres à ce type (ex. tache="t-34", item="c1" pour un critère coché). Aucune
+    ligne ne renvoie à la précédente.
+
+    Ne lève JAMAIS (exigence 2 du brief t-34, invariant le plus important de cette
+    fonction) : un disque plein, un chemin verrouillé, illisible ou déjà pris par autre
+    chose qu'un fichier ne doit jamais faire tomber une campagne pour la seule raison
+    qu'on a voulu journaliser un fait -- ni un champ passé par erreur que JSON ne sait
+    pas sérialiser (TypeError, ex. un set au lieu d'une liste). En échec, l'écriture
+    échoue en silence pour l'appelant (renvoie False) mais SIGNALE la panne sur le canal
+    Markdown déjà fiable, en best-effort ; si ce second canal échoue lui aussi, l'échec
+    reste muet plutôt que de lever à son tour.
+    """
+    ligne = {"at": store.now(), "chantier": chantier_id, "type": type_evenement, **champs}
+    try:
+        texte = json.dumps(ligne, ensure_ascii=False) + "\n"
+        with _evenements_path(chantier_id).open("a", encoding="utf-8") as f:
+            f.write(texte)
+        return True
+    except (OSError, TypeError) as exc:
+        with suppress(Exception):
+            write(
+                chantier_id, "ORDO",
+                f"machine journal write failed ({type_evenement}): {exc}",
+            )
+        return False
+
+
+def lire_evenements(chantier_id: str, type_evenement: str | None = None) -> list[dict]:
+    """Reparse le journal machine du chantier en dicts, dans l'ordre d'écriture.
+
+    Sans fichier, liste vide, jamais une erreur (même parti pris que read()). Une ligne
+    corrompue (écriture interrompue par un crash en plein milieu du fichier) est ignorée
+    plutôt que de faire échouer la relecture des lignes valides qui l'entourent.
+    type_evenement, quand fourni, ne garde que les faits de ce type.
+
+    Ne lève JAMAIS, même invariant que enregistrer_evenement() : un chemin devenu
+    illisible (permissions changées, remplacé par un répertoire) rend une liste vide
+    plutôt que de faire tomber l'appelant -- trouvé en pratique, un appelant qui relit ce
+    fichier pour dédoublonner (voir controle.py, étape 7) le fait à chaque tick, jamais
+    seulement à l'écriture.
+    """
+    path = _evenements_path(chantier_id)
+    try:
+        if not path.exists():
+            return []
+        contenu = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        with suppress(Exception):
+            write(chantier_id, "ORDO", f"machine journal read failed: {exc}")
+        return []
+    evenements: list[dict] = []
+    for ligne in contenu.splitlines():
+        if not ligne.strip():
+            continue
+        try:
+            evt = json.loads(ligne)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(evt, dict):
+            # JSON valide mais pas un objet (ex. un nombre ou une liste isolée sur sa
+            # propre ligne) : ce n'est pas un fait au format attendu, on l'ignore comme
+            # une ligne corrompue plutôt que de lever sur evt.get() plus bas.
+            continue
+        if type_evenement is not None and evt.get("type") != type_evenement:
+            continue
+        evenements.append(evt)
+    return evenements
 
 
 def _section_objectif(ch: dict) -> str:

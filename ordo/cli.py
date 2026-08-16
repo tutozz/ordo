@@ -112,6 +112,18 @@ def _resolve_task(state: dict, task_id: str) -> tuple[dict, dict]:
     return task, ch
 
 
+def _libelle_checklist(task: dict, item_id: str) -> str | None:
+    """Libellé courant d'un item de checklist, ou None si l'item n'existe pas.
+
+    Utilisé pour journaliser (t-55) le libellé exact que l'exécutante regardait au
+    moment d'un fait ("checklist-doing", "checklist-coche") : toujours lu sur le dict
+    déjà en main (task, tel que renvoyé par chantier.check()), jamais relu depuis
+    state.json a posteriori, sous peine de rapporter le libellé actuel plutôt que celui
+    du moment si l'item a été rewordé ou splitté entre-temps.
+    """
+    return next((i["label"] for i in task["checklist"] if i["id"] == item_id), None)
+
+
 def _derniere_ligne_utile(pane_id: str) -> str:
     texte = panes.capture(pane_id, lines=10)
     for ligne in reversed(texte.splitlines()):
@@ -498,8 +510,39 @@ def _do_launch(
     _record_pane_outcome(
         task_id, pane_id, cwd, resolved_model, "running", None, session_id
     )
-    panes.send(pane_id, f"Read {brief_path} and apply it.")
+    try:
+        panes.send(
+            pane_id,
+            f"Read {brief_path} and apply it.",
+            ready_timeout=panes.SEND_READY_TIMEOUT_S,
+        )
+    except RuntimeError as exc:
+        # t-53 et t-57 (2026-08-16, t-59) : le pane n'est jamais devenu réceptif, la tâche
+        # venait pourtant d'être marquée "running" juste au-dessus. Sans ce rattrapage, la
+        # carte affiche "running" pour toujours -- exactement le défaut mesuré -- même si
+        # `ordo launch` lui-même sort en erreur ici (main() imprime "error: ..." et rend un
+        # code non nul, mais rien ne dit que quelqu'un regardait le terminal à cet instant
+        # précis). Même forme que le blocage par dialogue de confiance ci-dessus : la
+        # tâche repasse "blocked" avec une raison lisible, jamais laissée sur "running".
+        raison = f"brief injection failed in pane {pane_id} (session {session}): {exc}"
+        _record_pane_outcome(
+            task_id, pane_id, cwd, resolved_model, "blocked", raison, session_id
+        )
+        journal.write(
+            ch["id"],
+            "ORDO",
+            f"{verb_label} {task_id} pane={pane_id} blocked: brief injection failed",
+        )
+        raise CliError(f"unable to {verb_label} {task_id}: {raison}") from exc
     journal.write(ch["id"], "ORDO", f"{verb_label} {task_id} pane={pane_id}")
+    # Fait machine (t-51) : modèle RÉELLEMENT utilisé (resolved_model, pas l'argument
+    # --model brut) et tentative déduite de l'attempts AVANT incrément par
+    # _record_pane_outcome ci-dessus (task local n'est jamais rafraîchi) -- 1 pour un
+    # premier launch, incrémenté à chaque relance sur la même tâche.
+    journal.enregistrer_evenement(
+        ch["id"], "tache-lancee", tache=task_id,
+        modele=resolved_model, tentative=task["attempts"] + 1,
+    )
 
     return {
         "paneId": pane_id,
@@ -855,7 +898,15 @@ def cmd_priority(args: argparse.Namespace) -> int:
 
 
 def cmd_amend(args: argparse.Namespace) -> int:
+    # Ancien prompt capturé AVANT l'appel (fait machine t-51) : amend() l'écrase.
+    # Tronqué à 200 caractères -- jamais le texte complet, le brief déjà sur disque
+    # en fait foi (voir SPEC).
+    etat_avant = store.load()["taches"].get(args.task) or {}
+    ancien_prompt = str(etat_avant.get("prompt") or "")
     t = chantier.amend(args.task, args.prompt)
+    journal.enregistrer_evenement(
+        t["chantier"], "tache-amendee", tache=args.task, ancien_prompt=ancien_prompt[:200],
+    )
     if args.json:
         _print_json(t)
         return 0
@@ -888,10 +939,12 @@ def cmd_check(args: argparse.Namespace) -> int:
     if args.doing:
         journal.enregistrer_evenement(
             t["chantier"], "checklist-doing", tache=args.task, item=args.item,
+            label=_libelle_checklist(t, args.item),
         )
     elif not args.undo and not deja_coche:
         journal.enregistrer_evenement(
             t["chantier"], "checklist-coche", tache=args.task, item=args.item,
+            label=_libelle_checklist(t, args.item),
         )
     # Déduction du critère en cours : seulement après une coche réelle (ni --doing, qui
     # déclare déjà explicitement le sien, ni --undo, qui décoche et n'est jamais une
@@ -910,6 +963,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                 t = chantier.check(args.task, suivant, doing=True)
                 journal.enregistrer_evenement(
                     t["chantier"], "checklist-doing", tache=args.task, item=suivant,
+                    label=_libelle_checklist(t, suivant),
                 )
     if args.json:
         _print_json(t)
@@ -949,6 +1003,11 @@ def cmd_checklist_add(args: argparse.Namespace) -> int:
     journal.write(
         ch["id"], args.author, f'checklist {args.task}: added {nouveau["id"]} "{args.label}"'
     )
+    # Journal machine (t-55) : add n'écrivait jusqu'ici rien dans le jsonl, seul le
+    # journal Markdown ci-dessus en gardait une trace informelle.
+    journal.enregistrer_evenement(
+        ch["id"], "checklist-add", tache=args.task, item=nouveau["id"], label=args.label,
+    )
     if args.json:
         _print_json(t)
         return 0
@@ -961,13 +1020,22 @@ def cmd_checklist_add(args: argparse.Namespace) -> int:
 
 def cmd_checklist_split(args: argparse.Namespace) -> int:
     state = store.load()
-    _, ch = _resolve_task(state, args.task)
+    tache_avant, ch = _resolve_task(state, args.task)
+    # Ancien libellé capturé AVANT l'appel (même piège que cmd_amend, voir sa docstring) :
+    # split_checklist_item() l'écrase en place sous args.first.
+    ancien_label = _libelle_checklist(tache_avant, args.item)
     t = chantier.split_checklist_item(args.task, args.item, args.first, args.second)
     nouveau = t["checklist"][-1]
     journal.write(
         ch["id"],
         args.author,
         f"checklist {args.task}: split {args.item} into {args.item} + {nouveau['id']}",
+    )
+    # Journal machine (t-55) : split n'écrivait jusqu'ici rien dans le jsonl.
+    journal.enregistrer_evenement(
+        ch["id"], "checklist-split", tache=args.task, item=args.item,
+        nouvel_item=nouveau["id"], ancien_label=ancien_label,
+        label_un=args.first, label_deux=args.second,
     )
     if args.json:
         _print_json(t)
@@ -980,7 +1048,18 @@ def cmd_checklist_split(args: argparse.Namespace) -> int:
 
 
 def cmd_checklist_reword(args: argparse.Namespace) -> int:
+    # Ancien libellé capturé AVANT l'appel (même piège que cmd_amend, voir sa docstring) :
+    # reword_checklist_item() l'écrase en place.
+    state = store.load()
+    tache_avant, ch = _resolve_task(state, args.task)
+    ancien_label = _libelle_checklist(tache_avant, args.item)
     t = chantier.reword_checklist_item(args.task, args.item, args.label)
+    # Journal machine (t-55) : reword n'écrivait jusqu'ici rien du tout, ni Markdown ni
+    # jsonl -- seul verbe des trois (add, split, reword) à ne laisser aucune trace.
+    journal.enregistrer_evenement(
+        ch["id"], "checklist-reword", tache=args.task, item=args.item,
+        ancien_label=ancien_label, nouveau_label=args.label,
+    )
     if args.json:
         _print_json(t)
         return 0
@@ -1102,6 +1181,13 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
 
 def cmd_relaunch(args: argparse.Namespace) -> int:
+    # Capturés AVANT _do_launch (fait machine t-51) : _record_pane_outcome y remet
+    # blockedCause et error à None pour cette tentative fraîche (voir sa docstring),
+    # donc la cause du blocage qu'on relance ne se lit qu'ICI, jamais après l'appel.
+    state_avant = store.load()
+    task_avant, ch_avant = _resolve_task(state_avant, args.task)
+    cause = task_avant.get("blockedCause") or task_avant.get("error")
+    tentative = task_avant["attempts"] + 1
     result = _do_launch(
         args.task,
         args.model,
@@ -1110,6 +1196,9 @@ def cmd_relaunch(args: argparse.Namespace) -> int:
         verb_label="relaunch",
         force=args.force,
         require_ready=False,
+    )
+    journal.enregistrer_evenement(
+        ch_avant["id"], "tache-relancee", tache=args.task, cause=cause, tentative=tentative,
     )
     return _print_launch_result(args.task, "relaunched", result, args.json)
 
@@ -1847,6 +1936,14 @@ def cmd_answer(args: argparse.Namespace) -> int:
             fresh_task = state["taches"].get(task_id)
             if fresh_task is not None and fresh_task["state"] == "waiting":
                 fresh_task["state"] = "running"
+        # Fait machine (t-54) : second chemin d'injection, jumeau exact de l'étape 4
+        # de controle.py::_tick_one -- même événement, même troncature à 200
+        # caractères, atteint seulement une fois l'envoi tmux réellement réussi
+        # (jamais sur le chemin d'erreur ci-dessus, qui lève avant ce bloc).
+        journal.enregistrer_evenement(
+            q["chantier"], "reponse-injectee", tache=task_id, question=q["id"],
+            reponse=str(args.text or "")[:200],
+        )
 
     if args.json:
         _print_json(q)

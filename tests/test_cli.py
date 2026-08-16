@@ -605,6 +605,23 @@ class TestGrapheVerbs(CliTestCase):
         code, out, err = self._run(["amend", t1, "--prompt", "x"])
         self.assertNotEqual(code, 0)
 
+    def test_amend_journalise_tache_amendee_avec_ancien_prompt_tronque(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, prompt="x" * 250)
+        self._run(["amend", t1, "--prompt", "nouveau texte"])
+        evenements = journal.lire_evenements(cid, "tache-amendee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["ancien_prompt"], "x" * 200)
+
+    def test_amend_refuse_ne_journalise_rien(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, prompt="ancien")
+        with store.locked() as state:
+            state["taches"][t1]["state"] = "running"
+        self._run(["amend", t1, "--prompt", "x"])
+        self.assertEqual(journal.lire_evenements(cid, "tache-amendee"), [])
+
     def test_check_et_undo(self):
         cid = self._chantier()
         t1 = self._tache(cid, checklist=["tests verts"])
@@ -732,6 +749,37 @@ class TestGrapheVerbs(CliTestCase):
         self.assertIn(("checklist-coche", "c1"), types_et_items)
         self.assertIn(("checklist-doing", "c2"), types_et_items)
 
+    def test_check_doing_journalise_le_libelle_de_litem(self):
+        # t-55 : sans le libellé, un item plus tard rewordé ou splitté rend impossible de
+        # savoir, a posteriori, quel texte exact l'exécutante regardait a ce moment-la.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier critère"])
+        self._run(["check", t1, "c1", "--doing"])
+        evenements = journal.lire_evenements(cid, "checklist-doing")
+        self.assertEqual(evenements[0]["label"], "premier critère")
+
+    def test_check_journalise_le_libelle_de_litem(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier critère"])
+        self._run(["check", t1, "c1", "--doing"])
+        self._run(["check", t1, "c1"])
+        evenements = journal.lire_evenements(cid, "checklist-coche")
+        self.assertEqual(evenements[0]["label"], "premier critère")
+
+    def test_check_journalise_le_libelle_courant_pas_celui_relu_apres_coup(self):
+        # t-55 : le libellé journalisé est celui regardé AU MOMENT du fait, pas relu
+        # depuis state.json a posteriori -- un reword entre les deux ne doit pas
+        # réécrire le passé.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["libellé initial"])
+        self._run(["check", t1, "c1", "--doing"])
+        self._run(["checklist", "reword", t1, "c1", "libellé corrigé"])
+        self._run(["check", t1, "c1"])
+        doing = journal.lire_evenements(cid, "checklist-doing")
+        coche = journal.lire_evenements(cid, "checklist-coche")
+        self.assertEqual(doing[0]["label"], "libellé initial")
+        self.assertEqual(coche[0]["label"], "libellé corrigé")
+
     def test_cancel_libere_currentItem(self):
         cid = self._chantier()
         t1 = self._tache(cid, checklist=["tests verts"])
@@ -788,6 +836,18 @@ class TestChecklistVerbs(CliTestCase):
             data["checklist"][1],
             {"id": "c2", "label": "second critère", "done": False, "dureeMin": None},
         )
+
+    def test_add_journalise_un_fait_dans_le_jsonl(self):
+        # t-55 : add n'écrivait rien dans le journal machine jusqu'ici, seul le journal
+        # Markdown (texte libre) en gardait une trace informelle.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        self._run(["checklist", "add", t1, "second critère"])
+        evenements = journal.lire_evenements(cid, "checklist-add")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["item"], "c2")
+        self.assertEqual(evenements[0]["label"], "second critère")
 
     def test_add_journalise_sous_lauteur_par_defaut_ordo(self):
         cid = self._chantier()
@@ -853,6 +913,22 @@ class TestChecklistVerbs(CliTestCase):
         self.assertIn("c1", entries[0]["texte"])
         self.assertIn("c2", entries[0]["texte"])
 
+    def test_split_journalise_un_fait_dans_le_jsonl(self):
+        # t-55 : split n'écrivait rien dans le journal machine jusqu'ici.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["fait deux choses à la fois"])
+        self._run(["checklist", "split", t1, "c1", "première moitié", "seconde moitié"])
+        evenements = journal.lire_evenements(cid, "checklist-split")
+        self.assertEqual(len(evenements), 1)
+        evt = evenements[0]
+        self.assertEqual(evt["tache"], t1)
+        self.assertEqual(evt["item"], "c1")
+        self.assertEqual(evt["nouvel_item"], "c2")
+        self.assertEqual(evt["ancien_label"], "fait deux choses à la fois")
+        self.assertEqual(evt["label_un"], "première moitié")
+        self.assertEqual(evt["label_deux"], "seconde moitié")
+        self.assertNotEqual(evt["ancien_label"], evt["label_un"])
+
     def test_split_item_inconnu_refuse(self):
         cid = self._chantier()
         t1 = self._tache(cid, checklist=["a"])
@@ -870,12 +946,26 @@ class TestChecklistVerbs(CliTestCase):
             {"id": "c1", "label": "libellé corrigé", "done": False, "dureeMin": None},
         )
 
-    def test_reword_ne_journalise_rien(self):
+    def test_reword_ne_journalise_rien_dans_le_markdown(self):
         cid = self._chantier()
         t1 = self._tache(cid, checklist=["libellé faux"])
         self._run_json(["checklist", "reword", t1, "c1", "libellé corrigé", "--json"])
         entries = self._run_json(["journal", "show", cid, "--json"])
         self.assertEqual(entries, [])
+
+    def test_reword_journalise_un_fait_dans_le_jsonl(self):
+        # t-55 : reword n'écrivait rien du tout jusqu'ici, ni Markdown ni jsonl.
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["libellé faux"])
+        self._run(["checklist", "reword", t1, "c1", "libellé corrigé"])
+        evenements = journal.lire_evenements(cid, "checklist-reword")
+        self.assertEqual(len(evenements), 1)
+        evt = evenements[0]
+        self.assertEqual(evt["tache"], t1)
+        self.assertEqual(evt["item"], "c1")
+        self.assertEqual(evt["ancien_label"], "libellé faux")
+        self.assertEqual(evt["nouveau_label"], "libellé corrigé")
+        self.assertNotEqual(evt["ancien_label"], evt["nouveau_label"])
 
     def test_attribut_pose_la_valeur(self):
         cid = self._chantier()
@@ -1214,6 +1304,45 @@ class TestExecutionVerbs(CliTestCase):
         self.assertEqual(code, 0)
         self.assertIn("--model opus", self._cmd_de_spawn(spawn))
         self.assertIn("tentative", out.lower())
+
+    def test_launch_journalise_tache_lancee_avec_modele_et_tentative(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, titre="CTRL-DOC 01", prompt="Voir a.py.", checklist=["a"])
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2, m3, m4, m5:
+            self._run(["launch", t1, "--model", "haiku"])
+        evenements = journal.lire_evenements(cid, "tache-lancee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["modele"], "haiku")
+        self.assertEqual(evenements[0]["tentative"], 1)
+
+    def test_relaunch_journalise_tache_lancee_tentative_incrementee(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, titre="t")
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2, m3, m4, m5:
+            self._run(["launch", t1])
+            with store.locked() as state:
+                state["taches"][t1]["state"] = "blocked"
+            self._run(["relaunch", t1])
+        evenements = journal.lire_evenements(cid, "tache-lancee")
+        self.assertEqual([e["tentative"] for e in evenements], [1, 2])
+
+    def test_relaunch_journalise_tache_relancee_avec_cause_et_tentative(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, titre="t")
+        with store.locked() as state:
+            state["taches"][t1]["state"] = "blocked"
+            state["taches"][t1]["error"] = "rapport illisible"
+        m1, m2, m3, m4, m5 = self._mock_panes()
+        with m1, m2, m3, m4, m5:
+            self._run(["relaunch", t1])
+        evenements = journal.lire_evenements(cid, "tache-relancee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["cause"], "rapport illisible")
+        self.assertEqual(evenements[0]["tentative"], 1)
 
     def test_launch_json_contient_toutes_les_cles_du_contrat(self):
         cid = self._chantier()
@@ -2037,6 +2166,37 @@ class TestSignalVerbs(CliTestCase):
         self.assertIsNotNone(answered.get("injectedAt"))
         task = store.load()["taches"][t1]
         self.assertEqual(task["state"], "running")
+
+    def test_answer_journalise_reponse_injectee(self):
+        # t-54 : second chemin d'injection (le premier est controle.py::_tick_one,
+        # étape 4), même fait machine, même contrat -- "comme le ferait un ordo say"
+        # (docstring de cmd_answer) inclut désormais le journal machine.
+        cid = self._chantier()
+        t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%7"
+            state["taches"][t1]["state"] = "waiting"
+        q = self._run_json(["ask", t1, "quelle branche ?", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=True), \
+             mock.patch.object(cli.panes, "send", return_value=None):
+            self._run_json(["answer", q["id"], "main", "--json"])
+        evenements = journal.lire_evenements(cid, "reponse-injectee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], t1)
+        self.assertEqual(evenements[0]["question"], q["id"])
+        self.assertEqual(evenements[0]["reponse"], "main")
+
+    def test_answer_ne_journalise_rien_si_lenvoi_echoue(self):
+        # Garde-fou jumeau de test_answer_echoue_bruyamment_si_pane_mort_mais_garde_la_reponse :
+        # pane mort -> aucune injection réelle -> aucun fait "reponse-injectee".
+        cid = self._chantier()
+        t1 = self._tache(cid)
+        with store.locked() as state:
+            state["taches"][t1]["paneId"] = "%9"
+        q = self._run_json(["ask", t1, "quelle branche ?", "--json"])
+        with mock.patch.object(cli.panes, "alive", return_value=False):
+            self._run(["answer", q["id"], "main"])
+        self.assertEqual(journal.lire_evenements(cid, "reponse-injectee"), [])
 
     def test_answer_echoue_bruyamment_si_pane_mort_mais_garde_la_reponse(self):
         # c3/c4 : pane mort -> personne n'a rien reçu, la commande le dit et n'affiche

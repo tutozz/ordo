@@ -734,6 +734,255 @@ class TestTickBlockedReportReread(ControleTestCase):
         self.assertIsNone(state["taches"][b]["blockedCause"])
 
 
+class TestTickJournalMachineCycleDeVie(ControleTestCase):
+    """t-51 : quatre faits machine de plus, jumeaux de checklist-doing/checklist-coche
+    (t-34/t-36) mais pour le cycle de vie de la tâche au-delà de sa checklist."""
+
+    def test_rapport_lu_journalise_ecrit_at_depuis_le_mtime_du_fichier(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "progress", "note": "en cours"})
+        mtime_attendu = report.path(tid, cid).stat().st_mtime
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "rapport-lu")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(
+            evenements[0]["ecrit_at"],
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime_attendu)),
+        )
+
+    def test_tache_terminee_journalisee_sur_done(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "done", "note": "fini", "touched": []})
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-terminee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["etat"], "done")
+
+    def test_tache_terminee_journalisee_sur_blocage_par_pane_mort(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999", started_ago=999.0)
+        with mock.patch.object(panes, "alive", return_value=False), \
+             mock.patch.object(controle, "PANE_DEAD_GRACE_S", 1.0):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-terminee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["etat"], "blocked")
+
+    def test_tache_terminee_ne_double_journalise_pas_un_rapport_encore_blocked(self):
+        # Garde-fou (jumeau de test_rapport_encore_blocked_reste_bloquee ci-dessus) :
+        # une tâche déjà bloquée qui reçoit un nouveau rapport "blocked" ne redevient
+        # pas "terminée" une seconde fois, ce ne serait pas une nouvelle terminaison.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._set_task(tid, state="blocked", error="premier obstacle")
+        self._write_report(tid, {"task": tid, "state": "blocked", "note": "encore bloquée"})
+        controle.tick(cid)
+        self.assertEqual(journal.lire_evenements(cid, "tache-terminee"), [])
+
+
+class TestTacheBloqueeCategorie(ControleTestCase):
+    """t-53 : le fait "tache-bloquee" porte désormais une catégorie, déduite du point
+    d'émission (jamais d'un parsing du texte de cause) -- pane mort d'un côté, rapport
+    d'échec (illisible ou explicitement "blocked") de l'autre."""
+
+    def test_categorie_rapport_sur_blocage_rapporte_par_lexecutante(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "blocked", "note": "obstacle réel"})
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-bloquee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["cause"], "obstacle réel")
+        self.assertEqual(evenements[0]["categorie"], controle.CATEGORIE_RAPPORT)
+
+    def test_categorie_rapport_sur_rapport_illisible(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999")
+        report.path(tid, cid).write_text("pas du json du tout", encoding="utf-8")
+        with mock.patch.object(panes, "alive", return_value=True):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-bloquee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["categorie"], controle.CATEGORIE_RAPPORT)
+
+    def test_categorie_pane_mort_sur_blocage_par_pane_mort(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999", started_ago=999.0)
+        with mock.patch.object(panes, "alive", return_value=False), \
+             mock.patch.object(controle, "PANE_DEAD_GRACE_S", 1.0):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-bloquee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["categorie"], controle.CATEGORIE_PANE_MORT)
+        self.assertIn(controle.PANE_MORT_RAISON, evenements[0]["cause"])
+
+    def test_ne_double_journalise_pas_la_meme_tache_et_cause(self):
+        # Même garde-fou anti-répétition que derive-perimetre (derives_deja_journalisees)
+        # : un rapport qui reconfirme EXACTEMENT le même blocage, tour après tour, ne
+        # doit pas noyer le journal machine d'autant de faits identiques que de tours.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "blocked", "note": "même obstacle"})
+        controle.tick(cid)
+        self._write_report(tid, {"task": tid, "state": "blocked", "note": "même obstacle"})
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-bloquee")
+        self.assertEqual(len(evenements), 1)
+
+
+class TestTacheDebloquee(ControleTestCase):
+    """t-53 : le fait "tache-debloquee" s'écrit quand une tâche "blocked" en sort par un
+    des mécanismes que controle.py observe directement -- jamais par relance (cli.py, un
+    autre fichier, hors de son périmètre), qui mute state["running"] sans jamais passer
+    par tick()."""
+
+    def test_verbe_say_quand_un_rapport_leve_le_blocage(self):
+        # Séquence vécue trois fois sur t-31 (voir TestTickBlockedReportReread) :
+        # l'orchestratrice débloque par `ordo say`, l'exécutante reprend et écrit "done".
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["c1"])
+        self._set_task(tid, state="blocked", error="obstacle réel rencontré")
+        self._write_report(
+            tid, {"task": tid, "state": "done", "note": "fini", "checked": ["c1"], "touched": []}
+        )
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-debloquee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["cause"], "obstacle réel rencontré")
+        self.assertEqual(evenements[0]["verbe"], controle.VERBE_SAY)
+
+    def test_pas_de_tache_debloquee_si_le_rapport_reconfirme_le_blocage(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._set_task(tid, state="blocked", error="premier obstacle")
+        self._write_report(
+            tid, {"task": tid, "state": "blocked", "note": "toujours le même obstacle"}
+        )
+        controle.tick(cid)
+        self.assertEqual(journal.lire_evenements(cid, "tache-debloquee"), [])
+
+    def test_verbe_unblock_propagated_quand_la_dependance_redevient_saine(self):
+        cid = self._chantier()
+        a = self._task(cid, titre="a", checklist=["fait"])
+        b = self._task(cid, titre="b", depends_on=[a])
+        self._set_task(a, state="failed")
+        controle.tick(cid)  # b bloquée par propagation
+
+        chantier.check(a, "c1")
+        self._set_task(a, state="done", error=None)
+        controle.tick(cid)  # b levée
+
+        evenements = journal.lire_evenements(cid, "tache-debloquee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], b)
+        self.assertEqual(evenements[0]["cause"], f"dependency {a} dead (failed)")
+        self.assertEqual(evenements[0]["verbe"], controle.VERBE_UNBLOCK_PROPAGATED)
+
+
+class TestTacheCout(ControleTestCase):
+    """t-52 : le coût d'une tâche (jetons lus depuis son transcript via usage.pour) doit
+    s'écrire au journal machine dès qu'elle atteint un état terminal -- jumeau de
+    tache-terminee (t-51), sinon ce coût n'est plus récupérable une fois le transcript
+    disparu du disque."""
+
+    _JETONS = {"input": 10, "output": 20, "cacheCreation": 5, "cacheRead": 100,
+               "turns": 3, "dernierContexte": 40}
+
+    def test_tache_cout_journalise_sur_done(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "done", "note": "fini", "touched": []})
+        with mock.patch.object(controle.usage, "pour", return_value=self._JETONS):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-cout")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["input"], 10)
+        self.assertEqual(evenements[0]["output"], 20)
+        self.assertEqual(evenements[0]["cacheCreation"], 5)
+        self.assertEqual(evenements[0]["cacheRead"], 100)
+        self.assertEqual(evenements[0]["source"], "transcript")
+
+    def test_tache_cout_journalise_sur_blocage_par_pane_mort(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999", started_ago=999.0)
+        with mock.patch.object(panes, "alive", return_value=False), \
+             mock.patch.object(controle, "PANE_DEAD_GRACE_S", 1.0), \
+             mock.patch.object(controle.usage, "pour", return_value=self._JETONS):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-cout")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["source"], "transcript")
+
+    def test_tache_cout_transcript_introuvable_dit_source_explicite_jamais_zero(self):
+        # L'invariant du docstring de usage.py : l'absence se dit absente, jamais zéro.
+        # Aucun champ de jetons n'est écrit quand le transcript est introuvable -- un 0
+        # silencieux se lirait comme "cette tâche n'a rien consommé", ce qui est faux.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "done", "note": "fini", "touched": []})
+        with mock.patch.object(controle.usage, "pour", return_value=None):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "tache-cout")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["source"], "transcript introuvable")
+        self.assertNotIn("input", evenements[0])
+        self.assertNotIn("output", evenements[0])
+        self.assertNotIn("cacheCreation", evenements[0])
+        self.assertNotIn("cacheRead", evenements[0])
+
+    def test_tache_cout_ne_relit_pas_deux_fois_le_meme_transcript(self):
+        # Le brief interdit une seconde lecture du transcript : un seul appel à la
+        # fonction publique de usage.py pour écrire ce fait.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "done", "note": "fini", "touched": []})
+        with mock.patch.object(controle.usage, "pour", return_value=self._JETONS) as m:
+            controle.tick(cid)
+        m.assert_called_once()
+
+    def test_tache_cout_ecriture_jamais_bloquante(self):
+        # Même contrat que enregistrer_evenement (best-effort) : une lecture de transcript
+        # qui lève ne doit jamais faire tomber le tick qui vient de terminer une tâche.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(tid, {"task": tid, "state": "done", "note": "fini", "touched": []})
+        with mock.patch.object(controle.usage, "pour", side_effect=RuntimeError("boom")):
+            result = controle.tick(cid)
+        self.assertIsNone(result["chantiers"][cid]["error"])
+        self.assertEqual(store.load()["taches"][tid]["state"], "done")
+
+    def test_tache_cout_ne_double_journalise_pas_un_rapport_encore_blocked(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._set_task(tid, state="blocked", error="premier obstacle")
+        self._write_report(tid, {"task": tid, "state": "blocked", "note": "encore bloquée"})
+        with mock.patch.object(controle.usage, "pour", return_value=self._JETONS):
+            controle.tick(cid)
+        self.assertEqual(journal.lire_evenements(cid, "tache-cout"), [])
+
+
 class TestTickAnswerInjection(ControleTestCase):
     def test_reponse_injectee_dans_le_pane_reel_et_tache_reprend(self):
         cid = self._chantier()
@@ -820,6 +1069,174 @@ class TestTickAnswerInjection(ControleTestCase):
             q["id"], "q-99",
             "q-99 est numériquement plus ancienne que q-100, même si le tri texte les inverse",
         )
+
+
+class TestTickJournalMachineQuestions(ControleTestCase):
+    """t-54 : deux faits machine de plus, jumeaux du reste du journal machine (voir
+    TestTickJournalMachineCycleDeVie ci-dessus) mais pour le cycle de vie d'une
+    question "waiting" : sa création (étape 2, rapport "asking") et l'injection de sa
+    réponse dans le pane (étape 4). Les deux événements survivent déjà dans state.json
+    tant qu'il n'est jamais purgé, mais restent invisibles à qui ne relit que le
+    .jsonl -- même raisonnement que rapport-lu/tache-terminee (t-51)."""
+
+    def test_question_posee_journalisee_a_la_creation(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        self._write_report(
+            tid, {"task": tid, "state": "asking", "note": "", "question": "quelle valeur ?"}
+        )
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "question-posee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["question"], "quelle valeur ?")
+        self.assertFalse(evenements[0]["pourHumain"])
+
+    def test_question_posee_texte_tronque_a_200_caracteres(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid)
+        longue_question = "x" * 250
+        self._write_report(
+            tid, {"task": tid, "state": "asking", "note": "", "question": longue_question}
+        )
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "question-posee")
+        self.assertEqual(len(evenements[0]["question"]), 200)
+        self.assertEqual(evenements[0]["question"], longue_question[:200])
+
+    def test_reponse_injectee_journalisee(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        session, pane_id = self._real_pane()
+        self._make_running(tid, pane_id=pane_id)
+        with store.locked() as state:
+            task = state["taches"][tid]
+            task["state"] = "waiting"
+            qid = store.next_id(state, "question")
+            state["questions"][qid] = {
+                "id": qid, "chantier": cid, "tache": tid, "question": "combien ?",
+                "options": [], "pourHumain": False, "answer": "quarante-deux",
+                "askedAt": store.now(), "answeredAt": store.now(), "injectedAt": None,
+            }
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "reponse-injectee")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+        self.assertEqual(evenements[0]["question"], qid)
+        self.assertEqual(evenements[0]["reponse"], "quarante-deux")
+
+    def test_reponse_injectee_texte_tronque_a_200_caracteres(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        session, pane_id = self._real_pane()
+        self._make_running(tid, pane_id=pane_id)
+        longue_reponse = "y" * 250
+        with store.locked() as state:
+            task = state["taches"][tid]
+            task["state"] = "waiting"
+            qid = store.next_id(state, "question")
+            state["questions"][qid] = {
+                "id": qid, "chantier": cid, "tache": tid, "question": "combien ?",
+                "options": [], "pourHumain": False, "answer": longue_reponse,
+                "askedAt": store.now(), "answeredAt": store.now(), "injectedAt": None,
+            }
+        controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "reponse-injectee")
+        self.assertEqual(len(evenements[0]["reponse"]), 200)
+        self.assertEqual(evenements[0]["reponse"], longue_reponse[:200])
+
+    def test_pas_de_reponse_injectee_journalisee_sans_reponse(self):
+        # Garde-fou jumeau de test_waiting_sans_reponse_reste_en_attente ci-dessus :
+        # une question posée mais pas encore répondue ne doit produire aucun fait, le
+        # pane n'a rien reçu.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999")
+        with store.locked() as state:
+            state["taches"][tid]["state"] = "waiting"
+            qid = store.next_id(state, "question")
+            state["questions"][qid] = {
+                "id": qid, "chantier": cid, "tache": tid, "question": "combien ?",
+                "options": [], "pourHumain": False, "answer": None,
+                "askedAt": store.now(), "answeredAt": None, "injectedAt": None,
+            }
+        controle.tick(cid)
+        self.assertEqual(journal.lire_evenements(cid, "reponse-injectee"), [])
+
+
+class TestTickAttenteInteractive(ControleTestCase):
+    """t-54 (c6) : le journal machine dit QUAND une tâche s'est arrêtée d'avancer
+    (checklist-silent) mais rien n'y distingue jusqu'ici "bloquée sur un dialogue" de
+    "réfléchit longuement" -- mesuré en pratique sur t-57 (16 minutes de trou dues au
+    dialogue de confiance tmux, découvertes seulement par une lecture manuelle du
+    pane). Deux briques déjà existantes, aucune troisième : panes.busy() (t-25)
+    distingue occupé d'inerte, panes.TRUST_DIALOG_MARKERS (déjà lu par
+    _is_confiance_block au lancement) reconnaît le dialogue."""
+
+    def test_attente_interactive_journalisee_si_dialogue_et_pane_inerte(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%42")
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=False), \
+             mock.patch.object(panes, "capture", return_value="Quick safety check: ..."):
+            controle.tick(cid)
+        evenements = journal.lire_evenements(cid, "attente-interactive")
+        self.assertEqual(len(evenements), 1)
+        self.assertEqual(evenements[0]["tache"], tid)
+
+    def test_pas_dattente_interactive_si_pane_occupe(self):
+        # busy() rend True -> une session qui travaille réellement, même silencieuse
+        # à l'œil, n'est jamais confondue avec un dialogue bloquant.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%42")
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=True), \
+             mock.patch.object(panes, "capture", return_value="Quick safety check: ..."):
+            controle.tick(cid)
+        self.assertEqual(journal.lire_evenements(cid, "attente-interactive"), [])
+
+    def test_pas_dattente_interactive_sans_marqueur_de_dialogue(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%42")
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=False), \
+             mock.patch.object(panes, "capture", return_value="rien de special ici"):
+            controle.tick(cid)
+        self.assertEqual(journal.lire_evenements(cid, "attente-interactive"), [])
+
+    def test_attente_interactive_ne_se_reecrit_pas_tant_que_le_dialogue_persiste(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%42")
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=False), \
+             mock.patch.object(panes, "capture", return_value="Quick safety check: ..."):
+            controle.tick(cid)
+            controle.tick(cid)
+        self.assertEqual(len(journal.lire_evenements(cid, "attente-interactive")), 1)
+
+    def test_attente_interactive_redeclenche_apres_resolution(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%42")
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=False), \
+             mock.patch.object(panes, "capture", return_value="Quick safety check: ..."):
+            controle.tick(cid)
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=True), \
+             mock.patch.object(panes, "capture", return_value="esc to interrupt"):
+            controle.tick(cid)
+        with mock.patch.object(panes, "alive", return_value=True), \
+             mock.patch.object(panes, "busy", return_value=False), \
+             mock.patch.object(panes, "capture", return_value="Quick safety check: ..."):
+            controle.tick(cid)
+        self.assertEqual(len(journal.lire_evenements(cid, "attente-interactive")), 2)
 
 
 class TestTickPropagation(ControleTestCase):

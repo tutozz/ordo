@@ -38,6 +38,23 @@ PANE_DEAD_GRACE_S = 30.0
 # prefixe est un contrat interne a ce module : lui seul l'ecrit, lui seul le relit.
 PANE_MORT_RAISON = "dead pane, no report received"
 
+# Catégorie du fait "tache-bloquee" (t-53), déduite du point d'émission qui l'écrit --
+# jamais d'un parsing du texte de cause, que l'exécutante peut reformuler librement. Un
+# seul appelant écrit chacune : le pane mort ci-dessus pour CATEGORIE_PANE_MORT, la
+# relecture de rapport (rapport illisible ou explicitement "blocked") pour
+# CATEGORIE_RAPPORT.
+CATEGORIE_PANE_MORT = "pane-mort"
+CATEGORIE_RAPPORT = "rapport"
+
+# Verbe déclencheur du fait "tache-debloquee" (t-53), même logique : déduit du point
+# d'émission, jamais du texte. VERBE_SAY couvre la relecture de rapport (le seul chemin
+# qui lève un blocage sans passer par cli.py, typiquement une reprise après `ordo say`) ;
+# VERBE_UNBLOCK_PROPAGATED couvre chantier.unblock_propagated(). Un troisième verbe,
+# "relance" (cmd_relaunch), mute task["state"] directement dans cli.py sans jamais passer
+# par ce module : hors de portée de ce fichier, donc absent d'ici.
+VERBE_SAY = "say"
+VERBE_UNBLOCK_PROPAGATED = "unblock_propagated"
+
 # Prefixe exact ecrit par chantier.propagate_failures() (voir ordo/chantier.py :
 # task["error"] = f"dependency {dep_id} dead ({dep['state']})"). Sert a exclure les
 # blocages en cascade de wake_reasons() : la tache dont la mort a declenche la cascade a
@@ -94,6 +111,14 @@ def _elapsed_seconds(iso_ts: str | None) -> float | None:
     if dt is None:
         return None
     return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+def _horodatage(epoch: float) -> str:
+    """Convertit un timestamp epoch (ex. mtime d'un fichier) au même format que
+    store.now() : ISO 8601 UTC, suffixe Z, sans microsecondes. Sert au fait machine
+    "rapport-lu" (t-51) pour rendre son "ecrit_at" directement comparable au "at"
+    du tick, sans reparsing côté lecteur."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _sorted_tasks(state: dict, chantier_id: str) -> list[dict]:
@@ -592,6 +617,34 @@ def _question_a_injecter(state: dict, task_id: str) -> dict | None:
     return min(candidates, key=lambda q: _num_id(q["id"]))
 
 
+def _journaliser_cout(chantier_id: str, task: dict) -> None:
+    """Écrit le fait machine "tache-cout" (t-52) au moment où une tâche atteint un état
+    terminal : les jetons consommés, lus une seule fois via usage.pour -- la même fonction
+    publique que la carte, jamais une seconde lecture du transcript -- sinon perdus dès
+    que le transcript disparaît du disque, une fois la tâche terminée.
+
+    Même invariant que le docstring de usage.py : l'absence se dit absente, jamais zéro.
+    Aucun champ de jetons n'est écrit quand le transcript est introuvable ; "source" le
+    dit explicitement plutôt que de laisser un 0 se lire comme "rien consommé".
+
+    Best-effort, jamais bloquant (même contrat que enregistrer_evenement) : protégé ici
+    même, au plus près de l'appel à usage.pour qui peut lire un disque en mauvais état,
+    plutôt que de compter sur la protection déjà en place plus haut, côté tick().
+    """
+    with suppress(Exception):
+        jetons = usage.pour(task)
+        champs = (
+            {"input": jetons["input"], "output": jetons["output"],
+             "cacheCreation": jetons["cacheCreation"], "cacheRead": jetons["cacheRead"]}
+            if jetons is not None else {}
+        )
+        journal.enregistrer_evenement(
+            chantier_id, "tache-cout", tache=task["id"],
+            source="transcript" if jetons is not None else "transcript introuvable",
+            **champs,
+        )
+
+
 def _tick_one(chantier_id: str) -> list[str]:
     """Etapes 2 a 8 de tick() pour UN chantier. Leve sur toute anomalie inattendue ;
     l'appelant (tick()) capture cette levee sans laisser un chantier casse empecher la
@@ -629,11 +682,17 @@ def _tick_one(chantier_id: str) -> list[str]:
     # sans risque de réappliquer un rapport périmé.
     blocked_tasks = [t for t in _sorted_tasks(state, chantier_id) if t["state"] == "blocked"]
     report_raw: dict[str, str] = {}
+    # mtime du fichier au moment de la LECTURE (fait machine t-51, "rapport-lu") : le
+    # capturer ici, jamais après report.apply() plus bas, qui supprime le fichier
+    # (clear()) une fois le rapport appliqué -- déjà sur disque, ce n'est pas une
+    # nouvelle mesure, seulement une conversion vers le format horodatage de store.now().
+    report_mtime: dict[str, str] = {}
     pane_alive: dict[str, bool] = {}
     for t in running + waiting_tasks + blocked_tasks:
         rp = report.path(t["id"], t["chantier"])
         if rp.exists():
             report_raw[t["id"]] = rp.read_text(encoding="utf-8")
+            report_mtime[t["id"]] = _horodatage(rp.stat().st_mtime)
     # L'état du pane ne sert qu'à l'étape 3 (pane mort -> blocked), qui ne concerne QUE
     # les tâches "running" : une tâche "waiting" protège son pane, il ne doit jamais être
     # jugé mort ni relancé depuis ce module (voir étape 3 plus bas).
@@ -641,12 +700,48 @@ def _tick_one(chantier_id: str) -> list[str]:
         pane_id = t.get("paneId")
         if pane_id:
             pane_alive[t["id"]] = panes.alive(pane_id)
+    # Fait machine "attente-interactive" (t-54, c6) : détecté ICI, hors verrou, même
+    # raisonnement que pane_alive juste au-dessus -- busy() et capture() sont des
+    # appels tmux. Deux briques déjà existantes, aucune troisième : panes.busy() (t-25)
+    # distingue occupé d'inerte, panes.TRUST_DIALOG_MARKERS (déjà lu par
+    # _is_confiance_block au lancement) reconnaît le dialogue de confiance tmux. Le
+    # coût reste borné aux panes inertes : busy() court-circuite avant toute capture
+    # supplémentaire pour le cas courant (une session qui travaille réellement).
+    # Best-effort (même contrat que le reste du journal machine) : un pane disparu
+    # entre la lecture de pane_alive et cet appel, ou tout autre échec tmux, ne doit
+    # jamais faire échouer TOUT le tick -- bug réel trouvé et corrigé pendant ce
+    # chantier, une exception ici empêchait même l'étape 2 (lecture du rapport) de
+    # s'exécuter (voir tests/test_controle.py, TestTickReportFirst).
+    dialogue_bloque: dict[str, bool] = {}
+    for t in running:
+        pane_id = t.get("paneId")
+        if not pane_id or not pane_alive.get(t["id"]):
+            continue
+        with suppress(RuntimeError):
+            if panes.busy(pane_id):
+                continue
+            tail = panes.capture(pane_id, lines=20)
+            dialogue_bloque[t["id"]] = any(m in tail for m in panes.TRUST_DIALOG_MARKERS)
 
     to_send: list[tuple[str, str]] = []
 
     with store.locked() as state:
         if chantier_id not in state["chantiers"]:
             raise ControleError(f"campaign not found: {chantier_id}")
+
+        # Garde-fou anti-répétition (t-53), jumeau exact de derives_deja_journalisees
+        # (étape 7 plus bas) : un rapport qui reconfirme EXACTEMENT la même cause, tour
+        # après tour, ne doit pas noyer le journal machine d'autant de faits identiques
+        # que de tours écoulés. Lus une fois ici pour tout le tick, mis à jour au fil des
+        # écritures ci-dessous pour couvrir aussi un doublon au sein d'un même tick.
+        bloquees_deja_journalisees = {
+            (e.get("tache"), e.get("cause"))
+            for e in journal.lire_evenements(chantier_id, "tache-bloquee")
+        }
+        debloquees_deja_journalisees = {
+            (e.get("tache"), e.get("cause"))
+            for e in journal.lire_evenements(chantier_id, "tache-debloquee")
+        }
 
         # Étape 2 (I2) : le rapport est lu EN PREMIER. S'il est présent, il tranche
         # seul ; l'étape 3 ci-dessous ne regarde jamais le pane d'une tâche déjà
@@ -669,6 +764,20 @@ def _tick_one(chantier_id: str) -> list[str]:
             # basculer -- report.apply() ne rend qu'une liste de phrases toutes faites,
             # jamais les identifiants cochés sous une forme réutilisable ici.
             coches_avant = {item["id"] for item in task["checklist"] if item["done"]}
+            etat_avant = task["state"]
+            # Capturée AVANT report.apply() (t-53), qui mute task["error"] en place : la
+            # cause du blocage qu'un rapport "done" est en train de lever ne se lit donc
+            # qu'ICI, jamais après l'appel (même piège que cmd_relaunch en cli.py, voir
+            # sa docstring).
+            cause_avant = task.get("error")
+            # Fait machine (t-51) : datation de la LECTURE elle-même, au moment précis où
+            # report.apply() va consommer le fichier -- ecrit_at vient de report_mtime
+            # (capturé plus haut, avant que apply() ne supprime le fichier via clear()),
+            # "at" reste le défaut (l'instant du tick), leur écart est ce que ce fait sert
+            # à mesurer.
+            journal.enregistrer_evenement(
+                chantier_id, "rapport-lu", tache=t["id"], ecrit_at=report_mtime.get(t["id"]),
+            )
             events.extend(report.apply(state, t["id"], raw))
             fresh = state["taches"][t["id"]]
             coches_apres = {item["id"] for item in fresh["checklist"] if item["done"]}
@@ -678,10 +787,39 @@ def _tick_one(chantier_id: str) -> list[str]:
                     at=fresh["lastReportAt"],
                 )
             if fresh["state"] == "blocked" and fresh.get("error"):
+                cle = (t["id"], fresh["error"])
+                if cle not in bloquees_deja_journalisees:
+                    journal.enregistrer_evenement(
+                        chantier_id, "tache-bloquee", tache=t["id"], cause=fresh["error"],
+                        categorie=CATEGORIE_RAPPORT, at=fresh["lastReportAt"],
+                    )
+                    bloquees_deja_journalisees.add(cle)
+            # Fait machine (t-53) : le seul chemin, dans ce module, où une tâche "blocked"
+            # repasse active sans passer par cli.py -- une exécutante débloquée par
+            # `ordo say` qui reprend et écrit un rapport "done" (voir docstring de la
+            # classe TestTickBlockedReportReread côté tests). Jamais "waiting" ici : une
+            # tâche bloquée qui se met à poser une question n'est pas débloquée, elle
+            # reste en attente d'un humain.
+            if etat_avant == "blocked" and fresh["state"] in ("running", "done"):
+                cle = (t["id"], cause_avant)
+                if cle not in debloquees_deja_journalisees:
+                    journal.enregistrer_evenement(
+                        chantier_id, "tache-debloquee", tache=t["id"], cause=cause_avant,
+                        verbe=VERBE_SAY, at=fresh["lastReportAt"],
+                    )
+                    debloquees_deja_journalisees.add(cle)
+            if fresh["state"] in ("done", "blocked") and fresh["state"] != etat_avant:
+                # Fait machine (t-51) : une VRAIE transition vers un état terminal, jamais
+                # un rapport qui reconfirme un état déjà terminal (garde-fou jumeau de
+                # deja_coche dans cmd_check -- sinon un second rapport "encore blocked"
+                # fausserait toute mesure de durée entre lancement et terminaison).
                 journal.enregistrer_evenement(
-                    chantier_id, "tache-bloquee", tache=t["id"], cause=fresh["error"],
+                    chantier_id, "tache-terminee", tache=t["id"], etat=fresh["state"],
                     at=fresh["lastReportAt"],
                 )
+                # Fait machine (t-52) : le coût de la tâche, jumeau de tache-terminee
+                # ci-dessus -- écrit à la même transition, jamais recalculé plus tard.
+                _journaliser_cout(chantier_id, fresh)
             if fresh["state"] == "waiting":
                 # Piege connu : report.apply() fait passer la tache en "waiting" mais
                 # ne cree AUCUNE entree dans state["questions"]. C'est le travail de
@@ -703,6 +841,15 @@ def _tick_one(chantier_id: str) -> list[str]:
                     "injectedAt": None,
                 }
                 events.append(f"{qid} created for {t['id']}")
+                # Fait machine (t-54) : la question elle-même n'était visible que dans
+                # state["questions"], invisible à qui ne relit que le .jsonl et sans
+                # garantie de survivre à un futur archivage. Texte tronqué à 200
+                # caractères, même contrat que les autres textes libres du journal
+                # machine (voir cmd_amend en cli.py, ancien_prompt[:200]).
+                journal.enregistrer_evenement(
+                    chantier_id, "question-posee", tache=t["id"],
+                    question=str(question_text or "")[:200], pourHumain=False,
+                )
 
         # Etape 3 : pane mort au-dela du delai SANS rapport -> blocked. Un pane vivant
         # mais inactif n'est pas un echec, c'est un tour fini sans signal ; on ne fait
@@ -736,9 +883,28 @@ def _tick_one(chantier_id: str) -> list[str]:
                 # discriminant blockedCause).
                 task["blockedCause"] = None
                 events.append(f"{t['id']} blocked: {raison}")
+                # cle jamais vue ici en pratique (elapsed et pane_id varient à chaque
+                # occurrence, garde plus haut dans le commentaire de tache-terminee) :
+                # le garde-fou est ajouté quand même, pour que "tache-bloquee" porte la
+                # même protection à ses deux points d'émission, quelle que soit lequel.
+                cle = (t["id"], raison)
+                if cle not in bloquees_deja_journalisees:
+                    journal.enregistrer_evenement(
+                        chantier_id, "tache-bloquee", tache=t["id"], cause=raison,
+                        categorie=CATEGORIE_PANE_MORT,
+                    )
+                    bloquees_deja_journalisees.add(cle)
+                # Fait machine (t-51) : cette boucle ne traite QUE des tâches encore
+                # "running" (garde plus haut), la transition vers "blocked" est donc
+                # toujours réelle ici -- aucun garde-fou de déduplication à reproduire,
+                # contrairement à la relecture de rapport ci-dessus.
                 journal.enregistrer_evenement(
-                    chantier_id, "tache-bloquee", tache=t["id"], cause=raison,
+                    chantier_id, "tache-terminee", tache=t["id"], etat="blocked",
                 )
+                # Fait machine (t-52) : le coût de la tâche, jumeau de tache-terminee
+                # ci-dessus -- même garde (boucle "running" uniquement), même absence de
+                # déduplication à reproduire.
+                _journaliser_cout(chantier_id, task)
 
         # Étape 3.5 : cache de silence de checklist, maintenu ICI et nulle part
         # ailleurs -- wake_reasons() (famille "checklist-silent") ne fait que le
@@ -767,6 +933,27 @@ def _tick_one(chantier_id: str) -> list[str]:
         for perime in [tid for tid in watch if tid not in still_running]:
             del watch[perime]
 
+        # Étape 3.6 (t-54, c6) : fait "attente-interactive", même geste de cache que
+        # checklistWatch juste au-dessus (dialogueWatch) -- un seul fait par épisode
+        # de blocage, jamais un par tick tant que le dialogue reste affiché. Le cache
+        # s'efface dès que le dialogue disparaît (résolu par un humain, ou le pane
+        # redevient occupé), pour qu'une récidive future redéclenche un fait frais
+        # plutôt que de rester silencieuse pour toujours.
+        dialogue_watch = ch.setdefault("dialogueWatch", {})
+        toujours_bloquees = set()
+        for t in running:
+            task = state["taches"].get(t["id"])
+            if task is None or task["state"] != "running" or not dialogue_bloque.get(t["id"]):
+                continue
+            toujours_bloquees.add(t["id"])
+            if t["id"] not in dialogue_watch:
+                dialogue_watch[t["id"]] = True
+                journal.enregistrer_evenement(
+                    chantier_id, "attente-interactive", tache=t["id"],
+                )
+        for perime in [tid for tid in dialogue_watch if tid not in toujours_bloquees]:
+            del dialogue_watch[perime]
+
         # Etape 4 : tache waiting dont la question est repondue -> reponse injectee
         # dans le pane (envoi effectif fait hors verrou, ci-dessous), tache reprise.
         waiting = [tt for tt in _sorted_tasks(state, chantier_id) if tt["state"] == "waiting"]
@@ -781,6 +968,14 @@ def _tick_one(chantier_id: str) -> list[str]:
             q["injectedAt"] = store.now()
             task["state"] = "running"
             events.append(f"{task['id']} resumes, answer injected")
+            # Fait machine (t-54) : jumeau de "question-posee" ci-dessus, pour
+            # l'autre bout du cycle -- l'injection elle-même n'était visible que dans
+            # state["questions"]["injectedAt"]. Réponse tronquée à 200 caractères,
+            # même contrat que question-posee.
+            journal.enregistrer_evenement(
+                chantier_id, "reponse-injectee", tache=task["id"], question=q["id"],
+                reponse=str(q["answer"] or "")[:200],
+            )
 
         # Etape 5. propagate_failures() confine desormais sa cascade au seul chantier
         # vise (point F du contrat, decision cote chantier.py) : call site mis a jour
@@ -795,8 +990,26 @@ def _tick_one(chantier_id: str) -> list[str]:
         # n'etait jamais leve. Ne touche jamais une tache bloquee pour sa propre raison
         # (pane mort, rapport illisible, dialogue de confiance) : voir le discriminant
         # blockedCause dans chantier.unblock_propagated().
+        # Capturées AVANT l'appel (t-53) : unblock_propagated() remet task["error"] à
+        # None pour chaque tâche qu'elle débloque -- la cause du blocage qu'on journalise
+        # plus bas ne se lit donc qu'ICI, jamais après (même piège que cause_avant,
+        # étape 2 ci-dessus, et que cmd_relaunch en cli.py).
+        causes_avant_deblocage = {
+            tid: t.get("error")
+            for tid, t in state["taches"].items()
+            if t["chantier"] == chantier_id and t["state"] == "blocked"
+        }
         unblocked = chantier.unblock_propagated(state)
         events.extend(f"{tid} unblocked: dependency(ies) healthy again" for tid in unblocked)
+        for tid in unblocked:
+            cause = causes_avant_deblocage.get(tid)
+            cle = (tid, cause)
+            if cle not in debloquees_deja_journalisees:
+                journal.enregistrer_evenement(
+                    chantier_id, "tache-debloquee", tache=tid, cause=cause,
+                    verbe=VERBE_UNBLOCK_PROPAGATED,
+                )
+                debloquees_deja_journalisees.add(cle)
 
     # Envois reels hors verrou (I6 : deux appels tmux separes, geres par panes.send()).
     for pane_id, texte in to_send:

@@ -7,6 +7,22 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- The served page becomes a **wall**: one column per campaign, side by side, across
+  projects. `+ colonne` adds one, the dropdown at the top of a column changes which
+  campaign it shows, `×` closes it, and the layout is remembered, so a spare monitor in
+  full screen holds every project at once. Following two campaigns used to mean two tabs
+  and a round trip, which is exactly the gesture a dashboard exists to remove.
+- Each column is a page of its own, served at `/panel`, that polls for itself. A column
+  that refreshes therefore leaves its neighbours untouched: the open task, the scroll
+  position and the search of the columns next to it survive. Their reading state is
+  partitioned per campaign, and a reopened wall restores each column where it was left.
+- Every card now carries **the model that will run the task**: solid when it was actually
+  imposed at launch, dashed when it is still `routage`'s forecast for the next launch,
+  escalation from past attempts included. A task already launched with no model imposed
+  reads `defaut` rather than a forecast, because predicting a model that did not run would
+  be inventing one. The reason for the call is one hover away, and the model is in the
+  task's facts.
+
 - `ordo/routage.py` picks each executor's model from the task itself, instead of letting
   every session inherit whatever Claude Code defaults to - which is the most expensive
   model, for applying a brief that has already been written and arbitrated. Ordered rules,

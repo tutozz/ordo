@@ -20,6 +20,7 @@ from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -190,6 +191,29 @@ class TestServeurVivant(ServeurVivantTestCase):
     def test_la_racine_sert_la_page(self):
         corps = self._get("/").read().decode("utf-8")
         self.assertTrue(corps.lstrip().lower().startswith("<!doctype html>"))
+
+    def test_la_racine_sert_le_mur_des_colonnes(self):
+        # La racine est l'adresse mise en favori : c'est elle qui doit ouvrir sur tous les
+        # chantiers a la fois, pas sur un seul avec un menu pour changer.
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn('id="cols"', corps)
+        self.assertIn('id="plus"', corps)
+
+    def test_une_colonne_se_sert_avec_son_home_et_son_chantier(self):
+        data = json.loads(self._get("/api/state").read())
+        c = data["campaigns"][0]
+        url = f"/panel?home={quote(c['home'])}&campaign={quote(c['id'])}"
+        corps = self._get(url).read().decode("utf-8")
+        self.assertTrue(corps.lstrip().lower().startswith("<!doctype html>"))
+        self.assertIn(c["id"], corps)
+        self.assertIn('id="board"', corps)
+
+    def test_une_colonne_sans_chantier_est_refusee(self):
+        # Une colonne sans cible interrogerait /api/map avec une campagne vide et
+        # afficherait une page morte sans jamais dire pourquoi.
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self._get("/panel")
+        self.assertEqual(cm.exception.code, 400)
 
     def test_l_etat_liste_les_chantiers_de_tous_les_homes_enregistres(self):
         b = self._home_avec_chantier("b")

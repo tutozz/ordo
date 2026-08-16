@@ -334,6 +334,21 @@ class _Handler(BaseHTTPRequestHandler):
         if route.path in ("/", "/index.html"):
             self._envoyer(200, carte.page().encode("utf-8"), "text/html; charset=utf-8")
             return
+        if route.path == "/panel":
+            # Une colonne du mur. Elle ne porte aucune donnee : elle recoit sa cible ici et
+            # va lire /api/map elle-meme, ou le controle du registre a bien lieu. Refuser
+            # une cible vide plutot que servir la page : sans campagne, la colonne
+            # interrogerait /api/map dans le vide et resterait grise sans dire pourquoi.
+            home = (params.get("home") or [""])[0]
+            campaign = (params.get("campaign") or [""])[0]
+            if not home or not campaign:
+                self._json(400, {"error": "panel needs home and campaign"})
+                return
+            self._envoyer(
+                200, carte.panneau(home, campaign).encode("utf-8"),
+                "text/html; charset=utf-8",
+            )
+            return
         if route.path == "/api/state":
             self._json(200, snapshot())
             return

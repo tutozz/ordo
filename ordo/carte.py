@@ -53,7 +53,7 @@ import re
 import time
 from collections.abc import Callable
 
-from . import chantier, journal, store, usage
+from . import chantier, journal, routage, store, usage
 
 # Coupe du titre dans une tuile : largeur en caracteres, nombre de lignes gardees. Le
 # titre entier reste lisible en infobulle et dans le panneau de detail, donc rien n'est
@@ -188,6 +188,30 @@ def _groupes_declares(ch: dict) -> dict[str, dict]:
         else:
             declares[cle] = {"label": str(valeur), "why": ""}
     return declares
+
+
+def _modele(task: dict) -> tuple[str, str, bool]:
+    """(modele, motif, predit) d'une tache. `predit` dit que personne ne l'a encore lancee.
+
+    Trois cas, et le troisieme est celui qui merite d'etre nomme.
+
+    Une tache deja lancee porte le modele qu'on lui a impose : c'est un fait mesure, il
+    prime sur tout calcul. Une tache jamais lancee n'en a pas, donc la carte annonce celui
+    que routage.pour_lancement retiendra, ESCALADE DES TENTATIVES COMPRISE -- sans elle la
+    case promettrait haiku la ou le prochain lancement partira sur opus, et c'est
+    exactement au moment d'une reprise qu'on regarde ce chiffre.
+
+    Une tache lancee avec `--model herite` n'a ni l'un ni l'autre : claude a applique sa
+    propre configuration. Lui recoller la prediction du routage inventerait apres coup un
+    modele qui n'a pas tourne.
+    """
+    impose = task.get("model")
+    if impose:
+        return impose, "modele impose a son lancement", False
+    if task.get("startedAt"):
+        return "defaut", "lancee sans modele impose : celui de claude a servi", False
+    modele, motif = routage.pour_lancement(None, task)
+    return modele or "defaut", motif, True
 
 
 def _blocking_reasons(task: dict, tasks: dict[str, dict]) -> list[dict]:
@@ -374,6 +398,7 @@ def model(
         rapport = t.get("report") if isinstance(t.get("report"), dict) else {}
         blocked_by = _blocking_reasons(t, tasks)
         pane_id = t.get("paneId")
+        modele, motif_modele, modele_predit = _modele(t)
         nodes[tid] = {
             "id": tid,
             "titre": t["titre"],
@@ -389,6 +414,9 @@ def model(
             "paneId": pane_id,
             "paneAlive": None if (alive is None or not pane_id) else bool(alive(pane_id)),
             "attempts": t.get("attempts", 0),
+            "model": modele,
+            "modelWhy": motif_modele,
+            "modelPredit": modele_predit,
             "priority": t.get("priority", 0),
             "createdAt": t.get("createdAt"),
             "startedAt": t.get("startedAt"),
@@ -566,6 +594,7 @@ def _facts(node: dict, jetons: dict | None = None) -> dict:
     """
     faits = {
         "zones": ", ".join(node["touches"]) or "-",
+        "modele": node["model"],
         "niveau": str(node["level"]),
         "depend de": " ".join(node["deps"]) or "-",
         "debloque": " ".join(node["dependants"]) or "-",
@@ -626,6 +655,12 @@ def vue(m: dict) -> dict:
             # nulle, alors que la tache n'a simplement pas commence.
             "duree": _duree(node["elapsedS"]) if node["elapsedS"] is not None else "",
             "elapsedS": node["elapsedS"],
+            # Le modele sort a part de facts pour la meme raison que la duree : il se lit
+            # SANS ouvrir la tache. C'est lui qui dit s'il faut relire le brief avant de
+            # lancer, et le relire apres coup ne sert plus a rien.
+            "model": node["model"],
+            "modelWhy": node["modelWhy"],
+            "modelPredit": node["modelPredit"],
             "tokens": usage.court(jetons["output"]) if jetons else "",
             "facts": _facts(node, jetons),
             "deps": node["deps"],
@@ -788,6 +823,15 @@ transition:opacity .12s,border-color .12s}
 .rhead{display:flex;align-items:baseline;gap:7px}
 .rid{font-size:10.5px;font-weight:600;color:#9aa4b1;flex:none}
 .rst{font-size:10px;font-weight:500}
+/* Le modele de l'executante, sur la case. Trait plein quand il a reellement tourne,
+   pointille quand ce n'est encore qu'une prevision du routage : la difference entre un
+   fait et un pronostic doit se voir sans lire le mot. */
+.mdl{font-size:9.5px;font-weight:600;letter-spacing:.03em;border:1px solid var(--line);
+border-radius:4px;padding:0 4px;color:var(--dim2);flex:none}
+.mdl.haiku{color:#7fb08a;border-color:#2c4d35}
+.mdl.sonnet{color:#6fa8dc;border-color:#274a68}
+.mdl.opus{color:#b892e0;border-color:#453060}
+.mdl.predit{border-style:dashed;opacity:.75}
 .rlinks{margin-left:auto;flex:none;display:flex;gap:7px;font-size:10px}
 .row.focus .rlinks{font-size:12px;font-weight:600}
 .nup{color:var(--up)}.ndown{color:var(--down)}.nnone{color:#3a4049}
@@ -872,6 +916,13 @@ _JS = r"""
 var D=null, S={sel:null,hover:null,q:"",filter:"reste",closed:{},docs:{},view:"graphe"};
 var byId={};
 
+// Cle de stockage propre a la colonne. sessionStorage est commun a TOUTE l'origine, et le
+// mur ouvre plusieurs colonnes dans cette meme origine : sans ce prefixe, ouvrir une tache
+// dans une colonne l'ouvrirait dans les autres, et la derniere chargee ecraserait le
+// defilement des precedentes. En page de fichier, ORDO_NS n'existe pas et les cles
+// retrouvent exactement leur nom d'avant.
+function K(n){return "ordo-"+n+(window.ORDO_NS||"")}
+
 // Point d'entree unique du rendu, appele au chargement en mode fichier et a chaque
 // battement en mode serveur. L'ETAT DE LECTURE NE BOUGE PAS : ni le defilement, ni la
 // tache ouverte, ni la recherche, ni les phases repliees, parce que tout cela vit dans S
@@ -884,6 +935,14 @@ window.ordoSetData=function(data){
   var y=window.scrollY;
   render();
   if(window.scrollY!==y)window.scrollTo(0,y);
+};
+
+// Le defilement ne se restaure qu'APRES un rendu : avant, la page n'a pas encore sa
+// hauteur et scrollTo ne va nulle part. En mode fichier ce rendu a lieu au chargement ; en
+// colonne, il a lieu a la premiere reponse du serveur, que ce module ne voit pas. D'ou la
+// fonction exposee plutot qu'un appel en dur ici.
+window.ordoRestoreScroll=function(){
+  try{var y=sessionStorage.getItem(K("scroll"));if(y)window.scrollTo(0,+y)}catch(e){}
 };
 
 function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;
@@ -929,7 +988,7 @@ function chip(id,parent){
 
 function select(id){
   S.sel=(S.sel===id)?null:id;
-  try{sessionStorage.setItem("ordo-sel",S.sel||"")}catch(e){}
+  try{sessionStorage.setItem(K("sel"),S.sel||"")}catch(e){}
   render();
   if(!S.sel)return;
   var r=document.querySelector('[data-row="'+id+'"]');
@@ -950,6 +1009,17 @@ function rowNode(t){
   head.appendChild(el("span","rid m",t.id));
   var st=el("span","rst",LAB[k]);st.style.color=(k==="queued")?"#6d7683":COL[k];
   head.appendChild(st);
+  if(t.model){
+    // La teinte ne se prend QUE dans cette table. t.model vient de l'etat, donc d'un
+    // --model tape a la main : le poser tel quel en classe laisserait ecrire n'importe
+    // quel nom de classe de la feuille de style depuis un lancement.
+    var connu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
+    var md=el("span","mdl m"+connu+(t.modelPredit?" predit":""),t.model);
+    // title est une propriete, jamais du balisage : un motif de routage y passe sans
+    // risque, et c'est la que se conteste le choix du modele.
+    md.title=(t.modelPredit?"prévu : ":"")+(t.modelWhy||"");
+    head.appendChild(md);
+  }
   var links=el("span","rlinks m");
   // Duree et jetons AVANT les liens, et toujours visibles : ce sont les deux chiffres
   // qu'on lit pendant qu'une tache tourne, c'est-a-dire au seul moment ou on la regarde.
@@ -1172,7 +1242,7 @@ function paintTop(){
     if(D.warnings.length){wc.style.cursor="pointer";wc.style.borderColor="#63541f";
       wc.style.color="#e3b341"}
     var cache=false;
-    try{cache=sessionStorage.getItem("ordo-warn")==="1"}catch(e){}
+    try{cache=sessionStorage.getItem(K("warn"))==="1"}catch(e){}
     wb.hidden=!D.warnings.length||cache;
   }
   var bouts=["survol = liens · clic = détail · échap = fermer"];
@@ -1250,16 +1320,16 @@ document.getElementById("q").addEventListener("input",function(e){S.q=e.target.v
   document.getElementById("v-"+v).addEventListener("click",function(){S.view=v;render()})});
 var wb=document.getElementById("warn"),wc=document.getElementById("warnchip");
 if(wb&&wc){wc.addEventListener("click",function(){
-  wb.hidden=!wb.hidden;try{sessionStorage.setItem("ordo-warn",wb.hidden?"1":"0")}catch(e){}});
-  try{if(sessionStorage.getItem("ordo-warn")==="1")wb.hidden=true}catch(e){}}
+  wb.hidden=!wb.hidden;try{sessionStorage.setItem(K("warn"),wb.hidden?"1":"0")}catch(e){}});
+  try{if(sessionStorage.getItem(K("warn"))==="1")wb.hidden=true}catch(e){}}
 window.addEventListener("keydown",function(e){if(e.key==="Escape"&&S.sel){S.sel=null;render()}});
 window.addEventListener("resize",draw);
-try{var last=sessionStorage.getItem("ordo-sel");if(last)S.sel=last}catch(e){}
+try{var last=sessionStorage.getItem(K("sel"));if(last)S.sel=last}catch(e){}
 window.addEventListener("scroll",function(){
-  try{sessionStorage.setItem("ordo-scroll",window.scrollY)}catch(e){}});
+  try{sessionStorage.setItem(K("scroll"),window.scrollY)}catch(e){}});
 if(window.ORDO){
   window.ordoSetData(window.ORDO);
-  try{var y0=sessionStorage.getItem("ordo-scroll");if(y0)window.scrollTo(0,+y0)}catch(e){}
+  window.ordoRestoreScroll();
 }
 })();
 """.strip()
@@ -1328,93 +1398,323 @@ def html(m: dict, interval: int = 0) -> str:
 """
 
 
-# Intervalle de battement de la page servie, en secondes. Trois secondes est l'ordre de
+# Intervalle de battement des pages servies, en secondes. Trois secondes est l'ordre de
 # grandeur d'un changement d'etat reel ; plus court ferait travailler le serveur pour rien,
 # puisque le redessin n'a lieu que si l'empreinte a bouge.
 POLL_S = 3
 
-_PICKER_CSS = """
-#picker{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:8px}
-#picker select{background:var(--panel);border:1px solid var(--line);border-radius:6px;
-color:var(--txt);font:inherit;font-size:12px;padding:4px 8px;outline:none;max-width:52vw}
-#picker select:focus{border-color:#2f6ba8}
-#picker .tag{font-size:10.5px;color:var(--dim2);border:1px solid var(--line);
-border-radius:20px;padding:2px 8px}
-#picker .tag.live{border-color:#63541f;color:#d3a03a}
-#picker .tag.err{border-color:#5a2f2f;color:#e05252}
+
+# ---------------------------------------------------------------------------
+# Le mur : une colonne par chantier, cote a cote, sur un seul ecran
+# ---------------------------------------------------------------------------
+#
+# La page servie montrait UN chantier avec un menu pour en changer. Suivre deux projets
+# demandait alors deux onglets et un aller-retour a chaque fois, ce qui est exactement le
+# geste qu'un tableau de bord existe pour supprimer.
+#
+# Le mur est donc un CADRE, et rien d'autre : il ne porte aucune donnee de chantier. Chaque
+# colonne est une page a part entiere, dans une iframe, qui va chercher son etat elle-meme
+# et se redessine sur son propre rythme. Ce choix a une consequence qui vaut a lui seul le
+# procede : une colonne qui se rafraichit ne touche pas les autres, donc la tache ouverte,
+# le defilement et la recherche des colonnes voisines survivent.
+#
+# L'autre solution -- instancier N fois le rendu dans une seule page -- demandait de
+# reecrire tout _JS, qui tient son etat en variables de module et vise le DOM par
+# identifiants uniques. Beaucoup de code de dessin deja eprouve, casse pour une mise en
+# page. La frontiere de document que donne l'iframe rend ce travail inutile.
+
+
+_PANNEAU_CSS = """
+/* Une colonne fait quelques centaines de pixels : tout ce qui est marge se resserre, et
+   la barre du bas se coupe au lieu de passer sur trois lignes. */
+#top{padding:9px 11px 8px}
+#board{padding:11px 11px 0}
+body{padding-bottom:30px}
+#legend{padding:5px 11px;flex-wrap:nowrap;white-space:nowrap;overflow:hidden}
+#foot{overflow:hidden;text-overflow:ellipsis}
+#dead{border-color:#5a2f2f;color:#e05252}
+#dead[hidden]{display:none}
+#wait{padding:26px 12px;color:var(--dim2);font-size:11.5px}
+""".strip()
+
+
+_PANNEAU_JS = r"""
+(function(){
+var POLL=__POLL__, C=window.ORDO_CIBLE, empreinte=null, timer=null, premier=true;
+function muet(oui){var d=document.getElementById("dead");if(d)d.hidden=!oui}
+function charger(){
+  fetch("/api/map?home="+encodeURIComponent(C.home)+
+        "&campaign="+encodeURIComponent(C.campaign))
+    .then(function(r){if(!r.ok)throw new Error(r.status);return r.json()})
+    .then(function(vue){
+      muet(false);
+      // Redessine seulement si le contenu a change. L'empreinte ignore l'horodatage, sans
+      // quoi chaque battement paraitrait different du precedent et la colonne se
+      // reconstruirait toutes les trois secondes pour rien.
+      if(vue.fingerprint===empreinte)return;
+      empreinte=vue.fingerprint;
+      var w=document.getElementById("wait");
+      if(w&&w.parentNode)w.parentNode.removeChild(w);
+      window.ordoSetData(vue);
+      // Une seule fois, au premier rendu. Le mur qu'on rouvre doit se retrouver ou on
+      // l'avait laisse ; restaurer a chaque battement, en revanche, remonterait la colonne
+      // sous les doigts de qui est en train de la lire.
+      if(premier){premier=false;window.ordoRestoreScroll()}
+    })
+    .catch(function(){muet(true)});
+}
+charger();
+timer=setInterval(charger,POLL*1000);
+// Une colonne cachee n'a personne pour la lire. La visibilite d'une iframe suit celle de
+// l'onglet qui la porte : replier le mur arrete donc toutes les colonnes d'un coup.
+document.addEventListener("visibilitychange",function(){
+  if(document.hidden){clearInterval(timer);timer=null}
+  else if(!timer){charger();timer=setInterval(charger,POLL*1000)}
+});
+})();
+""".strip()
+
+
+def panneau(home: str, campaign: str, poll: int = POLL_S) -> str:
+    """Une colonne du mur : un chantier, servi par le serveur local.
+
+    Ne porte aucune donnee : elle recoit une CIBLE et va lire /api/map elle-meme, en
+    boucle. C'est ce qui permet au mur de la poser sans rien savoir du chantier, et a la
+    colonne de se mettre a jour sans que le mur se recharge.
+
+    Le selecteur de chantier n'est pas ici mais dans le mur, qui possede la mise en page :
+    deux selecteurs pour une meme colonne se contrediraient des le premier changement.
+    """
+    js = _PANNEAU_JS.replace("__POLL__", str(max(1, int(poll))))
+    # L'espace de nommage cloisonne sessionStorage, commun a toute l'origine donc a toutes
+    # les colonnes. Sans lui, ouvrir une tache dans une colonne l'ouvrirait dans les
+    # autres, et la derniere chargee ecraserait le defilement des precedentes.
+    cible = _json({"home": home, "campaign": campaign})
+    espace = _json(f"|{home}|{campaign}")
+    return f"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ordo {_e(campaign)}</title>
+<style>{_CSS}
+{_PANNEAU_CSS}</style></head>
+<body>
+<div id="top">
+  <h1><span class="cid m" id="cid"></span><span id="ctx"></span>
+      <span class="pct m" id="pct"></span></h1>
+  <div id="segs"></div>
+  <div id="bar">
+    <input id="q" placeholder="filtrer : id, titre, zone..." autocomplete="off">
+    <button class="pill" id="f-reste">reste<b class="m" id="n-reste"></b></button>
+    <button class="pill" id="f-tout">tout<b class="m" id="n-tout"></b></button>
+    <span class="pill" id="warnchip" hidden></span>
+    <span class="pill" id="dead" hidden>serveur muet</span>
+    <div id="views"><button id="v-graphe">graphe</button><button id="v-liste">liste</button></div>
+  </div>
+</div>
+<div id="warn" hidden></div>
+<div id="board"><svg id="wires"></svg><div id="wait">lecture du chantier...</div></div>
+<div id="legend"><span id="foot"></span></div>
+<script>window.ORDO_CIBLE={cible};window.ORDO_NS={espace};</script>
+<script>{_JS}</script>
+<script>{js}</script>
+</body></html>
+"""
+
+
+_MUR_CSS = """
+html,body{height:100%;overflow:hidden}
+body{display:flex;flex-direction:column}
+#wtop{flex:none;display:flex;align-items:center;gap:9px;height:34px;padding:0 10px;
+background:var(--bg);border-bottom:1px solid var(--line)}
+#mark{font-size:11px;font-weight:600;letter-spacing:.12em;color:var(--dim)}
 #pulse{width:6px;height:6px;border-radius:50%;background:var(--done);flex:none;
 transition:opacity .3s}
 #pulse.stale{background:var(--blocked)}
+#wtop .tag{font-size:10.5px;color:var(--dim2);border:1px solid var(--line);
+border-radius:20px;padding:2px 8px;white-space:nowrap}
+#wtop .tag.live{border-color:#63541f;color:#d3a03a}
+#wtop .tag.err{border-color:#5a2f2f;color:#e05252}
+#lgd{display:flex;gap:10px;margin-left:auto;font-size:10px;color:var(--dim2)}
+#lgd span.item{display:flex;align-items:center;gap:4px;white-space:nowrap}
+#lgd .sw{width:7px;height:7px;border-radius:2px;display:inline-block}
+#wtop button{flex:none}
+#wtop button:disabled{opacity:.35;cursor:default}
+
+#cols{flex:1 1 auto;min-height:0;display:flex;align-items:stretch;overflow-x:auto}
+.col{display:flex;flex-direction:column;flex:1 1 0;min-width:340px;
+border-right:1px solid var(--line)}
+.chead{flex:none;display:flex;align-items:center;gap:5px;padding:5px 6px;
+background:var(--panel);border-bottom:1px solid var(--line2)}
+.chead select{flex:1 1 auto;min-width:0;background:var(--row);border:1px solid var(--line);
+border-radius:6px;color:var(--txt);font:inherit;font-size:11.5px;padding:3px 6px;
+outline:none}
+.chead select:focus{border-color:#2f6ba8}
+.chead button{flex:none;background:transparent;border:1px solid var(--line);border-radius:6px;
+color:var(--dim2);font:inherit;font-size:12px;line-height:1;padding:4px 7px;cursor:pointer}
+.chead button:hover{color:var(--txt);border-color:#3f4753}
+.col iframe{flex:1 1 auto;width:100%;border:0;background:var(--bg);display:block}
+#vide{margin:auto;padding:40px;color:var(--dim2);font-size:12px;text-align:center;
+text-wrap:pretty}
+#vide[hidden]{display:none}
 """.strip()
 
-_PICKER_JS = r"""
+
+_MUR_JS = r"""
 (function(){
-var POLL=__POLL__, courant=null, empreinte=null, timer=null;
+var POLL=__POLL__, CLE="ordo-mur", MAX=8;
+var cols=[], seq=0, campagnes=[], monte=false, timer=null;
+
 function pulse(vivant){
   var p=document.getElementById("pulse");
   p.classList.toggle("stale",!vivant);
   p.style.opacity=.35;setTimeout(function(){p.style.opacity=1},260);
 }
-function cle(c){return c.home+" "+c.id}
-function menu(campagnes){
-  var sel=document.getElementById("sel");
-  var avant=sel.value;
+function cle(c){return c.home+" "+c.campaign}
+function cleDe(c){return c.home+" "+c.id}
+function libelle(c){
+  return (c.slug||c.id)+" · "+c.done+"/"+c.total+
+    (c.running?" · "+c.running+" en cours":"")+(c.state==="open"?"":" · "+c.state);
+}
+// La disposition survit au rechargement : un mur qu'il faut remonter a chaque ouverture
+// n'est pas un ecran dedie, c'est un formulaire.
+function lire(){
+  try{
+    var d=JSON.parse(localStorage.getItem(CLE));
+    if(d&&d.cols&&d.cols.length)
+      return d.cols.filter(function(c){return c&&c.home&&c.campaign});
+  }catch(e){}
+  return null;
+}
+function ecrire(){
+  try{localStorage.setItem(CLE,JSON.stringify({v:1,cols:cols.map(function(c){
+    return {home:c.home,campaign:c.campaign}})}))}catch(e){}
+}
+
+function options(col){
+  var sel=col.sel;
+  // Deux raisons de ne PAS reconstruire. Un menu deroule a le focus : le refaire sous les
+  // doigts le referme, et le battement tombe toutes les trois secondes, donc ca arrive.
+  // Et une liste identique n'a rien a gagner a etre refaite.
+  if(document.activeElement===sel)return;
+  var sig=campagnes.map(function(c){return cleDe(c)+"="+libelle(c)}).join("|")+"#"+cle(col);
+  if(col.sig===sig)return;
+  col.sig=sig;
   sel.innerHTML="";
   campagnes.forEach(function(c){
     var o=document.createElement("option");
-    o.value=cle(c);
-    o.textContent=(c.slug||c.id)+" - "+c.id+" - "+c.done+"/"+c.total+
-      (c.running?" - "+c.running+" en cours":"")+(c.state==="open"?"":" - "+c.state);
+    o.value=cleDe(c);o.textContent=libelle(c);
     sel.appendChild(o);
   });
-  if(avant&&campagnes.some(function(c){return cle(c)===avant}))sel.value=avant;
-  else if(courant&&campagnes.some(function(c){return cle(c)===courant}))sel.value=courant;
-  return sel.value;
+  sel.value=cle(col);
+  // Un chantier sorti du registre ne peut pas etre choisi dans le menu : sans cette
+  // ligne, le select retomberait en silence sur son premier element et la colonne
+  // afficherait un autre projet que celui qu'on croit lire.
+  if(sel.value!==cle(col)){
+    var o=document.createElement("option");
+    o.value=cle(col);o.textContent=col.campaign+" — introuvable";
+    sel.appendChild(o);sel.value=cle(col);
+  }
 }
-function charger(choix,force){
-  var p=choix.split(" ");
-  fetch("/api/map?home="+encodeURIComponent(p[0])+"&campaign="+encodeURIComponent(p[1]))
-    .then(function(r){if(!r.ok)throw new Error(r.status);return r.json()})
-    .then(function(vue){
-      // Redessine seulement si le contenu a change. L'empreinte ignore l'horodatage,
-      // sans quoi chaque battement paraitrait different du precedent et la page se
-      // reconstruirait toutes les trois secondes pour rien.
-      if(!force&&vue.fingerprint===empreinte)return;
-      empreinte=vue.fingerprint;
-      window.ordoSetData(vue);
-    })
-    .catch(function(){});
+
+function creer(col){
+  var d=document.createElement("div");
+  d.className="col";d.setAttribute("data-uid",col.uid);
+  var h=document.createElement("div");h.className="chead";
+  var sel=document.createElement("select");
+  sel.setAttribute("aria-label","chantier de la colonne");
+  sel.addEventListener("change",function(){
+    var p=sel.value.split(" ");
+    col.home=p[0];col.campaign=p[1];ecrire();dessiner();
+  });
+  var x=document.createElement("button");
+  x.textContent="×";x.title="fermer la colonne";
+  x.addEventListener("click",function(){
+    cols=cols.filter(function(c){return c!==col});ecrire();dessiner();
+  });
+  h.appendChild(sel);h.appendChild(x);
+  var f=document.createElement("iframe");
+  f.setAttribute("title","carte du chantier");
+  d.appendChild(h);d.appendChild(f);
+  col.node=d;col.sel=sel;col.frame=f;
+  return d;
 }
+
+function dessiner(){
+  var hote=document.getElementById("cols"), vivants={};
+  cols.forEach(function(col){
+    // Les colonnes ne sont jamais REORDONNEES dans le DOM : deplacer une iframe la
+    // recharge, et une colonne rechargee perd tout ce que le mur sert a garder sous les
+    // yeux. Une nouvelle colonne s'ajoute a la fin, point.
+    if(!col.node)hote.appendChild(creer(col));
+    vivants[col.uid]=1;
+    options(col);
+    var url="/panel?home="+encodeURIComponent(col.home)+
+            "&campaign="+encodeURIComponent(col.campaign);
+    // Meme raison : la source ne se reecrit que si la cible a vraiment change, sinon
+    // chaque battement rechargerait toutes les colonnes.
+    if(col.frame.getAttribute("data-cible")!==url){
+      col.frame.setAttribute("data-cible",url);col.frame.src=url;
+    }
+  });
+  Array.prototype.slice.call(hote.children).forEach(function(n){
+    // Le message de mur vide n'a pas d'uid et n'est pas une colonne : sans ce garde-fou,
+    // le premier passage l'emporterait et il ne reviendrait jamais.
+    if(n.hasAttribute("data-uid")&&!vivants[n.getAttribute("data-uid")])hote.removeChild(n);
+  });
+  document.getElementById("vide").hidden=cols.length>0;
+  document.getElementById("plus").disabled=!campagnes.length||cols.length>=MAX;
+}
+
+function ajouter(){
+  if(!campagnes.length||cols.length>=MAX)return;
+  var pris={};cols.forEach(function(c){pris[cle(c)]=1});
+  var libre=null;
+  for(var i=0;i<campagnes.length;i++){
+    if(!pris[cleDe(campagnes[i])]){libre=campagnes[i];break}
+  }
+  var c=libre||campagnes[0];
+  cols.push({uid:String(++seq),home:c.home,campaign:c.id});
+  ecrire();dessiner();
+}
+
+function premier(){
+  var sauve=lire();
+  if(sauve){
+    cols=sauve.map(function(c){
+      return {uid:String(++seq),home:c.home,campaign:c.campaign}});
+    return;
+  }
+  // Premiere ouverture : les chantiers ouverts, plafonnes a trois. Ouvrir douze colonnes
+  // d'un coup sur une machine qui suit douze projets ne montrerait rien de lisible.
+  campagnes.filter(function(c){return c.state==="open"}).slice(0,3).forEach(function(c){
+    cols.push({uid:String(++seq),home:c.home,campaign:c.id})});
+  ecrire();
+}
+
 function battement(){
   fetch("/api/state").then(function(r){return r.json()}).then(function(etat){
-    var choix=menu(etat.campaigns);
-    var live=etat.campaigns.filter(function(c){return c.running}).length;
+    campagnes=etat.campaigns||[];
+    var live=campagnes.filter(function(c){return c.running}).length;
     var t=document.getElementById("live");
-    t.textContent=live?live+" chantier(s) avec une executante":"aucune executante";
+    t.textContent=campagnes.length+" chantier"+(campagnes.length>1?"s":"")+" · "+
+      (live?live+" avec une exécutante":"aucune exécutante");
     t.className="tag"+(live?" live":"");
     var pb=document.getElementById("pbs");
     pb.hidden=!etat.problems.length;
     if(etat.problems.length)pb.textContent=etat.problems.length+" home illisible";
     pulse(true);
-    if(!choix)return;
-    var change=choix!==courant;
-    courant=choix;
-    try{sessionStorage.setItem("ordo-campagne",choix)}catch(e){}
-    charger(choix,change);
+    if(!monte){monte=true;premier()}
+    dessiner();
   }).catch(function(){pulse(false)});
 }
-document.getElementById("sel").addEventListener("change",function(e){
-  courant=e.target.value;empreinte=null;
-  // La selection appartient au chantier qu'on quitte : la garder ferait ouvrir, sur le
-  // suivant, le detail d'une tache qui porte le meme identifiant sans etre la meme.
-  try{sessionStorage.removeItem("ordo-sel")}catch(e2){}
-  charger(courant,true);
+
+document.getElementById("plus").addEventListener("click",ajouter);
+document.getElementById("full").addEventListener("click",function(){
+  if(document.fullscreenElement)document.exitFullscreen();
+  else document.documentElement.requestFullscreen();
 });
-try{courant=sessionStorage.getItem("ordo-campagne")}catch(e){}
 battement();
 timer=setInterval(battement,POLL*1000);
-// Une page cachee n'a personne pour la lire : la laisser battre ferait travailler le
-// serveur pour un onglet que plus personne ne regarde.
 document.addEventListener("visibilitychange",function(){
   if(document.hidden){clearInterval(timer);timer=null}
   else if(!timer){battement();timer=setInterval(battement,POLL*1000)}
@@ -1424,50 +1724,39 @@ document.addEventListener("visibilitychange",function(){
 
 
 def page(poll: int = POLL_S) -> str:
-    """La page servie par le serveur local, pour tous les chantiers a la fois.
+    """Le mur, servi a la racine : une colonne par chantier, cote a cote.
 
-    Deux differences avec html(), et une seule les explique toutes : ici les donnees
-    arrivent par HTTP, la ou un fichier les porte figees. La page peut donc offrir un menu
-    de chantiers, et se mettre a jour SANS SE RECHARGER. Le meta refresh du mode fichier
-    ramenait le lecteur en haut de page a chaque cycle ; ici l'etat de lecture ne bouge
-    pas, parce que seul le contenu est remplace.
+    C'est l'adresse qu'on met en favori, donc celle qui doit ouvrir sur TOUT ce qui tourne,
+    pas sur un chantier avec un menu pour changer. Elle ne porte aucune donnee : la
+    disposition vit dans le navigateur (localStorage), l'etat de chaque chantier dans sa
+    colonne. Un mur qui embarquerait l'etat serait fige des sa livraison, et il faudrait le
+    recharger en entier pour voir bouger une seule colonne.
     """
-    picker = _PICKER_JS.replace("__POLL__", str(max(1, int(poll))))
+    js = _MUR_JS.replace("__POLL__", str(max(1, int(poll))))
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ordo</title>
 <style>{_CSS}
-{_PICKER_CSS}</style></head>
+{_MUR_CSS}</style></head>
 <body>
-<div id="top">
-  <div id="picker">
-    <span id="pulse" title="battement du serveur"></span>
-    <select id="sel" aria-label="chantier"></select>
-    <span class="tag" id="live"></span>
-    <span class="tag err" id="pbs" hidden></span>
-    <span class="pct m" id="pct"></span>
-  </div>
-  <h1><span class="cid m" id="cid"></span><span id="ctx"></span></h1>
-  <div id="segs"></div>
-  <div id="bar">
-    <input id="q" placeholder="filtrer : id, titre, zone..." autocomplete="off">
-    <button class="pill" id="f-reste">reste<b class="m" id="n-reste"></b></button>
-    <button class="pill" id="f-tout">tout<b class="m" id="n-tout"></b></button>
-    <span class="pill" id="warnchip" hidden></span>
-    <div id="views"><button id="v-graphe">graphe</button><button id="v-liste">liste</button></div>
-  </div>
+<div id="wtop">
+  <span id="mark" class="m">ORDO</span>
+  <span id="pulse" title="battement du serveur"></span>
+  <span class="tag" id="live"></span>
+  <span class="tag err" id="pbs" hidden></span>
+  <span id="lgd">
+    <span class="item"><span class="sw" style="background:#46a35a"></span>fait</span>
+    <span class="item"><span class="sw" style="background:#d3a03a"></span>en cours</span>
+    <span class="item"><span class="sw" style="background:#5aa2f0"></span>lancable</span>
+    <span class="item"><span class="sw" style="background:#4a5361"></span>en attente</span>
+  </span>
+  <button class="pill" id="plus" title="ajouter une colonne">+ colonne</button>
+  <button class="pill" id="full" title="plein ecran">plein ecran</button>
 </div>
-<div id="warn" hidden></div>
-<div id="board"><svg id="wires"></svg></div>
-<div id="legend">
-  <span class="item"><span class="sw" style="background:#46a35a"></span>fait</span>
-  <span class="item"><span class="sw" style="background:#d3a03a"></span>en cours</span>
-  <span class="item"><span class="sw" style="background:#5aa2f0"></span>lancable</span>
-  <span class="item"><span class="sw" style="background:#4a5361"></span>en attente</span>
-  <span style="margin-left:auto" id="foot"></span>
+<div id="cols">
+  <div id="vide" hidden>aucune colonne. « + colonne » en ouvre une.</div>
 </div>
-<script>{_JS}</script>
-<script>{picker}</script>
+<script>{js}</script>
 </body></html>
 """

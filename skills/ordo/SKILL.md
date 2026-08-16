@@ -191,7 +191,7 @@ about what it is for, and `ordo digest` prints the repair command instead of the
 **3. Give them the page.**
 
 ```bash
-ordo serve            # http://127.0.0.1:9123/ , every campaign, live
+ordo serve            # http://127.0.0.1:9123/ , every campaign, live, one column each
 ```
 
 You rarely need to run even that: `ordo watch` starts the server on its own. **Give the

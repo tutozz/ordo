@@ -781,3 +781,159 @@ class TestDureeSurLaCarte(CarteTestCase):
         self._set_state(a["id"], state="running", startedAt="2020-01-01T00:00:00Z")
         page = carte.html(carte.model(self.chantier))
         self.assertIn('"duree"', page)
+
+
+class TestModeleSurLaCarte(CarteTestCase):
+    """Le modele qui executera la tache, lisible sur sa case sans l'ouvrir.
+
+    Une case qui ne dit pas quel modele va la prendre oblige a relancer `ordo routage`
+    dans un terminal pour le savoir, alors que c'est exactement le chiffre qui decide si
+    on relit le brief avant de lancer.
+    """
+
+    def test_une_tache_non_lancee_annonce_le_modele_prevu(self):
+        # Titre de conception : le routage envoie sur opus, et rien n'a encore tourne.
+        self._add("0.1 Concevoir le schema")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["model"], "opus")
+        self.assertTrue(t["modelPredit"])
+
+    def test_le_modele_prevu_est_celui_du_routage_pas_un_defaut_fixe(self):
+        # Geste mecanique borne : haiku. Si la carte affichait un defaut fixe, ce test
+        # verrait "opus" ici.
+        self._add("0.1 Renommer le module", touches=["ordo/x.py"], checklist=["fait"])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["model"], "haiku")
+
+    def test_le_modele_prevu_monte_avec_les_tentatives_ratees(self):
+        # L'escalade de routage.pour_lancement doit se voir sur la carte : sans elle, la
+        # case promettrait haiku alors que le prochain lancement partira sur opus.
+        a = self._add("0.1 Renommer le module", touches=["ordo/x.py"], checklist=["fait"])
+        self._set_state(a["id"], attempts=2)
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["model"], "opus")
+        self.assertTrue(t["modelPredit"])
+
+    def test_le_modele_reellement_lance_prime_sur_la_prediction(self):
+        a = self._add("0.1 Concevoir le schema")
+        self._set_state(a["id"], state="running", model="sonnet",
+                        startedAt="2020-01-01T00:00:00Z")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["model"], "sonnet")
+        self.assertFalse(t["modelPredit"])
+
+    def test_une_tache_lancee_sans_modele_impose_ne_predit_plus_rien(self):
+        # Lancee avec --model herite : claude a applique sa propre configuration. Afficher
+        # la prediction du routage inventerait un modele qui n'a pas tourne.
+        a = self._add("0.1 Concevoir le schema")
+        self._set_state(a["id"], state="done", model=None,
+                        startedAt="2020-01-01T00:00:00Z",
+                        finishedAt="2020-01-01T00:01:00Z")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["model"], "defaut")
+        self.assertFalse(t["modelPredit"])
+
+    def test_le_motif_du_routage_accompagne_le_modele(self):
+        # Le nom seul ne se conteste pas : ce qui se conteste est le signal qui a tranche.
+        self._add("0.1 Concevoir le schema")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertIn("conception", t["modelWhy"])
+
+    def test_le_modele_figure_dans_les_faits_de_la_tache(self):
+        self._add("0.1 Concevoir le schema")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["facts"]["modele"], "opus")
+
+    def test_la_page_de_fichier_porte_aussi_le_modele(self):
+        self._add("0.1 Concevoir le schema")
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn('"model"', page)
+        self.assertIn("modelPredit", page)
+
+
+class TestMur(CarteTestCase):
+    """Le mur : une colonne par chantier, cote a cote, sur un seul ecran.
+
+    Le mur ne porte AUCUNE donnee de chantier. Il pose des colonnes et leur donne une
+    adresse ; chaque colonne va chercher son etat elle-meme. C'est ce qui permet a une
+    colonne de se rafraichir sans que les autres perdent leur defilement.
+    """
+
+    def test_le_mur_est_du_html_complet(self):
+        mur = carte.page()
+        self.assertTrue(mur.lstrip().lower().startswith("<!doctype html>"))
+        self.assertIn("</html>", mur)
+
+    def test_le_mur_porte_le_conteneur_de_colonnes_et_le_bouton_d_ajout(self):
+        mur = carte.page()
+        self.assertIn('id="cols"', mur)
+        self.assertIn('id="plus"', mur)
+
+    def test_le_mur_ne_porte_aucune_donnee_de_chantier(self):
+        # Un mur qui embarquerait l'etat serait fige des sa livraison, et il faudrait le
+        # recharger en entier pour voir bouger une seule colonne.
+        self._add("0.1 Recette locale")
+        mur = carte.page()
+        self.assertNotIn("Recette locale", mur)
+        self.assertNotIn("window.ORDO=", mur)
+
+    def test_le_mur_offre_le_plein_ecran(self):
+        self.assertIn("requestFullscreen", carte.page())
+
+    def test_le_mur_ne_charge_aucune_ressource_distante(self):
+        mur = carte.page()
+        self.assertNotIn("http://", mur)
+        self.assertNotIn("https://", mur)
+        self.assertNotIn("<link", mur)
+
+
+class TestPanneau(CarteTestCase):
+    """Une colonne du mur : un seul chantier, servi par le serveur local."""
+
+    def test_une_colonne_cible_le_home_et_le_chantier_demandes(self):
+        p = carte.panneau("/tmp/ordo-home", "c-7")
+        self.assertIn("/tmp/ordo-home", p)
+        self.assertIn("c-7", p)
+
+    def test_une_colonne_porte_le_plateau_et_les_deux_vues(self):
+        p = carte.panneau("/tmp/ordo-home", "c-7")
+        for cle in ('id="board"', 'id="wires"', 'id="v-graphe"', 'id="v-liste"'):
+            self.assertIn(cle, p)
+
+    def test_une_colonne_ne_porte_pas_le_selecteur_de_chantier(self):
+        # Le choix du chantier appartient au mur : deux selecteurs pour une meme colonne
+        # se contrediraient des le premier changement.
+        self.assertNotIn('id="sel"', carte.panneau("/tmp/ordo-home", "c-7"))
+
+    def test_un_home_hostile_ne_peut_pas_fermer_le_script_qui_le_porte(self):
+        # Le home vient de l'URL : il est ecrit par qui forme le lien, donc jamais sur.
+        p = carte.panneau('/tmp/x</script><script>alert(1)</script>', "c-7")
+        self.assertNotIn("</script><script>alert(1)", p)
+
+    def test_deux_colonnes_ne_partagent_pas_leur_etat_de_lecture(self):
+        # sessionStorage est commun a toute l'origine : sans cloisonnement, ouvrir une
+        # tache dans une colonne l'ouvrirait dans toutes les autres.
+        a = re.search(r'ORDO_NS=("[^"]*")', carte.panneau("/tmp/a", "c-1"))
+        b = re.search(r'ORDO_NS=("[^"]*")', carte.panneau("/tmp/b", "c-2"))
+        self.assertIsNotNone(a)
+        self.assertIsNotNone(b)
+        self.assertNotEqual(a.group(1), b.group(1))
+
+
+class TestDefilementRestaure(CarteTestCase):
+    """Le defilement d'une colonne survit a la reouverture du mur.
+
+    Il etait ecrit dans sessionStorage a chaque mouvement et jamais relu hors du mode
+    fichier : une colonne rouverte revenait toujours en haut, et un mur de trois colonnes
+    demandait de tout refaire defiler a chaque ouverture.
+    """
+
+    def test_la_restauration_est_exposee_par_le_rendu(self):
+        # Elle ne peut pas etre appelee depuis le rendu lui-meme : en colonne, le premier
+        # dessin a lieu a la reponse du serveur, que le rendu ne voit pas.
+        self.assertIn("window.ordoRestoreScroll=function", carte.html(
+            carte.model(self.chantier)))
+
+    def test_une_colonne_restaure_son_defilement_au_premier_rendu(self):
+        p = carte.panneau("/tmp/ordo-home", "c-7")
+        self.assertIn("window.ordoRestoreScroll()", p)

@@ -188,11 +188,18 @@ ordo map c-01 --open            # or a standalone file, no server involved
 **You do not start that server by hand.** `ordo watch`, the watch an orchestrator arms
 anyway, starts it if it does not answer on `127.0.0.1:9123`. The first campaign of the day
 lights it up, the following ones find it standing and only register themselves, and if it
-dies the next watch brings it back. A picker at the top switches between campaigns, across
-projects. `--no-serve` on the watch, or `ORDO_NO_SERVE` in the environment, turns it off.
+dies the next watch brings it back. `--no-serve` on the watch, or `ORDO_NO_SERVE` in the
+environment, turns it off.
 
-The served page **updates without reloading**: it polls its own server and redraws only when
-the content actually changed, so scroll position, open task, folded phases and search all
+The served page is a **wall**: one column per campaign, side by side, across projects. `+
+colonne` adds a column, the dropdown at the top of a column changes which campaign it
+shows, `×` closes it, and the layout survives a reload. Full screen on a spare monitor and
+every project is on one screen, which is the point: following two campaigns used to mean
+two tabs and a round trip.
+
+Each column is its own page and polls on its own, so a column that refreshes leaves its
+neighbours alone. And a served page **updates without reloading**: it redraws only when the
+content actually changed, so scroll position, open task, folded phases and search all
 survive. The standalone file cannot do that; it refreshes wholesale and sends you back to
 the top of the page.
 
@@ -206,8 +213,10 @@ A finished phase folds itself away and shows only its bar, so what is left to do
 fills the screen. Inside a phase, tasks are laid out by dependency depth: a prerequisite is
 always to the left of, or above, what it unblocks, and oriented arcs say which way.
 
-Every card shows how long the task took and how many tokens it spent, read from the
-executor's own transcript; a card whose transcript cannot be found shows nothing rather
+Every card shows how long the task took, how many tokens it spent, read from the executor's
+own transcript, and **which model will run it**: solid when the model was actually imposed
+at launch, dashed when it is still the routing's forecast, and the reason for the call is
+in the tooltip. A card whose transcript cannot be found shows nothing rather
 than a zero it did not measure. Hovering a task marks its whole transitive chain, green
 upstream and blue downstream, and dims everything else. Clicking it opens, in place, what it waits on, what it unblocks, why
 it exists, what blocks it right now, its facts, its checklist, and its prompt and report as

@@ -446,6 +446,7 @@ def model(
             "checklist": checklist,
             "checkDone": sum(1 for i in checklist if i["done"]),
             "checkTotal": len(checklist),
+            "currentItem": t.get("currentItem"),
             "paneId": pane_id,
             "paneAlive": None if (alive is None or not pane_id) else bool(alive(pane_id)),
             "attempts": t.get("attempts", 0),
@@ -596,6 +597,58 @@ def _duree(secondes: int | None) -> str:
     return f"{secondes // 3600}h{(secondes % 3600) // 60:02d}"
 
 
+def _duree_min(minutes: int | None) -> str:
+    """Formate une durée exprimée en MINUTES-CLAUDE (estimation de critère, brief t-27),
+    jamais en secondes : contrairement à _duree() ci-dessus, cette échelle n'a jamais de
+    précision seconde, et un suffixe "s" y laisserait croire à une précision qu'on n'a pas.
+    """
+    if minutes is None:
+        return ""
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}"
+
+
+def _restant_min(checklist: list[dict]) -> int | None:
+    """Minutes-Claude restant : somme des durées des critères NON cochés (brief t-27).
+
+    None, jamais zéro, dès qu'un seul critère non coché porte une durée inconnue : un
+    restant partiel se lirait comme le restant complet, alors qu'il le sous-estime. Zéro
+    n'est un vrai zéro que lorsque chaque critère non coché (s'il en reste) porte une
+    durée connue -- ou qu'il n'en reste aucun. .get() et non [] : un critère créé avant ce
+    champ n'a jamais porté la clé "dureeMin" sur disque (c8).
+    """
+    restants = [item for item in checklist if not item["done"]]
+    if any(item.get("dureeMin") is None for item in restants):
+        return None
+    return sum(item["dureeMin"] for item in restants)
+
+
+def _total_estime_min(checklist: list[dict]) -> int | None:
+    """Minutes-Claude estimées au total : somme de CE QUI EST CONNU, cochés compris (brief
+    t-27). Le total de la tâche se calcule, il ne se saisit pas -- jamais une somme
+    partielle cachée derrière un None comme _restant_min ci-dessus : un seul critère estimé
+    suffit déjà à juger un dépassement sur ce qu'on sait, plutôt que de se taire tant que
+    la checklist entière n'est pas estimée.
+    """
+    valeurs = [item["dureeMin"] for item in checklist if item.get("dureeMin") is not None]
+    return sum(valeurs) if valeurs else None
+
+
+def _depassement_min(elapsed_s: int | None, total_estime_min: int | None) -> str:
+    """Le passé (elapsedS, mesuré depuis startedAt, jamais déclaré -- voir _elapsed) au-delà
+    du total estimé (brief t-27, point 5) : jamais masqué en zéro, ce serait un mensonge
+    exactement au moment où l'humain a besoin de l'information. Chaîne vide tant que le
+    passé ne dépasse pas l'estimé, ou que l'un des deux est inconnu -- rien à comparer.
+    """
+    if elapsed_s is None or total_estime_min is None:
+        return ""
+    ecart = (elapsed_s // 60) - total_estime_min
+    if ecart <= 0:
+        return ""
+    return "+" + _duree_min(ecart)
+
+
 
 
 
@@ -661,14 +714,31 @@ def _facts(node: dict, jetons: dict | None = None) -> dict:
 
 
 def _meta(node: dict) -> str:
-    """Faits courts de la ligne de detail. La duree n'y est plus : elle a rejoint l'en-tete
-    de la carte, ou elle reste visible quelle que soit la vue."""
+    """Faits courts de la ligne de détail. La durée n'y est plus : elle a rejoint l'en-tête
+    de la carte, où elle reste visible quelle que soit la vue. La progression de checklist
+    non plus : elle vit désormais dans sa propre ligne, visible sans ouvrir la tâche et dans
+    les deux vues (voir vue())."""
     bouts = []
-    if node["checkTotal"]:
-        bouts.append(f'{node["checkDone"]}/{node["checkTotal"]}')
     if node["paneId"]:
         bouts.append(f'{node["paneId"]} {_VIVACITE[node["paneAlive"]]}')
     return _SEP.join(bouts)
+
+
+def _doing(node: dict) -> str:
+    """Le libellé du critère que l'exécutante a déclaré en cours (`ordo check --doing`).
+
+    Chaîne vide, jamais un tiret ni un zéro, quand rien n'a été déclaré : une case qui n'a
+    rien à dire à cet endroit ne doit rien afficher qui se lise comme une information.
+    currentItem est un identifiant d'item, pas son texte -- le retrouver dans la checklist
+    est le seul moyen de l'afficher.
+    """
+    courant = node["currentItem"]
+    if not courant:
+        return ""
+    for item in node["checklist"]:
+        if item["id"] == courant:
+            return item["label"]
+    return ""
 
 
 def vue(m: dict) -> dict:
@@ -683,7 +753,6 @@ def vue(m: dict) -> dict:
     for tid in sorted(m["nodes"], key=_num_id):
         node = m["nodes"][tid]
         jetons = node.get("usage")
-        tours = (jetons or {}).get("turns") or 0
         tasks.append({
             "id": tid,
             "title": node["titre"],
@@ -697,21 +766,44 @@ def vue(m: dict) -> dict:
             # Chaine vide et pas "-" quand on ne sait pas : un tiret se lit comme une duree
             # nulle, alors que la tache n'a simplement pas commence.
             "duree": _duree(node["elapsedS"]) if node["elapsedS"] is not None else "",
+            # La progression de checklist sort à part de meta pour la même raison que la
+            # durée : elle doit se lire SANS ouvrir la tâche, et dans les DEUX vues -- sur
+            # une case fermée en vue graphe, meta ne s'affiche jamais (voir _meta()). doing
+            # est le libellé du critère en cours, jamais un identifiant : une case qui n'a
+            # rien déclaré rend une chaîne vide, jamais un tiret ni un zéro qui se liraient
+            # comme une information.
+            "checkDone": node["checkDone"],
+            "checkTotal": node["checkTotal"],
+            "doing": _doing(node),
             "elapsedS": node["elapsedS"],
+            # Restant (somme des critères non cochés) et dépassement (passé au-delà du
+            # total estimé) : brief t-27. Chaîne vide et jamais un zéro fabriqué quand on
+            # ne sait simplement pas -- même convention que "duree" et "doing" ci-dessus.
+            "restant": _duree_min(_restant_min(node["checklist"])),
+            "depassement": _depassement_min(
+                node["elapsedS"], _total_estime_min(node["checklist"])
+            ),
             # Le modele sort a part de facts pour la meme raison que la duree : il se lit
             # SANS ouvrir la tache. C'est lui qui dit s'il faut relire le brief avant de
             # lancer, et le relire apres coup ne sert plus a rien.
             "model": node["model"],
             "modelWhy": node["modelWhy"],
             "modelPredit": node["modelPredit"],
-            # Les tours sortent a part de facts, comme la duree et le modele : c'est le
-            # chiffre qui dit depuis combien de temps une tache traine son contexte, et il
-            # predit son cout mieux que tout le reste. Le lire ne doit pas demander
-            # d'ouvrir la tache. Le pane, lui, reste dans facts : il sert a aller voir, ce
-            # qu'on ne fait qu'apres avoir ouvert la tache.
-            "turns": tours,
-            "sessionLongue": bool(tours >= (usage.SEUIL_TOURS or float("inf"))),
-            "tokens": usage.court(jetons["output"]) if jetons else "",
+            # Le contexte sort à part de facts, comme la durée et le modèle : il se lit
+            # SANS ouvrir la tâche. C'est le contexte du DERNIER tour (voir usage.pour), pas
+            # la sortie cumulée de la session : la sortie grossit avec la durée d'une
+            # session sans jamais redescendre, elle ne dit rien de ce qu'un tour de plus va
+            # coûter à relire. Le nombre de tours a occupé cette place avant lui et s'est
+            # trompé sur seize sessions (voir le commentaire de usage.SEUIL_TOURS) : un
+            # contexte lourd en peu de tours passait inaperçu. Il reste lisible dans facts,
+            # en détail, où le pane vit déjà pour la même raison.
+            "tokens": usage.court(jetons["dernierContexte"]) if jetons else "",
+            # S'allume au même seuil que la compaction réelle (usage.SEUIL_CONTEXTE), jamais
+            # redéfini ici : une carte qui alerterait à une autre valeur que celle qui
+            # déclenche _compacter() raconterait une autre histoire que celle qui se joue.
+            "contexteLourd": bool(
+                jetons and jetons["dernierContexte"] >= (usage.SEUIL_CONTEXTE or float("inf"))
+            ),
             "facts": _facts(node, jetons),
             "deps": node["deps"],
             "dependants": node["dependants"],
@@ -797,8 +889,9 @@ def _e(value: object) -> str:
 _CSS = """
 :root{--bg:#0b0d10;--panel:#12151a;--row:#14171c;--rowsel:#171c23;--line:#232830;
 --line2:#20252c;--txt:#dfe4ea;--txt2:#c9d1da;--dim:#858e9b;--dim2:#6d7683;--dim3:#5b6470;
---done:#46a35a;--running:#d3a03a;--ready:#5aa2f0;--queued:#4a5361;--blocked:#e05252;
---cancelled:#333941;--up:#5fa96f;--down:#5aa2f0;--accent:#8cc0f7}
+--done:#46a35a;--done2:#3c7a4a;--running:#d3a03a;--finishing:#8b5cf6;--ready:#5aa2f0;
+--queued:#4a5361;--blocked:#e05252;--cancelled:#333941;--up:#5fa96f;--down:#5aa2f0;
+--accent:#8cc0f7;--lien:#2f6ba8;--relu:#3f5d80;--badge:#171b21}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;
 font:12.5px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -838,10 +931,24 @@ max-height:20vh;overflow:auto;color:#e3b341;font-size:11.5px}
 #warn div+div{margin-top:3px}
 #warn[hidden]{display:none}
 
-#board{position:relative;padding:14px 14px 0}
+/* Le bas est laissé vide exprès : sans cette réserve, la dernière phase ne peut jamais
+   monter en haut de l'écran, même en repliant tout ce qui la précède. Aucun script ne s'y
+   scrolle tout seul, c'est un espace à faire défiler, pas un mouvement. */
+#board{position:relative;padding:14px 14px 70vh}
 #wires{position:absolute;left:0;top:0;width:100%;pointer-events:none;z-index:0;
 overflow:visible}
 section.phase{margin-bottom:14px}
+/* Plusieurs phases finies et repliées à la suite mangeaient toute la hauteur du mur, une
+   par ligne. Condensées, elles tiennent à plusieurs sur la même bande et passent à la
+   ligne quand il n'y a plus de place — un chantier à moitié fait ne demande plus qu'à
+   faire défiler des en-têtes vides. */
+.condensed{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.pchip{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%;cursor:pointer;
+background:var(--row);border:1px solid var(--line2);border-radius:20px;padding:3px 10px 3px 7px}
+.pchip.full .pkey{color:var(--done);border-color:#2c4d35;background:#122116}
+.pchip .cname{font-size:11px;color:var(--txt2);min-width:0;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.pchip .pcount{min-width:0;flex:none}
 .phead{position:relative;z-index:3;background:var(--bg);display:flex;align-items:center;
 gap:8px;cursor:pointer;padding:2px 0 6px}
 .pkey{font-size:10.5px;font-weight:600;color:#9aa4b1;border:1px solid #2b3038;
@@ -893,36 +1000,69 @@ border-radius:4px;padding:0 4px;color:var(--dim2);flex:none}
 .mdl.sonnet{color:#6fa8dc;border-color:#274a68}
 .mdl.opus{color:#b892e0;border-color:#453060}
 .mdl.predit{border-style:dashed;opacity:.75}
-/* Le pane et les tours d'une session en cours. Les tours virent a l'orange au-dela du
-   seuil de compaction : c'est le seul chiffre qui predit ce qu'une session va coûter, et
-   il n'apparaissait nulle part. */
-.turns{color:var(--dim2)}
-.row.running .turns{color:var(--txt2)}
-.turns.longue{color:#e3b341;font-weight:600}
 .rlinks{margin-left:auto;flex:none;display:flex;gap:7px;font-size:10px}
 .row.focus .rlinks{font-size:12px;font-weight:600}
 .nup{color:var(--up)}.ndown{color:var(--down)}.nnone{color:#3a4049}
 .dur{color:var(--dim2)}
-/* Les jetons ne se colorent que sur une tache en cours : c'est la seule ou le chiffre
-   bouge encore, donc la seule ou il appelle le regard. */
+/* Dépassement : passé au-delà du total estimé (brief t-27). --blocked, déjà la teinte
+   d'alarme du reste de la carte (voir COL/kind()), jamais une nouvelle variable pour ce
+   qui est la même famille de signal : quelque chose ne va pas comme prévu. */
+.over{color:var(--blocked);font-weight:600}
+/* Le contexte du dernier tour, pas la sortie cumulée de la session (voir vue() en
+   Python). Il ne se colore que sur une tâche en cours, où le chiffre bouge encore ; au-delà
+   du seuil de compaction lu dans usage.SEUIL_CONTEXTE, il vire à l'orange : c'est le
+   chiffre qui prédit ce qu'une session va coûter à relire, là où son nombre de tours s'est
+   trompé sur seize sessions (voir le commentaire de usage.SEUIL_TOURS). */
 .tok{color:var(--dim2)}
 .row.running .tok{color:var(--running)}
+.tok.lourd{color:#e3b341;font-weight:600}
 .rtitle{font-size:12.5px;line-height:1.35;color:var(--txt);margin-top:3px;text-wrap:pretty}
 .row.cancelled .rtitle{color:var(--dim2);text-decoration:line-through}
 .rmeta{display:flex;gap:9px;align-items:baseline;margin-top:3px;font-size:10.5px;
 color:var(--dim2)}
 .rmeta .zones{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* La checklist ne prend le vert du fini qu'à l'état "done" de la tâche : cochée à 100% sur
+   une tâche encore "running", elle reste neutre, sans quoi la case raconterait un succès
+   qu'elle n'a pas encore. Le libellé du critère en cours va jusqu'à 60 caractères, il ne
+   tient pas dans une colonne de mur : il se coupe à l'ellipse, le texte complet reste
+   joignable en infobulle. */
+.rprog{display:flex;gap:6px;align-items:baseline;margin-top:3px;font-size:10.5px;min-width:0}
+.rprog .cnt{color:var(--dim2);font-weight:600;flex:none}
+.row.done .rprog .cnt{color:var(--done)}
+.rprog .rest{color:var(--dim3);flex:none}
+.rprog .doing{color:var(--dim);min-width:0;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+/* Troisième état, pas une nuance du deuxième : une checklist à 100% sur une tâche encore
+   running remplace le libellé du critère en cours (il n'y en a plus) par cette mention,
+   dans le violet propre à cet état -- distinct du jaune "en cours" et du vert "fini",
+   visible sans lire sur un mur de colonnes (voir kind() et .sb ci-dessous). */
+.rprog .doing.rapport{color:var(--finishing);font-weight:600}
 
 .detail{margin-top:9px;border-top:1px solid #262c34;padding-top:11px}
+
+/* bandeau d'identité : qui exécute, où, combien de fois déjà, à quelle profondeur du
+   graphe -- un badge neutre par fait, jamais un paragraphe. */
+.strip{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.dtag{display:flex;align-items:center;gap:5px;font-size:10px;color:#9aa4b1;
+background:var(--badge);border:1px solid var(--line);border-radius:4px;padding:1px 6px}
+.dtag .dot{width:5px;height:5px;border-radius:50%}
+.dtag.vivant .dot{background:var(--done);animation:ordopulse 1.8s ease-in-out infinite}
+.dtag.mort .dot{background:var(--blocked)}
+.dtag .dot.off{background:#3a4049}
+.tries{display:flex;gap:3px;align-items:center}
+.try{width:5px;height:5px;border-radius:50%;background:#9aa4b1;flex:none;display:inline-block}
+.try.ko{background:var(--blocked)}
+.try.off{background:transparent;border:1px solid #2b3038}
+
+/* chaîne attend/débloque : le maillon central est la carte elle-même, elle n'est pas
+   redessinée -- un simple trait la sépare des deux colonnes. */
 .chain{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin-bottom:12px}
 .chain .side{flex:1 1 190px;min-width:0}
-.chain .arrow{flex:none;display:flex;align-items:center;color:#3f4753;font-size:15px}
-.chain .self{flex:0 1 150px;min-width:0;display:flex;align-items:center}
-.chain .selfbox{width:100%;border:1px solid #3f7fc4;border-radius:6px;background:#101922;
-padding:7px 9px}
+.chain .sep{flex:none;align-self:stretch;width:1px;background:#262c34}
 .k{font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim2);
 margin-bottom:5px}
 .k.up{color:var(--up)}.k.down{color:var(--down)}
+.k .aval{letter-spacing:0;text-transform:none;color:var(--dim3)}
 .col{display:flex;flex-direction:column;gap:4px}
 .chip{display:flex;align-items:center;gap:6px;cursor:pointer;background:#191d23;
 border:1px solid #262c34;border-radius:5px;padding:4px 7px;min-width:0}
@@ -932,22 +1072,74 @@ border:1px solid #262c34;border-radius:5px;padding:4px 7px;min-width:0}
 .chip .ctitle{font-size:11px;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}
 .none{font-size:11px;color:var(--dim3)}
-.why{font-size:11.5px;line-height:1.5;color:var(--txt2);border-left:2px solid #2f6ba8;
+.why{font-size:11.5px;line-height:1.5;color:var(--txt2);border-left:2px solid var(--lien);
 padding-left:9px;text-wrap:pretty}
 .why.absent{color:#8a7433;border-left-color:#63541f}
+.waits{margin-top:9px;display:flex;flex-direction:column;gap:3px}
 .wait{font-size:11.5px;color:var(--txt2);cursor:pointer;padding:3px 7px;background:#191d23;
 border-left:2px solid var(--running);border-radius:0 4px 4px 0}
-.facts{margin-top:10px;display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
-gap:4px 12px}
-.fact{display:flex;gap:6px;font-size:11px;border-bottom:1px solid #1a1e24;padding-bottom:3px}
-.fact .fk{color:var(--dim2);flex:none}
-.fact .fv{color:var(--txt2);margin-left:auto;overflow:hidden;text-overflow:ellipsis;
-white-space:nowrap}
-.check{display:flex;gap:7px;align-items:flex-start;font-size:11.5px;line-height:1.4}
+
+/* jauges comparatives : aucun chiffre seul, chacun porte son repere de comparaison, la
+   mediane du chantier, pour se juger. */
+.gauges{margin-top:11px;display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));
+gap:9px 16px}
+.g{min-width:0}
+.track{position:relative;height:5px;border-radius:3px;background:var(--line2);margin-top:6px;
+overflow:hidden}
+.fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
+.tick{position:absolute;top:0;bottom:0;width:1px;background:var(--dim2)}
+.gv{font-size:11px;color:var(--txt2);margin-top:5px}
+.gv em{font-style:normal;color:var(--dim3)}
+.pips{display:flex;gap:2px;height:5px;flex:1 1 auto;max-width:170px}
+.pip{flex:1 1 0;min-width:3px;height:5px;border-radius:3px;background:#2b3038}
+.pip.on{background:var(--done2)}
+.pips.fini .pip.on{background:var(--done)}
+.pip.doing{background:var(--running);animation:ordopulse 1.6s ease-in-out infinite}
+
+/* composition des jetons : quatre postes illisibles seuls, une seule barre qui les montre
+   d'un coup. Nom "jetons" et non "tok" : .tok désigne déjà le contexte du dernier tour
+   dans l'en-tête de la case, un autre chiffre que la somme des quatre postes ici. */
+.jetons{margin-top:12px}
+.jhead{display:flex;align-items:baseline;gap:8px}
+.jhead .tot{margin-left:auto;font-size:11px;color:var(--txt2)}
+.jhead .tot em{font-style:normal;color:var(--dim3)}
+.jbar{display:flex;gap:1px;height:9px;margin-top:6px;border-radius:3px;overflow:hidden;
+background:var(--line2)}
+.jbar span{min-width:2px}
+.jlegend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;font-size:10px;
+color:var(--dim2)}
+.jlegend .item{display:flex;align-items:center;gap:5px}
+.jlegend .sw{width:7px;height:7px;border-radius:2px}
+.jlegend b{font-weight:400;color:var(--txt2)}
+.jlegend i{font-style:normal;color:var(--dim3)}
+
+/* frise : la tâche située dans la fenêtre du chantier */
+.tl{margin-top:12px}
+.tlbar{position:relative;height:14px;border-radius:4px;background:#101317;
+border:1px solid #1e232a;overflow:hidden}
+.tlspan{position:absolute;top:0;bottom:0;min-width:3px;border-radius:3px;opacity:.85}
+.tlspan.open{animation:ordopulse 2.4s ease-in-out infinite}
+.tlfoot{display:flex;align-items:baseline;gap:8px;margin-top:4px;font-size:9.5px;
+color:var(--dim3)}
+.tlfoot .lab{letter-spacing:.09em;text-transform:uppercase;color:#4c5561}
+.tlfoot .rule{flex:1 1 auto;height:1px;background:#1e232a}
+
+.zones{display:flex;flex-wrap:wrap;gap:4px;margin-top:11px}
+.zone{font-size:10px;color:#9aa4b1;background:var(--badge);border:1px solid var(--line);
+border-radius:4px;padding:1px 6px}
+
+.checks{margin-top:12px}
+.chead{display:flex;align-items:center;gap:8px}
+.chead .cnt{font-size:10.5px;color:var(--dim2)}
+.check{display:flex;gap:7px;align-items:flex-start;font-size:11.5px;line-height:1.4;
+margin-top:4px}
 .box{flex:none;width:13px;height:13px;border-radius:3px;border:1px solid #2b3038;
 color:var(--done);font-size:9px;line-height:12px;text-align:center;margin-top:2px}
 .box.on{border-color:#2c4d35;background:#122116}
+.box.doing{border-color:#63541f;background:#241a0c;color:var(--running);
+animation:ordopulse 1.8s ease-in-out infinite}
 .check.on .ctext{color:#7d8794}
+.check.doing .ctext{color:var(--txt)}
 .doc{margin-top:10px}
 .doc button{width:100%;text-align:left;background:#191d23;border:1px solid #262c34;
 border-radius:6px;color:#9aa4b1;font:inherit;font-size:11px;padding:5px 9px;cursor:pointer;
@@ -1015,6 +1207,9 @@ _JS = r"""
 (function(){
 var D=null, S={sel:null,hover:null,q:"",filter:"reste",closed:{},docs:{},view:"graphe"};
 var byId={};
+// Les repères du chantier pour les jauges du détail (médiane, plafond) : calculés une
+// seule fois par jeu de données, pas à chaque case ouverte. Voir ordoContexte().
+var CTX=null;
 
 // Cle de stockage propre a la colonne. sessionStorage est commun a TOUTE l'origine, et le
 // mur ouvre plusieurs colonnes dans cette meme origine : sans ce prefixe, ouvrir une tache
@@ -1030,6 +1225,7 @@ function K(n){return "ordo-"+n+(window.ORDO_NS||"")}
 // rechargement de page, qui ramenait le lecteur en haut a chaque cycle.
 window.ordoSetData=function(data){
   D=data;byId={};D.tasks.forEach(function(t){byId[t.id]=t});
+  CTX=ordoContexte(D.tasks);
   if(S.sel&&!byId[S.sel])S.sel=null;
   if(S.hover&&!byId[S.hover])S.hover=null;
   var y=window.scrollY;
@@ -1047,17 +1243,22 @@ window.ordoRestoreScroll=function(){
 
 function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;
   if(txt!=null)e.textContent=txt;return e}
+// running se scinde en deux au dernier critère coché : la tâche tourne encore, mais il
+// n'y a plus rien à faire avancer, seulement le rapport à écrire. L'état se DÉDUIT de
+// checkDone/checkTotal, jamais déclaré en plus par l'exécutante -- une checklist sans
+// aucun critère (checkTotal 0) ne peut jamais être "à 100%" de rien.
+function finReport(t){return t.checkTotal>0&&t.checkDone===t.checkTotal}
 function kind(t){
   if(t.status==="done")return "done";
-  if(t.status==="running")return "running";
+  if(t.status==="running")return finReport(t)?"finishing":"running";
   if(t.status==="cancelled")return "cancelled";
   if(t.status==="blocked"||t.status==="failed")return "blocked";
   return t.ready?"ready":"queued";
 }
-var COL={done:"#46a35a",running:"#d3a03a",ready:"#5aa2f0",queued:"#4a5361",
-         blocked:"#e05252",cancelled:"#333941"};
-var LAB={done:"fait",running:"en cours",ready:"lançable",queued:"en attente",
-         blocked:"bloquée",cancelled:"annulée"};
+var COL={done:"#46a35a",running:"#d3a03a",finishing:"#8b5cf6",ready:"#5aa2f0",
+         queued:"#4a5361",blocked:"#e05252",cancelled:"#333941"};
+var LAB={done:"fait",running:"en cours",finishing:"termine",ready:"lançable",
+         queued:"en attente",blocked:"bloquée",cancelled:"annulée"};
 function settled(t){var k=kind(t);return k==="done"||k==="cancelled"}
 function focusId(){return S.hover||S.sel}
 function matches(t){
@@ -1098,6 +1299,12 @@ function select(id){
 
 function rowNode(t){
   var k=kind(t), sel=S.sel===t.id;
+  // Une case finie ou annulée ET fermée n'a plus de lecteur pour son contexte de jetons,
+  // sa progression de checklist ni son critère en cours : la session qui les a produits
+  // est morte, le chiffre y est figé pour toujours. Repliée, elle tombe à l'en-tête et au
+  // titre, comme une phase repliée (voir .condensed) un cran plus haut. Ouverte (sel),
+  // rien ne change : c'est la même règle qu'à la condensation des phases dans render().
+  var condense=settled(t)&&!sel;
   var cls="row "+k;
   if(sel)cls+=" sel";
   if(S.filter==="reste"&&settled(t))cls+=" settled";
@@ -1122,26 +1329,72 @@ function rowNode(t){
     head.appendChild(md);
   }
   var links=el("span","rlinks m");
-  // Duree et jetons AVANT les liens, et toujours visibles : ce sont les deux chiffres
-  // qu'on lit pendant qu'une tache tourne, c'est-a-dire au seul moment ou on la regarde.
+  // Durée et contexte AVANT les liens, et toujours visibles : ce sont les deux chiffres
+  // qu'on lit pendant qu'une tâche tourne, c'est-à-dire au seul moment où on la regarde.
   // Ils vivaient dans la ligne de meta, que la vue graphe n'affiche pas.
   if(t.duree)links.appendChild(el("span","dur",t.duree));
-  if(t.tokens)links.appendChild(el("span","tok",t.tokens));
-  // Les tours disent depuis combien de temps la tache traine son contexte. Une session
-  // longue s'allume : au dela du seuil, chaque tour supplementaire relit tout ce qui
-  // precede.
-  if(t.turns){
-    var tr=el("span","turns"+(t.sessionLongue?" longue":""),t.turns+"t");
-    tr.title=t.sessionLongue
-      ? "session longue : chaque tour relit tout le contexte accumulé"
-      : "tours de la session";
-    links.appendChild(tr);
+  // Le dépassement (passé au-delà du total estimé des critères, brief t-27) : à côté de
+  // la durée, jamais soumis à `condense` -- une tâche finie en dépassement le reste,
+  // c'est une donnée acquise pour affiner la prochaine estimation, pas un état transitoire
+  // qui s'éteint avec la case.
+  if(t.depassement){
+    var over=el("span","over",t.depassement);
+    over.title="dépassement : le temps passé dépasse le total estimé des critères";
+    links.appendChild(over);
+  }
+  // t.tokens porte le contexte du DERNIER tour (voir vue() en Python), pas la sortie
+  // cumulée de la session : c'est ce chiffre-là, pas l'autre, qui prédit ce qu'un tour de
+  // plus va coûter à relire. Il s'allume au même seuil que celui qui déclenche la
+  // compaction (usage.SEUIL_CONTEXTE), jamais un seuil posé ici. Le nombre de tours a
+  // quitté l'en-tête : il reste lisible en détail, dans les faits de la tâche.
+  if(t.tokens&&!condense){
+    var tk=el("span","tok"+(t.contexteLourd?" lourd":""),t.tokens);
+    tk.title=t.contexteLourd
+      ? "contexte lourd : au-delà du seuil de compaction"
+      : "contexte du dernier tour";
+    links.appendChild(tk);
   }
   links.appendChild(el("span",t.deps.length?"nup":"nnone","↑"+t.deps.length));
   links.appendChild(el("span",t.dependants.length?"ndown":"nnone","↓"+t.dependants.length));
   head.appendChild(links);
   row.appendChild(head);
   row.appendChild(el("div","rtitle",t.title));
+
+  // La progression de checklist et le critère en cours, visibles SANS ouvrir la tâche et
+  // dans les deux vues : sur une case fermée en vue graphe, rmeta (ci-dessous) ne s'affiche
+  // jamais, c'était la case n°1 pour laquelle une checklist entièrement cochée restait
+  // invisible tant qu'on n'ouvrait pas la tâche. Le compteur ne prend la couleur du fini
+  // qu'à l'état "done" (voir .row.done .cnt) : une checklist cochée à 100% sur une tâche
+  // encore en cours reste un compteur neutre, jamais un mensonge de succès anticipé.
+  // condense enveloppe ce bloc entier sans toucher à sa condition interne (t.checkTotal),
+  // ni à son indentation d'origine : la case rouverte (sel) doit retrouver l'exacte même
+  // construction qu'avant cette tâche, jamais une variante, et les tests qui découpent ce
+  // bloc au caractère près (voir TestEcritureDuRapportEnCours) restent valables tels quels.
+  if(!condense){
+  if(t.checkTotal){
+    var prog=el("div","rprog");
+    prog.appendChild(el("span","cnt",t.checkDone+"/"+t.checkTotal));
+    // Restant : somme des critères non cochés (brief t-27), moot une fois la case réglée
+    // -- condense comme le compteur et le libellé du critère en cours, contrairement au
+    // dépassement, resté dans l'en-tête inconditionnel.
+    if(t.restant)prog.appendChild(el("span","rest",t.restant));
+    // Le libellé du critère en cours et la mention de fin de rapport se disputent la
+    // MÊME place : jamais les deux à la fois, jamais hors d'une tâche en cours. k vaut
+    // déjà "finishing" (voir kind()) quand tout est coché sur une tâche running -- c'est
+    // le seul signal qui compte, jamais currentItem, qui peut rester périmé après un
+    // passage à "done" et raconterait alors un critère en cours qui n'existe plus.
+    if(t.status==="running"){
+      if(k==="finishing"){
+        prog.appendChild(el("span","doing rapport","Écriture du rapport en cours"));
+      }else if(t.doing){
+        var doing=el("span","doing",t.doing);
+        doing.title=t.doing;
+        prog.appendChild(doing);
+      }
+    }
+    row.appendChild(prog);
+  }
+  }
 
   if(S.view!=="graphe"||sel){
     var meta=el("div","rmeta");
@@ -1161,9 +1414,179 @@ function rowNode(t){
   return row;
 }
 
+// Les quatre postes de jetons, dans l'ordre où ils se lisent : ce qui est entré, ce qui
+// est sorti, puis le cache -- écrit une fois, relu à chaque tour. Les couleurs viennent
+// des variables déjà posées sur les états de case : entrée/sortie partagent leur teinte
+// avec les tuiles "lancable"/"fait", le cache écrit avec "en cours".
+var POSTES=[
+  {k:"jetons entres",lab:"entrés",c:"var(--ready)"},
+  {k:"jetons sortis",lab:"sortis",c:"var(--done)"},
+  {k:"cache cree",lab:"cache écrit",c:"var(--running)"},
+  {k:"cache relu",lab:"cache relu",c:"var(--relu)"}
+];
+
+// "7m", "1h50" -> minutes. Une chaîne qui ne matche rien (le tiret d'une tâche jamais
+// commencée) rend null, jamais zéro : une jauge à zéro se lirait comme une tâche
+// instantanée.
+function minutes(s){
+  s=(s||"").trim();
+  var h=/^(\d+)h(\d*)$/.exec(s), m=/^(\d+)m$/.exec(s), sec=/^(\d+)s$/.exec(s);
+  return h?+h[1]*60+(+h[2]||0):m?+m[1]:sec?0:null;
+}
+function nb(v){
+  if(v==null)return null;
+  var n=+String(v).replace(/[^\d.-]/g,"");
+  return isNaN(n)?null:n;
+}
+function fmt(n){
+  if(n==null)return "—";
+  if(n>=1e6)return (n/1e6).toFixed(2).replace(".",",")+" M";
+  if(n>=1e4)return Math.round(n/1000)+" k";
+  if(n>=1000)return (n/1000).toFixed(1).replace(".",",")+" k";
+  return String(n);
+}
+function med(vals){
+  var v=vals.filter(function(x){return x!=null}).sort(function(a,b){return a-b});
+  return v.length?v[Math.floor(v.length/2)]:0;
+}
+function maxDe(vals){
+  var v=vals.filter(function(x){return x!=null});
+  return v.length?Math.max.apply(null,v):1;
+}
+function jetonsDe(facts){
+  var s=0, vu=false;
+  POSTES.forEach(function(p){var v=nb(facts[p.k]);if(v!=null){vu=true;s+=v}});
+  return vu?s:null;
+}
+function hhmm(ms){
+  var x=new Date(ms), p=function(n){return (n<10?"0":"")+n};
+  return p(x.getDate())+"/"+p(x.getMonth()+1)+" "+p(x.getHours())+":"+p(x.getMinutes());
+}
+
+// Les repères du chantier pour les jauges du détail : médiane et plafond de durée, de
+// tours, de jetons, et le poids aval (tout ce qu'une tâche débloque, transitivement) qui
+// dit si elle ouvre un boulevard ou une impasse. Calculé une fois par jeu de données, pas
+// à chaque case ouverte (voir ordoSetData).
+function ordoContexte(tasks){
+  var poids={}, mins={}, jet={}, tours={}, stamps=[];
+  function aval(t,acc){
+    (t.dependants||[]).forEach(function(id){
+      if(!acc[id]){acc[id]=1;var dt=byId[id];if(dt)aval(dt,acc)}
+    });
+    return acc;
+  }
+  tasks.forEach(function(t){
+    var f=t.facts||{};
+    poids[t.id]=Object.keys(aval(t,{})).length;
+    mins[t.id]=minutes(f.duree);
+    jet[t.id]=jetonsDe(f);
+    tours[t.id]=nb(f.tours);
+    var a=Date.parse(f.demarree||""), b=Date.parse(f.finie||"");
+    if(!isNaN(a))stamps.push(a);
+    if(!isNaN(b))stamps.push(b);
+    // Une tâche encore en cours n'a pas de fin : la fenêtre du chantier s'étire jusqu'à
+    // maintenant, sinon sa barre sortirait du cadre par la droite.
+    if(t.status==="running"&&isNaN(b))stamps.push(Date.now());
+  });
+  var ids=tasks.map(function(t){return t.id});
+  return {poids:poids,mins:mins,jet:jet,tours:tours,
+    med:med(ids.map(function(i){return mins[i]})),
+    maxMin:maxDe(ids.map(function(i){return mins[i]})),
+    medJet:med(ids.map(function(i){return jet[i]})),
+    maxJet:maxDe(ids.map(function(i){return jet[i]})),
+    medTours:med(ids.map(function(i){return tours[i]})),
+    maxTours:maxDe(ids.map(function(i){return tours[i]})),
+    maxW:maxDe(ids.map(function(i){return poids[i]})),
+    t0:stamps.length?Math.min.apply(null,stamps):0,
+    t1:stamps.length?Math.max.apply(null,stamps):1};
+}
+
+// Une jauge = un libellé, une barre bornée par le chantier, un chiffre et son repère (la
+// médiane, en trait). txt et repère sont deux nœuds de texte séparés, jamais une chaîne
+// avec du balisage dedans : voir la règle d'échappement en tête de fichier.
+function jauge(lab,val,ref,plafond,txt,repere,coul,tip){
+  var g=el("div","g");
+  g.appendChild(el("div","k",lab));
+  var track=el("div","track");
+  if(tip)track.title=tip;
+  var w=val!=null&&plafond?Math.max(2,val/plafond*100):0;
+  var fill=el("span","fill");fill.style.width=w+"%";fill.style.background=coul;
+  track.appendChild(fill);
+  if(ref&&plafond){
+    var tick=el("span","tick");tick.style.left=(ref/plafond*100)+"%";
+    track.appendChild(tick);
+  }
+  g.appendChild(track);
+  var gv=el("div","gv m",txt);
+  if(repere)gv.appendChild(el("em",null," · "+repere));
+  g.appendChild(gv);
+  return g;
+}
+
+// n pastilles ; "essais" teinte toutes sauf la dernière en échec (rouge), le dernier
+// passage restant à désigner par la couleur de la case elle-même. Sans passage, une seule
+// pastille neutre plutôt qu'une absence, pour ne pas se lire comme un défaut d'affichage.
+function pips(n,essais){
+  var wrap=el("span","tries");
+  if(!n){wrap.appendChild(el("span","try off"));return wrap}
+  for(var i=0;i<n;i++)wrap.appendChild(el("span","try"+(essais&&i<n-1?" ko":"")));
+  return wrap;
+}
+
 function detailNode(t){
   var d=el("div","detail");
+  var ctx=CTX||ordoContexte(D?D.tasks:[t]);
+  var k=kind(t), f=t.facts||{}, enCours=t.status==="running";
+  var cl=t.checklist||[];
+  var faits=cl.filter(function(c){return c.done}).length;
+  var doingIdx=enCours?cl.map(function(c){return c.done}).indexOf(false):-1;
+  var w=ctx.poids[t.id]||0;
+  var mn=ctx.mins[t.id], tours=nb(f.tours), jt=jetonsDe(f);
+  var essais=nb(f.tentatives)||0, comp=nb(f.compactions), niveau=f.niveau;
+  var a=Date.parse(f.demarree||""), bf=Date.parse(f.finie||"");
+  var b=isNaN(bf)?(enCours?Date.now():a):bf;
+  var span=Math.max(1,ctx.t1-ctx.t0);
 
+  /* 1. qui exécute, où, combien de fois déjà, à quelle profondeur du graphe */
+  var pane=(f.pane||"").trim();
+  if(t.model||(pane&&pane!=="-")||essais||comp!=null||niveau!=null){
+    var strip=el("div","strip");
+    if(t.model){
+      var connu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
+      strip.appendChild(el("span","mdl m"+connu+(t.modelPredit?" predit":""),t.model));
+    }
+    if(pane&&pane!=="-"){
+      var vivant=/vivant/i.test(pane), mort=/MORT/.test(pane);
+      var tg=el("span","dtag"+(vivant?" vivant":mort?" mort":""));
+      tg.title="pane tmux de l'exécutante";
+      tg.appendChild(el("span","dot"+(vivant||mort?"":" off")));
+      tg.appendChild(document.createTextNode(pane));
+      strip.appendChild(tg);
+    }
+    if(essais){
+      var te=el("span","dtag");
+      te.title=essais+" passage(s), le dernier en date à droite";
+      te.appendChild(pips(essais,true));
+      te.appendChild(document.createTextNode(essais>1?essais+" passages":"1 passage"));
+      strip.appendChild(te);
+    }
+    if(comp!=null){
+      var tc=el("span","dtag");
+      tc.title="compactions de contexte subies par la session";
+      tc.appendChild(pips(comp,false));
+      tc.appendChild(document.createTextNode(
+        comp?comp+" compaction"+(comp>1?"s":""):"aucune compaction"));
+      strip.appendChild(tc);
+    }
+    if(niveau!=null){
+      var tn=el("span","mdl m","niveau "+niveau);
+      tn.title="profondeur dans le graphe de dépendances";
+      strip.appendChild(tn);
+    }
+    d.appendChild(strip);
+  }
+
+  /* 2. la chaîne : le maillon central serait la carte elle-même, il n'est pas redessiné */
   var chain=el("div","chain");
   var left=el("div","side");
   left.appendChild(el("div","k up","attend ("+t.deps.length+")"));
@@ -1171,70 +1594,158 @@ function detailNode(t){
   if(t.deps.length)t.deps.forEach(function(x){chip(x,lc)});
   else lc.appendChild(el("div","none","rien — elle peut partir seule"));
   left.appendChild(lc);chain.appendChild(left);
-  chain.appendChild(el("div","arrow","→"));
-  var self=el("div","self"),box=el("div","selfbox");
-  box.appendChild(el("div","cid2 m",t.id));
-  box.appendChild(el("div","ctitle",t.title.replace(/^[\d.]+[a-z]? /,"")));
-  self.appendChild(box);chain.appendChild(self);
-  chain.appendChild(el("div","arrow","→"));
+  chain.appendChild(el("div","sep"));
   var right=el("div","side");
-  right.appendChild(el("div","k down","débloque ("+t.dependants.length+")"));
+  var kd=el("div","k down","débloque ("+t.dependants.length+")");
+  if(w>t.dependants.length){
+    var av=el("span","aval"," "+w+" en aval");
+    av.title="tout l'aval transitif, maximum du chantier "+ctx.maxW;
+    kd.appendChild(av);
+  }
+  right.appendChild(kd);
   var rc=el("div","col");
   if(t.dependants.length)t.dependants.forEach(function(x){chip(x,rc)});
   else rc.appendChild(el("div","none","rien n'attend après elle"));
   right.appendChild(rc);chain.appendChild(right);
   d.appendChild(chain);
 
+  /* 3. le pourquoi, puis ce qui la retient */
   d.appendChild(el("div","why"+(t.whyAbsent?" absent":""),
     t.whyAbsent?"aucune explication enregistrée pour cette tâche":t.why));
-
   if(t.waits.length){
-    var w=el("div");w.style.marginTop="9px";
-    w.appendChild(el("div","k","bloquée par"));
-    var wc=el("div","col");
+    var wa=el("div","waits");
     t.waits.forEach(function(x){
-      var b=el("div","wait",x.text);
-      b.addEventListener("click",function(e){e.stopPropagation();select(x.id)});
-      wc.appendChild(b);
+      var wb=el("div","wait",x.text);
+      wb.addEventListener("click",function(e){e.stopPropagation();select(x.id)});
+      wa.appendChild(wb);
     });
-    w.appendChild(wc);d.appendChild(w);
+    d.appendChild(wa);
   }
 
-  var facts=el("div","facts");
-  Object.keys(t.facts).forEach(function(key){
-    if(key==="depend de"||key==="debloque")return;
-    var f=el("div","fact");
-    f.appendChild(el("span","fk",key));
-    f.appendChild(el("span","fv m",t.facts[key]));
-    facts.appendChild(f);
-  });
-  d.appendChild(facts);
-
-  if(t.checklist.length){
-    var c=el("div");c.style.marginTop="11px";
-    var faits=t.checklist.filter(function(x){return x.done}).length;
-    c.appendChild(el("div","k","checklist "+faits+"/"+t.checklist.length));
-    var cc=el("div","col");
-    t.checklist.forEach(function(x){
-      var line=el("div","check"+(x.done?" on":""));
-      line.appendChild(el("span","box"+(x.done?" on":""),x.done?"✓":""));
-      line.appendChild(el("span","ctext",x.text));
-      cc.appendChild(line);
+  /* 4. les jauges comparatives */
+  var gs=el("div","gauges");
+  gs.appendChild(jauge("durée",mn,ctx.med,ctx.maxMin,
+    mn!=null?f.duree:"—", mn!=null?"med "+ctx.med+"m":null,
+    mn!=null&&mn>ctx.med?"var(--running)":"var(--done2)",
+    mn!=null?mn+" min — médiane du chantier "+ctx.med+" min, plus longue "+ctx.maxMin+" min"
+      :"pas de durée enregistrée"));
+  if(tours!=null)gs.appendChild(jauge("tours",tours,ctx.medTours,ctx.maxTours,
+    String(tours),"med "+ctx.medTours,
+    tours>ctx.medTours?"var(--running)":"var(--lien)",
+    tours+" tours de boucle — médiane "+ctx.medTours+", plus bavarde "+ctx.maxTours));
+  if(jt!=null)gs.appendChild(jauge("jetons",jt,ctx.medJet,ctx.maxJet,
+    fmt(jt),"med "+fmt(ctx.medJet),
+    jt>ctx.medJet?"var(--running)":"var(--lien)",
+    "total des quatre postes — médiane du chantier "+fmt(ctx.medJet)
+      +", plus lourde "+fmt(ctx.maxJet)));
+  if(cl.length){
+    var gcrit=el("div","g");
+    gcrit.appendChild(el("div","k","critères"));
+    var pp=el("div","pips"+(k==="done"?" fini":""));
+    pp.style.marginTop="6px";pp.style.maxWidth="none";
+    cl.forEach(function(c,i){
+      pp.appendChild(el("span","pip"+(c.done?" on":i===doingIdx?" doing":"")));
     });
-    c.appendChild(cc);d.appendChild(c);
+    gcrit.appendChild(pp);
+    var gv=el("div","gv m",faits+"/"+cl.length);
+    if(doingIdx>-1)gv.appendChild(el("em",null," · 1 en cours"));
+    gcrit.appendChild(gv);
+    gs.appendChild(gcrit);
+  }
+  d.appendChild(gs);
+
+  /* 5. la composition des jetons : une barre, quatre postes, le cache visible d'un coup */
+  if(jt!=null){
+    var parts=POSTES.map(function(p){
+      var v=nb(f[p.k])||0;
+      return {lab:p.lab,c:p.c,v:v,pc:jt?v/jt*100:0};
+    });
+    var jw=el("div","jetons");
+    var jh=el("div","jhead");
+    jh.appendChild(el("span","k","composition des jetons"));
+    var tot=el("span","tot m",fmt(jt));
+    if(tours)tot.appendChild(el("em",null," · "+fmt(Math.round(jt/tours))+"/tour"));
+    jh.appendChild(tot);
+    jw.appendChild(jh);
+    var bar=el("div","jbar");
+    parts.forEach(function(p){
+      var seg=el("span",null);
+      seg.style.flex=p.v+" 0 auto";seg.style.background=p.c;
+      seg.title=p.lab+" : "+p.v.toLocaleString("fr-FR");
+      bar.appendChild(seg);
+    });
+    jw.appendChild(bar);
+    var leg=el("div","jlegend m");
+    parts.forEach(function(p){
+      var item=el("span","item");
+      var sw=el("span","sw");sw.style.background=p.c;item.appendChild(sw);
+      item.appendChild(document.createTextNode(p.lab+" "));
+      item.appendChild(el("b",null,fmt(p.v)));
+      item.appendChild(document.createTextNode(" "));
+      item.appendChild(el("i",null,Math.round(p.pc)+"%"));
+      leg.appendChild(item);
+    });
+    jw.appendChild(leg);
+    d.appendChild(jw);
   }
 
+  /* 6. la frise : la tâche située dans la fenêtre du chantier */
+  if(!isNaN(a)){
+    var tl=el("div","tl");
+    var tb=el("div","tlbar");
+    var tsp=el("span","tlspan"+(isNaN(bf)&&enCours?" open":""));
+    tsp.style.left=((a-ctx.t0)/span*100)+"%";
+    tsp.style.width=Math.max(1.2,(b-a)/span*100)+"%";
+    tsp.style.background=COL[k];
+    if(k==="cancelled")tsp.style.opacity=".35";
+    tb.appendChild(tsp);tl.appendChild(tb);
+    var tf=el("div","tlfoot m");
+    tf.appendChild(el("span","lab","fenêtre"));
+    tf.appendChild(el("span",null,hhmm(a)));
+    tf.appendChild(el("span","rule"));
+    tf.appendChild(el("span",null,isNaN(bf)?(enCours?"en cours":"—"):hhmm(bf)));
+    tl.appendChild(tf);
+    d.appendChild(tl);
+  }
+
+  /* 7. zones touchées */
+  var zones=(f.zones||"").split(",").map(function(z){return z.trim()})
+    .filter(function(z){return z&&z!=="-"});
+  if(zones.length){
+    var zo=el("div","zones");
+    zones.forEach(function(z){zo.appendChild(el("span","zone m",z))});
+    d.appendChild(zo);
+  }
+
+  /* 8. les critères, avec celui en cours désigné */
+  if(cl.length){
+    var ck=el("div","checks");
+    var ch=el("div","chead");
+    ch.appendChild(el("span","k",
+      k==="finishing"?"rédaction du rapport":doingIdx>-1?"critère en cours et suite":"critères"));
+    ck.appendChild(ch);
+    cl.forEach(function(c,i){
+      var st=c.done?" on":i===doingIdx?" doing":"";
+      var line=el("div","check"+st);
+      line.appendChild(el("span","box"+st,c.done?"✓":i===doingIdx?"·":""));
+      line.appendChild(el("span","ctext",c.text));
+      ck.appendChild(line);
+    });
+    d.appendChild(ck);
+  }
+
+  /* 9. pièces jointes */
   t.docs.forEach(function(doc,i){
     var key=t.id+":"+i, open=!!S.docs[key];
     var box2=el("div","doc"+(open?" open":""));
-    var b=document.createElement("button");
-    b.appendChild(el("span","chev2","▸"));
-    b.appendChild(el("span",null,doc.k));
-    b.appendChild(el("span","size m",(Math.round(doc.text.length/100)/10)+"k"));
-    b.addEventListener("click",function(e){
+    var bt=document.createElement("button");
+    bt.appendChild(el("span","chev2","▸"));
+    bt.appendChild(el("span",null,doc.k));
+    bt.appendChild(el("span","size m",(Math.round(doc.text.length/100)/10)+"k"));
+    bt.addEventListener("click",function(e){
       e.stopPropagation();S.docs[key]=!S.docs[key];render();
     });
-    box2.appendChild(b);
+    box2.appendChild(bt);
     var pre=document.createElement("pre");pre.className="m";pre.textContent=doc.text;
     box2.appendChild(pre);
     d.appendChild(box2);
@@ -1249,16 +1760,64 @@ function render(){
   board.innerHTML="";
   if(wires)board.appendChild(wires);
 
-  var vues=0;
+  // Rien ne tourne nulle part dans la campagne : entre deux tâches, plus aucune phase ne
+  // porterait de tâche en cours et l'écran se replierait en entier, l'inverse du but
+  // recherché. Repli de repli : la première phase de l'ordre du graphe qui porte encore
+  // du travail (une tâche ni finie ni annulée) reste ouverte à la place. Dès qu'une tâche
+  // démarre quelque part, `anyRunning` redevient vrai et ce filet ne joue plus.
+  var anyRunning=D.phases.some(function(p){
+    return p.order.map(function(i){return byId[i]}).filter(Boolean)
+      .some(function(t){return t.status==="running"});
+  });
+  var defaultKey=null;
+  if(!anyRunning){
+    D.phases.some(function(p){
+      var all=p.order.map(function(i){return byId[i]}).filter(Boolean);
+      if(all.some(function(t){return !settled(t)})){defaultKey=p.key;return true}
+      return false;
+    });
+  }
+
+  var vues=0, condense=null;
   D.phases.forEach(function(p){
     var all=p.order.map(function(i){return byId[i]}).filter(Boolean);
     var shown=all.filter(matches);
+    // Compté ici, avant le repli condensé ci-dessous : une phase compacte ne construit
+    // plus ses lignes, mais ses tâches ont bien été matchées et ne doivent pas faire
+    // croire à un plateau vide.
+    vues+=shown.length;
     var faits=all.filter(function(t){return kind(t)==="done"}).length;
     var fini=all.length>0&&all.every(settled);
     var forced=S.closed[p.key];
-    // "reste" ne cache jamais une tache : il replie les phases finies et estompe le fait.
-    // Une tache qui disparait, c'est une position qui bouge, donc un reperage perdu.
-    var open=shown.length>0&&(forced===undefined?!(S.filter==="reste"&&fini):!forced);
+    var running=all.some(function(t){return t.status==="running"});
+    // Le défaut suit ce qui bouge : seule une phase qui porte une tâche en cours reste
+    // ouverte, les autres se replient — finies ou pas encore commencées. C'est recalculé à
+    // chaque rendu, donc une phase se replie quand elle finit et s'ouvre quand une tâche y
+    // démarre, sans rien de plus à écrire. S.closed[p.key] reste le seul forçage manuel :
+    // quand il est défini, il décide SEUL (jamais `running`), dans les deux sens — une
+    // phase ouverte à la main ne se referme pas parce qu'elle finit, une phase fermée à la
+    // main ne se rouvre pas parce qu'une tâche y démarre.
+    var defautOuvert=anyRunning?running:(p.key===defaultKey);
+    var open=shown.length>0&&(forced===undefined?defautOuvert:!forced);
+
+    // Une phase finie ET repliée n'a plus rien à dire qu'un numéro, un libellé et un
+    // compte : plusieurs à la suite mangeaient toute la hauteur du mur en restant chacune
+    // sur sa ligne. Elles se regroupent donc dans une même bande qui passe à la ligne
+    // toute seule. Le clic la rouvre exactement comme le ferait son en-tête normal — même
+    // ligne S.closed[p.key]=open — donc rouverte, sa présentation redevient celle du jour,
+    // sans rien de différent.
+    if(fini&&!open){
+      if(!condense){condense=el("div","condensed");board.appendChild(condense)}
+      var chip=el("div","pchip"+(all.length&&faits===all.length?" full":""));
+      chip.appendChild(el("span","pkey m",p.key||"-"));
+      chip.appendChild(el("span","cname",p.name));
+      chip.appendChild(el("span","pcount m",faits+"/"+all.length));
+      chip.addEventListener("click",function(){S.closed[p.key]=open;render()});
+      condense.appendChild(chip);
+      return;
+    }
+    condense=null;
+
     var sec=el("section","phase"+(open?"":" closed")+(all.length&&faits===all.length?" full":""));
     var head=el("div","phead");
     head.appendChild(el("span","pkey m",p.key||"-"));
@@ -1285,7 +1844,7 @@ function render(){
       var tient=ts.some(function(t){return t.id===S.sel});
       var rang=el("div","rang"+(tient?" wide":""));
       var liste=el("div","rlist");
-      ts.forEach(function(t){liste.appendChild(rowNode(t));vues++});
+      ts.forEach(function(t){liste.appendChild(rowNode(t))});
       rang.appendChild(liste);rangs.appendChild(rang);
     });
     sec.appendChild(rangs);
@@ -1627,7 +2186,7 @@ _PANNEAU_CSS = """
 /* Une colonne fait quelques centaines de pixels : tout ce qui est marge se resserre, et
    la barre du bas se coupe au lieu de passer sur trois lignes. */
 #top{padding:9px 11px 8px}
-#board{padding:11px 11px 0}
+#board{padding:11px 11px 70vh}
 body{padding-bottom:30px}
 #legend{padding:5px 11px;flex-wrap:nowrap;white-space:nowrap;overflow:hidden}
 #foot{overflow:hidden;text-overflow:ellipsis}
@@ -1752,8 +2311,23 @@ border-radius:20px;padding:2px 8px;white-space:nowrap}
 #wtop .tag.err{border-color:#5a2f2f;color:#e05252}
 #wtop .tag.ask{border-color:#63541f;color:#e3b341;
 animation:ordopulse 2.2s ease-in-out infinite}
+#quota{display:flex;align-items:center;gap:12px;font-size:10.5px;color:var(--dim2)}
+#quota[hidden]{display:none}
+#quota .qwin{display:flex;align-items:center;gap:5px;white-space:nowrap}
+#quota .qwin.estompe{opacity:.45}
+#quota .qkey{font-weight:600;color:var(--dim)}
 .col.ask{border-right-color:#63541f}
 .col.ask .chead{background:#241a0c;border-bottom-color:#63541f}
+/* Attend son orchestratrice : rien ne tourne mais quelque chose peut partir. C'est le
+   signal le plus coûteux à manquer (vingt minutes perdues sur loko), donc le plus voyant :
+   même famille que #dead (rouge d'alerte), pas celle de .ask (choix humain, pas relance). */
+.col.wait{border-right-color:#5a2f2f}
+.col.wait .chead{background:#241010;border-bottom-color:#5a2f2f}
+/* Finie ou bloquée : rien ne tourne, rien n'est lançable. Une décision (fermer, ou nommer
+   le blocage), pas une urgence : ton neutre, distinct du rouge de .wait et de l'ambre
+   de .ask pour ne jamais se confondre avec eux. */
+.col.stall{border-right-color:#3a4048}
+.col.stall .chead{background:#1a1d22;border-bottom-color:#3a4048}
 #lgd{display:flex;gap:10px;margin-left:auto;font-size:10px;color:var(--dim2)}
 #lgd span.item{display:flex;align-items:center;gap:4px;white-space:nowrap}
 #lgd .sw{width:7px;height:7px;border-radius:2px;display:inline-block}
@@ -1795,10 +2369,31 @@ function trouver(k){
   for(var i=0;i<campagnes.length;i++)if(cleDe(campagnes[i])===k)return campagnes[i];
   return null;
 }
+// Trois situations, jamais confondues. Une exécutante vit => aucun signal (le compteur
+// "en cours" suffit déjà). Aucune exécutante mais quelque chose est lançable => la
+// campagne attend son orchestratrice, c'est le cas qui a coûté vingt minutes à l'humain,
+// il doit se voir le plus. Aucune exécutante et rien de lançable => la campagne est finie
+// ou bloquée, elle mérite d'être fermée ou son blocage nommé. Un "asking" en cours
+// explique déjà l'immobilité par une autre voie (une réponse humaine pendante) : les deux
+// signaux ne se cumulent jamais, sinon la colonne mentirait par excès. Une campagne sans
+// aucune tâche (total=0, juste créée) n'a encore rien à signaler. "ouvert" est l'état
+// francophone qu'une version antérieure écrivait encore (voir _CHANTIER_OUVERT côté
+// Python) : les deux campagnes réelles citées par le mandat (lavuln c-03, loko c-02) le
+// portent encore, un signal qui ne le reconnaîtrait pas resterait aveugle exactement là où
+// on lui demande de voir.
+function ouvert(c){return c.state==="open"||c.state==="ouvert"}
+function signal(c){
+  if(!ouvert(c)||c.asking||c.running||!c.total)return null;
+  return c.ready?"wait":"stall";
+}
 function libelle(c){
+  var sig=signal(c);
   return (c.slug||c.id)+" · "+c.done+"/"+c.total+
     (c.asking?" · CHOIX A FAIRE":"")+
-    (c.running?" · "+c.running+" en cours":"")+(c.state==="open"?"":" · "+c.state);
+    (c.running?" · "+c.running+" en cours":"")+
+    (sig==="wait"?" · ATTEND ORCHESTRATRICE":"")+
+    (sig==="stall"?" · TERMINEE OU BLOQUEE":"")+
+    (c.state==="open"?"":" · "+c.state);
 }
 // La disposition survit au rechargement : un mur qu'il faut remonter a chaque ouverture
 // n'est pas un ecran dedie, c'est un formulaire.
@@ -1876,8 +2471,10 @@ function dessiner(){
     // La colonne entiere se teinte quand son chantier attend un arbitrage. Le calque, lui,
     // vit DANS la colonne : sur un mur de six colonnes en plein ecran, il faut d'abord
     // savoir laquelle regarder.
-    var etat=trouver(cle(col));
+    var etat=trouver(cle(col)), sig=etat?signal(etat):null;
     col.node.classList.toggle("ask",!!(etat&&etat.asking));
+    col.node.classList.toggle("wait",sig==="wait");
+    col.node.classList.toggle("stall",sig==="stall");
     var url="/panel?home="+encodeURIComponent(col.home)+
             "&campaign="+encodeURIComponent(col.campaign);
     // Meme raison : la source ne se reecrit que si la cible a vraiment change, sinon
@@ -1921,6 +2518,46 @@ function premier(){
   ecrire();
 }
 
+// Âge au-delà duquel une lecture de quota est jugée trop vieille pour être montrée
+// à jour. Le fichier n'est réécrit que par une session Claude Code active : quinze
+// minutes de silence disent qu'aucune session ne tourne plus pour la rafraîchir.
+var QUOTA_AGE_MAX=15*60;
+
+function remplirQuota(q){
+  var conteneur=document.getElementById("quota");
+  var fenetres=q&&q.fenetres||[];
+  // Sans fenêtre lisible, le conteneur reste caché : une jauge vide se lirait
+  // comme "zéro consommé", ce que ce module ne sait justement pas dire.
+  if(!fenetres.length){conteneur.hidden=true;return}
+  conteneur.hidden=false;
+  // Vidage nœud par nœud, jamais par une affectation globale : la reconstruction
+  // qui suit n'utilise que createElement et textContent, une donnée du fichier de
+  // quota ne doit jamais se retrouver interprétée comme du balisage.
+  while(conteneur.firstChild)conteneur.removeChild(conteneur.firstChild);
+  var vieux=q.ageSecondes>QUOTA_AGE_MAX;
+  fenetres.forEach(function(f){
+    var perime=f.perime||vieux;
+    var item=document.createElement("span");
+    item.className="qwin"+(perime?" estompe":"");
+    if(perime)item.title=f.perime
+      ? "cette fenêtre a déjà été réinitialisée : ce pourcentage date d'avant"
+      : "lecture vieille de plus de quinze minutes : aucune session ne la rafraîchit";
+    var cle=document.createElement("span");
+    cle.className="qkey";cle.textContent=f.cle;
+    item.appendChild(cle);
+    var piste=document.createElement("span");piste.className="ptrack";
+    var barre=document.createElement("span");barre.className="pfill";
+    barre.style.width=Math.max(0,Math.min(100,f.pourcent))+"%";
+    barre.style.background=f.couleur;
+    piste.appendChild(barre);
+    item.appendChild(piste);
+    var texte=document.createElement("span");
+    texte.textContent=f.pourcent+"% · reset "+f.resetTexte;
+    item.appendChild(texte);
+    conteneur.appendChild(item);
+  });
+}
+
 function battement(){
   fetch("/api/state").then(function(r){return r.json()}).then(function(etat){
     campagnes=etat.campaigns||[];
@@ -1936,6 +2573,7 @@ function battement(){
     var ak=document.getElementById("asks");
     ak.hidden=!choix;
     ak.textContent=choix+" choix à faire";
+    remplirQuota(etat.quota);
     pulse(true);
     if(!monte){monte=true;premier()}
     dessiner();
@@ -1978,6 +2616,7 @@ def page(poll: int = POLL_S) -> str:
   <span id="mark" class="m">ORDO</span>
   <span id="pulse" title="battement du serveur"></span>
   <span class="tag" id="live"></span>
+  <span id="quota" hidden></span>
   <span class="tag err" id="pbs" hidden></span>
   <span class="tag ask" id="asks" hidden></span>
   <span id="lgd">

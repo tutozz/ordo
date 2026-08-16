@@ -7,18 +7,21 @@ de la carte reste verifiable sans serveur tmux.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ordo import carte, chantier, journal, store
+from ordo import carte, chantier, journal, store, usage
 
 
 class CarteTestCase(unittest.TestCase):
@@ -599,6 +602,59 @@ class TestHtml(CarteTestCase):
         page = self._page()
         self.assertTrue(page.lstrip().lower().startswith("<!doctype html>"))
         self.assertIn("</html>", page)
+
+
+class TestDetailDeTache(CarteTestCase):
+    """Le panneau de détail transpose une maquette dessinée à la main (t-28) : chaîne sans
+    maillon central redessiné, jauges comparatives au chantier, composition des jetons,
+    frise, zones en chips, critère en cours désigné. Ces tests portent sur le texte de la
+    page comme le reste de TestHtml : le rendu réel se vérifie au navigateur."""
+
+    def _page(self) -> str:
+        return carte.html(carte.model(self.chantier))
+
+    def test_le_maillon_central_n_est_plus_redessine(self):
+        # La carte elle-même EST déjà le maillon central sous la chaîne attend/débloque :
+        # la boîte qui répétait id et titre a disparu au profit d'un simple séparateur.
+        self._add("0.1 a")
+        page = self._page()
+        self.assertNotIn("selfbox", page)
+        self.assertIn('el("div","sep")', page)
+
+    def test_les_faits_bruts_ne_sont_plus_boucles_en_grille(self):
+        # L'ancien détail listait Object.keys(t.facts) en grille clé/valeur ; chaque fait a
+        # désormais son affichage dédié (bandeau, jauges, frise, zones), et ce code mort a
+        # disparu.
+        self._add("0.1 a")
+        page = self._page()
+        self.assertNotIn("Object.keys(t.facts)", page)
+
+    def test_le_detail_porte_les_jauges_comparatives_et_la_composition_des_jetons(self):
+        self._add("0.1 a")
+        page = self._page()
+        for marqueur in ("function ordoContexte(", 'el("div","gauges")', "function jauge(",
+                          'el("div","jetons")', "jetons entres", "jetons sortis",
+                          "cache cree", "cache relu"):
+            self.assertIn(marqueur, page, marqueur)
+
+    def test_le_detail_designe_le_critere_en_cours_par_une_case_dediee(self):
+        # currentItem (ordo check --doing) est comparé au texte de chaque critère : la case
+        # correspondante prend l'état "doing", distinct du simple "on" d'un critère coché.
+        self._add("0.1 a")
+        page = self._page()
+        self.assertIn('"box"+st', page)
+        self.assertIn("i===doingIdx", page)
+
+    def test_les_couleurs_ajoutees_sont_des_variables_pas_du_dur(self):
+        # Les teintes qui viennent de la maquette et n'avaient pas d'équivalent dans le
+        # thème existant sont posées en variables sur :root, jamais collées en dur dans les
+        # règles du détail.
+        self._add("0.1 a")
+        page = self._page()
+        for var in ("--done2:", "--lien:", "--relu:", "--badge:"):
+            self.assertIn(var, page, var)
+
+
 # ---------------------------------------------------------------------------
 # Projection consommee par la page
 # ---------------------------------------------------------------------------
@@ -742,10 +798,12 @@ class TestJetons(CarteTestCase):
         vue = carte.vue(carte.model(
             self.chantier,
             usage_de=lambda t: {"input": 0, "output": 112221, "cacheCreation": 3000,
-                                "cacheRead": 25480808, "turns": 30},
+                                "cacheRead": 25480808, "turns": 30, "dernierContexte": 48000},
         ))
         t = vue["tasks"][0]
-        self.assertEqual(t["tokens"], "112k")
+        # 48k, le contexte du dernier tour, et non 112k qui est la sortie cumulée de la
+        # session : c'est exactement le chiffre que ce module s'est trompé d'afficher.
+        self.assertEqual(t["tokens"], "48k")
         self.assertIn("112221", t["facts"]["jetons sortis"])
         self.assertIn("25480808", t["facts"]["cache relu"])
         self.assertEqual(t["facts"]["tours"], "30")
@@ -781,6 +839,105 @@ class TestDureeSurLaCarte(CarteTestCase):
         self._set_state(a["id"], state="running", startedAt="2020-01-01T00:00:00Z")
         page = carte.html(carte.model(self.chantier))
         self.assertIn('"duree"', page)
+
+
+class TestRestantEtDepassementSurLaCarte(CarteTestCase):
+    """Restant et dépassement (brief t-27) : l'estimation vit sur CHAQUE critère, le total
+    et le restant de la tâche se calculent, ils ne se saisissent jamais. Le temps passé
+    réutilise elapsedS, déjà mesuré depuis startedAt (voir TestDureeSurLaCarte) : jamais
+    un second champ que l'exécutante pourrait déclarer elle-même (c5)."""
+
+    def test_restant_est_la_somme_des_criteres_non_coches(self):
+        a = self._add("0.1 a", checklist=["c un", "c deux", "c trois"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 5},
+            {"id": cl[1]["id"], "label": "c deux", "done": False, "dureeMin": 8},
+            {"id": cl[2]["id"], "label": "c trois", "done": False, "dureeMin": 12},
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["restant"], "20m")
+
+    def test_restant_vide_quand_un_critere_non_coche_na_pas_destimation(self):
+        # Un restant partiel comprendrait le vrai restant, jamais l'inverse : mieux vaut
+        # ne rien dire que sous-estimer (c8, critère sans durée toléré).
+        a = self._add("0.1 a", checklist=["c un", "c deux"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl[0]["id"], "label": "c un", "done": False, "dureeMin": 5},
+            {"id": cl[1]["id"], "label": "c deux", "done": False},
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["restant"], "")
+
+    def test_restant_zero_quand_tout_est_coche(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 5},
+        ])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["restant"], "0m")
+
+    def test_restant_vide_sur_une_checklist_sans_aucune_duree(self):
+        # Les 349 critères existants : aucun n'a de durée, la case ne doit rien inventer.
+        self._add("0.1 a", checklist=["c un", "c deux"])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["restant"], "")
+
+    def test_depassement_vide_tant_que_le_passe_ne_depasse_pas_lestime(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(
+            a["id"], state="done",
+            startedAt="2020-01-01T00:00:00Z", finishedAt="2020-01-01T00:10:00Z",
+            checklist=[{"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 30}],
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["depassement"], "")
+
+    def test_depassement_affiche_quand_le_passe_depasse_le_total_estime(self):
+        # c7/c10 : un restant négatif affiché en zéro serait un mensonge -- ce test échoue
+        # si le dépassement cesse d'apparaître une fois le budget dépassé.
+        a = self._add("0.1 a", checklist=["c un"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(
+            a["id"], state="done",
+            startedAt="2020-01-01T00:00:00Z", finishedAt="2020-01-01T00:12:00Z",
+            checklist=[{"id": cl[0]["id"], "label": "c un", "done": True, "dureeMin": 5}],
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["depassement"], "+7m")
+
+    def test_depassement_vide_sans_aucune_estimation_connue(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        self._set_state(
+            a["id"], state="done",
+            startedAt="2020-01-01T00:00:00Z", finishedAt="2020-01-01T01:00:00Z",
+        )
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["depassement"], "")
+
+    def test_depassement_vide_sur_une_tache_jamais_lancee(self):
+        self._add("0.1 a", checklist=[{"label": "c un", "dureeMin": 5}])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["depassement"], "")
+
+    def test_le_chip_de_depassement_est_inconditionnel_comme_la_duree(self):
+        # Même traitement que t.duree (voir TestCondensationDesTachesReglees) : visible
+        # même sur une case réglée et repliée, jamais soumis à `condense`.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        garde_checklist = bloc.index("if(!condense){")
+        self.assertLess(bloc.index('el("span","dur",t.duree)'), garde_checklist)
+        self.assertLess(bloc.index("t.depassement"), garde_checklist)
+
+    def test_le_chip_de_restant_vit_dans_la_ligne_de_progression(self):
+        # Contrairement au dépassement : moot une fois la case réglée, condense comme le
+        # compteur et le libellé du critère en cours.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        self.assertIn("t.restant", bloc)
 
 
 class TestModeleSurLaCarte(CarteTestCase):
@@ -1045,55 +1202,153 @@ class TestMurEtQuestions(CarteTestCase):
         self.assertIn("serveur muet", p)
 
 
-class TestSessionSurLaCase(CarteTestCase):
-    """Ce qui exécute une tâche, et depuis combien de tours, lisible sans ouvrir la case.
+class TestMurDistingueTroisEtats(CarteTestCase):
+    """Une exécutante vit, ou la campagne attend son orchestratrice, ou elle est finie ou
+    bloquée : trois situations que /api/state doit rendre visibles sans se confondre (t-17).
 
-    Mesure sur soixante transcripts : le dernier tiers d'une session coûte 2,3 fois son
-    premier tiers. La longueur d'une session est donc le seul chiffre qui prédit ce
-    qu'elle va coûter, et c'est précisément celui qui n'apparaissait nulle part.
+    La logique vit dans du JS embarqué dans une chaîne Python (_MUR_JS) : aucune assertion
+    de chaîne ne peut prouver son comportement, seule son exécution le peut. Ces tests
+    extraient les fonctions réellement servies et les exécutent sous Node avec de vraies
+    campagnes, exactement le payload que /api/state produit.
     """
 
-    def test_une_tache_lancee_porte_ses_tours(self):
+    def _signal(self, campagne: dict) -> dict:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS du mur")
+        js = carte._MUR_JS
+        debut = js.index("function ouvert")
+        fin = js.index("// La disposition survit")
+        script = (
+            js[debut:fin]
+            + "\nconst c = " + json.dumps(campagne) + ";"
+            + "\nprocess.stdout.write(JSON.stringify({signal: signal(c), libelle: libelle(c)}));"
+        )
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    def _campagne(self, **kwargs) -> dict:
+        base = {
+            "id": "c-01", "slug": "loko", "state": "open", "asking": 0,
+            "running": 0, "ready": 0, "total": 1, "done": 0,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_une_executante_vivante_ne_declenche_aucun_signal(self):
+        r = self._signal(self._campagne(running=1, ready=0))
+        self.assertIsNone(r["signal"])
+        self.assertNotIn("ATTEND", r["libelle"])
+        self.assertNotIn("TERMINEE", r["libelle"])
+
+    def test_rien_ne_tourne_mais_quelque_chose_est_lancable_attend_l_orchestratrice(self):
+        # Le cas qui a coûté vingt minutes à l'humain sur loko c-05 : c'est celui qui doit
+        # se voir le plus.
+        r = self._signal(self._campagne(running=0, ready=1))
+        self.assertEqual(r["signal"], "wait")
+        self.assertIn("ATTEND ORCHESTRATRICE", r["libelle"])
+
+    def test_rien_ne_tourne_et_rien_n_est_lancable_campagne_finie_ou_bloquee(self):
+        r = self._signal(self._campagne(running=0, ready=0, done=1))
+        self.assertEqual(r["signal"], "stall")
+        self.assertIn("TERMINEE OU BLOQUEE", r["libelle"])
+
+    def test_l_etat_legacy_ouvert_est_reconnu_comme_ouvert(self):
+        # lavuln c-03 et loko c-02, les deux campagnes réelles citées par le mandat,
+        # portent encore cet état francophone qu'une version antérieure écrivait.
+        r = self._signal(self._campagne(state="ouvert", running=0, ready=0, done=1))
+        self.assertEqual(r["signal"], "stall")
+
+    def test_un_chantier_ferme_ne_declenche_jamais_ce_signal(self):
+        r = self._signal(self._campagne(state="closed", running=0, ready=0))
+        self.assertIsNone(r["signal"])
+
+    def test_une_question_humaine_pendante_prime_sur_le_nouveau_signal(self):
+        # "asking" est déjà porté par sa propre alerte (.ask) : cumuler un second signal
+        # ferait dire deux choses différentes de la même immobilité.
+        r = self._signal(self._campagne(running=0, ready=1, asking=1))
+        self.assertIsNone(r["signal"])
+
+    def test_une_campagne_sans_aucune_tache_ne_signale_rien(self):
+        # Juste créée, pas encore peuplée : rien à signaler, ce n'est pas "à l'arrêt".
+        r = self._signal(self._campagne(running=0, ready=0, total=0, done=0))
+        self.assertIsNone(r["signal"])
+
+    def test_le_mur_porte_les_classes_css_des_deux_nouveaux_signaux(self):
+        page = carte.page()
+        self.assertIn(".col.wait", page)
+        self.assertIn(".col.stall", page)
+
+
+class TestSessionSurLaCase(CarteTestCase):
+    """Le contexte du dernier tour d'une session en cours, lisible sans ouvrir la case.
+
+    Le nombre de tours a longtemps tenu cette place : mesuré sur cinquante-neuf sessions
+    réelles, il ratait seize d'entre elles, qui atteignaient un gros contexte en peu de
+    tours (voir le commentaire de usage.SEUIL_TOURS). Le contexte du dernier tour est le
+    chiffre qui prédit réellement ce qu'une session va coûter, et c'est lui que la
+    compaction lit pour décider (usage.SEUIL_CONTEXTE) -- la case doit donc dire le même
+    chiffre, pas un autre.
+    """
+
+    def test_une_tache_lancee_porte_le_contexte_du_dernier_tour(self):
         a = self._add("0.1 a")
         self._set_state(a["id"], state="running", paneId="%126",
                         claudeSessionId="ce85c8b5-0000")
         t = carte.vue(carte.model(
             self.chantier,
-            usage_de=lambda x: {"input": 0, "output": 900, "cacheCreation": 0,
-                                "cacheRead": 0, "turns": 180},
+            usage_de=lambda x: {"input": 0, "output": 900000, "cacheCreation": 0,
+                                "cacheRead": 0, "turns": 180, "dernierContexte": 48000},
         ))["tasks"][0]
-        self.assertEqual(t["turns"], 180)
-        # Le pane reste joignable, dans les faits : on ne va voir un pane qu'apres avoir
-        # ouvert la tache, jamais en balayant le mur du regard.
+        # 48k et non 900k : la sortie cumulée de la session grossit avec sa durée sans
+        # jamais redescendre, elle ne dit rien de ce qu'un tour de plus va coûter à relire.
+        self.assertEqual(t["tokens"], "48k")
+        # Le pane reste joignable, dans les faits : on ne va voir un pane qu'après avoir
+        # ouvert la tâche, jamais en balayant le mur du regard.
         self.assertIn("%126", t["facts"]["pane"])
 
-    def test_une_session_trop_longue_est_signalee(self):
+    def test_un_contexte_qui_depasse_le_seuil_de_compaction_est_signale(self):
         a = self._add("0.1 a")
         self._set_state(a["id"], state="running", paneId="%1")
-        longue = carte.vue(carte.model(
+        lourd = carte.vue(carte.model(
             self.chantier,
-            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
-                                "cacheRead": 0, "turns": 200},
+            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0,
+                                "turns": 5, "dernierContexte": usage.SEUIL_CONTEXTE + 1},
         ))["tasks"][0]
-        self.assertTrue(longue["sessionLongue"])
+        self.assertTrue(lourd["contexteLourd"])
 
-    def test_une_session_courte_n_est_pas_signalee(self):
+    def test_un_contexte_sous_le_seuil_de_compaction_n_est_pas_signale(self):
         a = self._add("0.1 a")
         self._set_state(a["id"], state="running", paneId="%1")
-        courte = carte.vue(carte.model(
+        leger = carte.vue(carte.model(
             self.chantier,
-            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
-                                "cacheRead": 0, "turns": 10},
+            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0,
+                                "turns": 5, "dernierContexte": usage.SEUIL_CONTEXTE - 1},
         ))["tasks"][0]
-        self.assertFalse(courte["sessionLongue"])
+        self.assertFalse(leger["contexteLourd"])
 
-    def test_une_tache_jamais_lancee_n_affiche_aucun_tour(self):
-        # Zero tour se lirait comme une session qui n'a rien fait ; la verite est qu'il
-        # n'y a pas de session du tout.
+    def test_le_seuil_qui_allume_le_contexte_vient_de_usage_jamais_d_une_copie(self):
+        # Patch usage.SEUIL_CONTEXTE lui-même, pas une copie éventuelle dans carte.py : si
+        # carte.py définissait son propre seuil, ce patch n'aurait aucun effet et le test
+        # échouerait. C'est la preuve que le seuil est bien lu là où vit la compaction.
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%1")
+        with mock.patch.object(usage, "SEUIL_CONTEXTE", 500):
+            t = carte.vue(carte.model(
+                self.chantier,
+                usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
+                                    "cacheRead": 0, "turns": 5, "dernierContexte": 600},
+            ))["tasks"][0]
+        self.assertTrue(t["contexteLourd"])
+
+    def test_une_tache_jamais_lancee_n_affiche_aucun_contexte(self):
+        # Chaîne vide et pas zéro : zéro se lirait comme "cette tâche n'a rien lu", la
+        # vérité est qu'il n'y a pas de session du tout.
         self._add("0.1 a")
         t = carte.vue(carte.model(self.chantier))["tasks"][0]
-        self.assertEqual(t["turns"], 0)
-        self.assertFalse(t["sessionLongue"])
+        self.assertEqual(t["tokens"], "")
+        self.assertFalse(t["contexteLourd"])
 
     def test_les_compactions_deja_faites_sont_dans_les_faits(self):
         a = self._add("0.1 a")
@@ -1102,22 +1357,368 @@ class TestSessionSurLaCase(CarteTestCase):
         t = carte.vue(carte.model(self.chantier))["tasks"][0]
         self.assertEqual(t["facts"]["compactions"], "2")
 
-    def test_la_page_porte_les_tours(self):
+    def test_la_page_porte_le_contexte_et_son_seuil_d_alerte(self):
         a = self._add("0.1 a")
         self._set_state(a["id"], state="running", paneId="%126")
         page = carte.html(carte.model(
             self.chantier,
             usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
-                                "cacheRead": 0, "turns": 200},
+                                "cacheRead": 0, "turns": 5, "dernierContexte": 999999999},
         ))
-        self.assertIn("sessionLongue", page)
+        self.assertIn("contexteLourd", page)
+
+    def test_le_nombre_de_tours_a_quitte_l_en_tete_de_la_case(self):
+        # Le nombre de tours n'est plus le critère de compaction : il n'a plus à occuper
+        # l'en-tête. Il reste lisible en détail, dans les faits de la tâche (voir _facts).
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%126")
+        page = carte.html(carte.model(
+            self.chantier,
+            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
+                                "cacheRead": 0, "turns": 200, "dernierContexte": 0},
+        ))
+        self.assertNotIn("sessionLongue", page)
+        self.assertNotIn('el("span","turns"', page)
 
     def test_la_case_ne_repete_ni_l_etat_ni_le_pane(self):
-        # La barre de couleur porte deja l'etat, et le repeter en toutes lettres coutait
-        # la moitie de la largeur d'une colonne : le reste debordait de la case.
+        # La barre de couleur porte déjà l'état, et le répéter en toutes lettres coûtait
+        # la moitié de la largeur d'une colonne : le reste débordait de la case.
         self._add("0.1 a")
         page = carte.html(carte.model(self.chantier))
         self.assertNotIn('el("span","rst"', page)
         self.assertNotIn('el("span","pane"', page)
         # L'information n'est pas perdue : elle passe en infobulle sur la barre.
         self.assertIn("sb.title=LAB[k]", page)
+
+
+# ---------------------------------------------------------------------------
+# Progression de checklist et critère en cours, visibles sans ouvrir la case
+# ---------------------------------------------------------------------------
+
+
+class TestProgressionSurLaCase(CarteTestCase):
+    """La progression vivait dans meta, que la vue graphe (le défaut) n'affiche que sur la
+    case sélectionnée : une checklist entièrement cochée restait invisible tant qu'on
+    n'ouvrait pas la tâche. Ces tests portent le compteur et le libellé du critère en cours
+    hors de meta, dans leur propre ligne, lue dans les deux vues."""
+
+    def test_le_libelle_du_critere_en_cours_sort_de_currentitem(self):
+        a = self._add("0.1 a", checklist=["c un", "c deux"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], currentItem=cl[1]["id"])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["doing"], "c deux")
+
+    def test_sans_critere_en_cours_le_libelle_est_vide(self):
+        # Vide, jamais un tiret ni un zéro : une case qui n'a rien déclaré ne doit rien
+        # afficher qui se lise comme une information.
+        self._add("0.1 a", checklist=["c un"])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["doing"], "")
+
+    def test_un_currentitem_qui_ne_correspond_plus_a_aucun_item_ne_fabrique_rien(self):
+        a = self._add("0.1 a", checklist=["c un"])
+        self._set_state(a["id"], currentItem="item-disparu")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["doing"], "")
+
+    def test_le_compteur_et_le_libelle_sortent_de_meta(self):
+        # meta ne s'affiche pas en vue graphe sur une case fermée (voir la classe
+        # ci-dessus) : le compteur ne peut plus vivre là s'il doit être vu sans ouvrir.
+        a = self._add("0.1 a", checklist=["c un", "c deux"])
+        cl = carte.model(self.chantier)["nodes"][a["id"]]["checklist"]
+        self._set_state(a["id"], checklist=[
+            {"id": cl[0]["id"], "label": "c un", "done": True},
+            {"id": cl[1]["id"], "label": "c deux", "done": False},
+        ], currentItem=cl[1]["id"])
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual((t["checkDone"], t["checkTotal"]), (1, 2))
+        self.assertNotIn("1/2", t["meta"])
+
+    def test_la_ligne_de_progression_n_est_pas_reservee_a_la_vue_selectionnee(self):
+        # C'est la case n°1 du brief : contrairement à rmeta, rprog ne doit dépendre ni de
+        # S.view ni de sel, sans quoi la régression revient telle quelle.
+        self._add("0.1 a", checklist=["c un"])
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn('el("div","rprog")', page)
+        avant_meta = page.index('el("div","rprog")')
+        garde_meta = page.index('if(S.view!=="graphe"||sel){')
+        self.assertLess(avant_meta, garde_meta)
+
+    def test_le_libelle_du_critere_est_a_cote_du_compteur_dans_la_meme_ligne(self):
+        self._add("0.1 a", checklist=["c un"])
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        self.assertIn('el("span","cnt",t.checkDone+"/"+t.checkTotal)', bloc)
+        self.assertIn('el("span","doing",t.doing)', bloc)
+
+    def test_le_libelle_du_critere_passe_par_textcontent_jamais_par_du_balisage(self):
+        # el() pose toujours txt en textContent (voir sa définition) : c'est cet appel-là,
+        # jamais innerHTML, qui doit porter un libellé écrit par un modèle.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn('function el(tag,cls,txt){var e=document.createElement(tag)', page)
+        self.assertIn('e.textContent=txt', page)
+        self.assertNotIn("doing.innerHTML", page)
+
+    def test_le_compteur_ne_prend_le_vert_du_fini_qu_a_l_etat_done(self):
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn(".row.done .rprog .cnt{color:var(--done)}", page)
+        # Hors de l'état "done", le compteur reste dans la teinte neutre des faits courts,
+        # jamais celle du succès : une checklist à 100% sur une tâche encore en cours ne
+        # doit pas se lire comme une tâche finie.
+        self.assertIn(".rprog .cnt{color:var(--dim2)", page)
+
+    def test_un_libelle_long_deborde_a_l_ellipse_jamais_hors_de_la_case(self):
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn(
+            ".rprog .doing{color:var(--dim);min-width:0;overflow:hidden;"
+            "text-overflow:ellipsis;", page,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Écriture du rapport en cours : troisième état visuel, ni "en cours" ni "fini"
+# ---------------------------------------------------------------------------
+
+
+class TestEcritureDuRapportEnCours(CarteTestCase):
+    """Une tâche running dont tous les critères sont cochés n'a plus de libellé de
+    critère à montrer : la case le dit en clair plutôt que de laisser un silence qui a
+    déjà fait croire une fois qu'une session était bloquée (t-16). Trois cas, jamais
+    confondus : running+partiel -> libellé, running+complet -> mention, done -> ni
+    l'un ni l'autre."""
+
+    def test_toutes_les_cases_cochees_et_running_affiche_la_mention_rapport(self):
+        # c1 : le libellé du critère en cours n'existe plus une fois tout coché -- la case
+        # dit alors en clair qu'elle termine, dans son propre texte, jamais deviné d'un
+        # champ vide.
+        self._add("0.1 a", checklist=["c un"])
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        self.assertIn('if(k==="finishing"){', bloc)
+        self.assertIn(
+            'el("span","doing rapport","Écriture du rapport en cours")', bloc,
+        )
+
+    def test_la_mention_rapport_porte_sa_propre_couleur_violette(self):
+        # Troisième état, pas une nuance du deuxième (jaune "en cours") ni du premier
+        # (vert "fini") : sa propre variable de thème, la même que celle qui teint déjà la
+        # barre de couleur de la case entière via kind()/COL.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn("--finishing:#8b5cf6", page)
+        self.assertIn(
+            ".rprog .doing.rapport{color:var(--finishing);font-weight:600}", page,
+        )
+        self.assertIn('finishing:"#8b5cf6"', page)
+
+    def test_le_libelle_du_critere_reste_l_alternative_quand_rien_n_est_fini(self):
+        # c2 : la mention rapport et le libellé du critère en cours sont le if/else d'une
+        # seule et même condition -- jamais deux blocs indépendants qui pourraient un jour
+        # diverger ou s'afficher ensemble.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        self.assertIn(
+            'if(k==="finishing"){\n'
+            '        prog.appendChild(el("span","doing rapport",'
+            '"Écriture du rapport en cours"));\n'
+            '      }else if(t.doing){\n'
+            '        var doing=el("span","doing",t.doing);',
+            bloc,
+        )
+
+    def test_ni_libelle_ni_mention_rapport_hors_d_une_tache_en_cours(self):
+        # c3 : done, blocked, cancelled, ready, queued -- aucun des deux ne doit sortir.
+        # Prouvé structurellement : les deux branches vivent SOUS if(t.status==="running"),
+        # donc inatteignables ailleurs, sans dépendre d'un currentItem qui pourrait rester
+        # périmé après la fin de la tâche (voir chantier.check, qui ne le vide que si
+        # l'item déclaré est celui qu'on coche).
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        garde = bloc.index('if(t.status==="running"){')
+        rapport = bloc.index("doing rapport")
+        libelle = bloc.index('el("span","doing",t.doing)')
+        fin_garde = bloc.index('    }\n    row.appendChild(prog);')
+        self.assertLess(garde, rapport)
+        self.assertLess(garde, libelle)
+        self.assertLess(rapport, fin_garde)
+        self.assertLess(libelle, fin_garde)
+
+    def test_une_tache_sans_critere_ne_construit_aucune_ligne_de_progression(self):
+        # c4 : aucun critère, donc aucune ligne -- ni compteur, ni libellé, ni mention. Le
+        # garde-fou if(t.checkTotal) enveloppe la construction entière de rprog, y compris
+        # la mention de fin de rapport.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index("function rowNode(t){"):page.index('if(S.view!=="graphe"||sel){')]
+        garde = bloc.index("if(t.checkTotal){")
+        prog = bloc.index('el("div","rprog")')
+        rapport = bloc.index("doing rapport")
+        self.assertLess(garde, prog)
+        self.assertLess(garde, rapport)
+
+
+# ---------------------------------------------------------------------------
+# Pliage des phases : ouverture par défaut, suivi automatique, forçage humain
+# ---------------------------------------------------------------------------
+
+
+class TestPliageDesPhases(CarteTestCase):
+    """Ces tests portent sur le rendu JS embarqué dans la page (voir TestHtml et
+    TestMurQuota pour le précédent) : il n'y a pas de navigateur ici, donc pas de DOM à
+    faire tourner. Ce qui est vérifié est le CONTRAT que la page embarque, assez précis
+    pour casser si le calcul d'ouverture ou le regroupement condensé régressent."""
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_le_defaut_d_ouverture_vient_des_taches_en_cours_pas_du_filtre(self):
+        # Avant : une phase s'ouvrait par défaut sauf si le filtre "reste" et qu'elle était
+        # finie -- une phase jamais commencée restait ouverte, ce que le brief interdit.
+        page = self._page()
+        self.assertIn('running=all.some(function(t){return t.status==="running"})', page)
+        self.assertIn("forced===undefined?defautOuvert:!forced", page)
+        self.assertNotIn('S.filter==="reste"&&fini', page)
+
+    def test_le_forcage_manuel_decide_seul_quand_il_est_pose(self):
+        # La même expression que ci-dessus le prouve structurellement : quand `forced` est
+        # défini, seul `!forced` compte dans la branche -- jamais `defautOuvert`, donc jamais
+        # `running`. Un changement d'état qui rouvrirait ou refermerait une phase forcée
+        # casserait cette chaîne.
+        page = carte.panneau("/tmp/ordo-home", "c-7")
+        self.assertIn("forced===undefined?defautOuvert:!forced", page)
+
+    def test_rien_ne_tourne_la_première_phase_à_finir_reste_ouverte(self):
+        # t-18 : entre deux tâches, plus aucune phase ne porte de tâche en cours -- avant
+        # ce filet, `running` valait faux partout et l'écran se repliait en entier, l'inverse
+        # du but recherché. `defautOuvert` retombe alors sur la première phase de l'ordre du
+        # graphe qui porte encore une tâche ni finie ni annulée.
+        page = self._page()
+        self.assertIn(
+            'var anyRunning=D.phases.some(function(p){\n'
+            '    return p.order.map(function(i){return byId[i]}).filter(Boolean)\n'
+            '      .some(function(t){return t.status==="running"});\n'
+            '  });',
+            page,
+        )
+        self.assertIn(
+            'if(all.some(function(t){return !settled(t)})){defaultKey=p.key;return true}',
+            page,
+        )
+        self.assertIn("var defautOuvert=anyRunning?running:(p.key===defaultKey);", page)
+
+    def test_une_tâche_qui_démarre_rend_la_main_au_repli_normal(self):
+        # Dès qu'une tâche tourne quelque part, `anyRunning` est vrai et `defautOuvert`
+        # retombe exactement sur `running` -- le comportement de t-13, phase par phase, sans
+        # plus aucune trace du filet de repli.
+        page = self._page()
+        self.assertIn("var defautOuvert=anyRunning?running:(p.key===defaultKey);", page)
+
+    def test_les_phases_finies_repliees_se_regroupent_en_bande_condensee(self):
+        page = self._page()
+        self.assertIn('el("div","condensed")', page)
+        self.assertIn('el("div","pchip"', page)
+        self.assertIn(".condensed{display:flex;flex-wrap:wrap", page)
+
+    def test_une_puce_condensee_garde_sa_cle_son_libelle_et_son_compte(self):
+        page = self._page()
+        self.assertIn('chip.appendChild(el("span","pkey m",p.key||"-"))', page)
+        self.assertIn('chip.appendChild(el("span","cname",p.name))', page)
+        self.assertIn('chip.appendChild(el("span","pcount m",faits+"/"+all.length))', page)
+
+    def test_une_puce_condensee_se_rouvre_par_le_meme_mecanisme_que_l_en_tete(self):
+        # Le même geste "S.closed[p.key]=open;render()" doit apparaître exactement deux
+        # fois : une pour l'en-tête d'une phase normale, une pour la puce condensée. Toute
+        # divergence romprait la promesse que la réouverture ne change rien à l'affichage.
+        page = self._page()
+        self.assertEqual(page.count("S.closed[p.key]=open;render()"), 2)
+
+    def test_une_puce_condensee_ne_deborde_pas_sur_un_libelle_long(self):
+        page = self._page()
+        self.assertIn(
+            '.pchip .cname{font-size:11px;color:var(--txt2);min-width:0;overflow:hidden;',
+            page,
+        )
+
+    def test_un_espace_de_defilement_suit_la_fin_du_plateau(self):
+        # De la place après le contenu, pas un défilement : c'est l'humain qui scrolle.
+        page = self._page()
+        self.assertIn("#board{position:relative;padding:14px 14px 70vh}", page)
+        colonne = carte.panneau("/tmp/ordo-home", "c-7")
+        self.assertIn("#board{padding:11px 11px 70vh}", colonne)
+
+    def test_aucun_defilement_automatique_n_accompagne_le_nouvel_espace(self):
+        # Compte figé des appels qui déplacent le défilement tout seuls : select() en garde
+        # un (recentrer la tâche choisie), ordoSetData et ordoRestoreScroll deux autres
+        # (revenir où on était). Un troisième site de scrollTo ou un second de scrollBy
+        # signalerait un défilement automatique ajouté à tort.
+        self.assertEqual(carte._JS.count("scrollTo("), 2)
+        self.assertEqual(carte._JS.count("scrollBy("), 1)
+        self.assertNotIn("scrollIntoView", carte._JS)
+
+
+# ---------------------------------------------------------------------------
+# Condensation des tâches réglées : t-13 un cran plus bas (t-24)
+# ---------------------------------------------------------------------------
+
+
+class TestCondensationDesTachesReglees(CarteTestCase):
+    """Une case finie ou annulée, fermée, occupait la même hauteur qu'une case en cours et
+    affichait des chiffres qui n'ont plus de lecteur (contexte de jetons figé, progression
+    de checklist redondante avec l'état "fait"). Même principe que la condensation des
+    phases (voir TestPliageDesPhases), un cran plus bas : reste cliquable, retrouve sa
+    présentation entière une fois ouverte."""
+
+    def test_le_repli_se_declenche_sur_une_case_reglee_et_fermee(self):
+        # Repose sur settled(), déjà partagée avec le repli des phases : une tâche annulée
+        # (c5) suit donc mécaniquement le même sort qu'une tâche finie, sans code séparé.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn("var condense=settled(t)&&!sel;", page)
+
+    def test_le_contexte_de_jetons_disparait_sur_une_case_condensee(self):
+        # c2 : la session qui a produit ce chiffre est morte, il ne bouge plus.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn('if(t.tokens&&!condense){', page)
+
+    def test_la_progression_de_checklist_disparait_sur_une_case_condensee(self):
+        # c3 : "7/7" ne dit rien de plus que l'état "fait" et la couleur de la barre. Le
+        # bloc entier (compteur, critère en cours, mention de fin de rapport) est enveloppé
+        # d'un seul garde-fou, sans toucher à sa condition interne ni à son indentation --
+        # les tests de TestEcritureDuRapportEnCours, qui découpent ce bloc au caractère
+        # près, doivent rester valables tels quels.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index("function rowNode(t){"):page.index('if(S.view!=="graphe"||sel){')]
+        garde = bloc.index("if(!condense){")
+        interne = bloc.index("if(t.checkTotal){")
+        self.assertLess(garde, interne)
+
+    def test_la_duree_le_modele_et_les_compteurs_de_dependances_restent_inconditionnels(self):
+        # c4 : ce que la case garde n'est jamais soumis à `condense`. Preuve structurelle --
+        # les trois constructions sont posées avant le seul garde-fou qui enveloppe un bloc
+        # entier (la checklist) ; le badge du modèle est même construit avant que `condense`
+        # soit déclaré.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        garde_checklist = bloc.index("if(!condense){")
+        self.assertLess(bloc.index('el("span","dur",t.duree)'), garde_checklist)
+        self.assertLess(bloc.index('head.appendChild(md)'), garde_checklist)
+        self.assertLess(
+            bloc.index('el("span",t.deps.length?"nup":"nnone"'), garde_checklist,
+        )
+
+    def test_une_case_condensee_reste_cliquable_et_repliee_seulement_fermee(self):
+        # c6 : `condense` vaut faux dès que sel est vrai -- la case ouverte reconstruit tout
+        # le bloc de checklist et de contexte, exactement comme avant t-24. Et rowNode ne
+        # perd ni son data-row ni son écouteur de clic, quel que soit l'état.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn("var condense=settled(t)&&!sel;", page)
+        self.assertIn('row.setAttribute("data-row",t.id)', page)
+        self.assertIn('row.addEventListener("click",function(e){e.stopPropagation();select(t.id)});', page)
+
+    def test_une_case_annulee_suit_le_meme_repli_qu_une_case_finie(self):
+        # c5, au niveau du modèle cette fois : settled() traite done et cancelled à
+        # l'identique, donc condense aussi, sans qu'aucune tâche annulée n'ait besoin de son
+        # propre garde-fou.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn(
+            'function settled(t){var k=kind(t);return k==="done"||k==="cancelled"}', page,
+        )

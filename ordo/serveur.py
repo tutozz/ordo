@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import carte, chantier, panes, quota, store, usage
+from . import carte, chantier, journal, panes, quota, routage, store, usage
 
 # Port fixe, et fixe volontairement. Un port tire au hasard obligerait a le retrouver a
 # chaque fois, ce qui interdit le favori qui fait tout l'interet de la chose.
@@ -308,54 +308,88 @@ def _vivants() -> Callable[[str], bool] | None:
     return lambda pane_id: pane_id in ids
 
 
-# Verrou du rechargement de carte.py. Il couvre le contrôle de fraîcheur, le reload
-# éventuel ET l'appel aux fonctions du module pendant tout le rendu d'une réponse : sans
-# cette dernière partie, un reload pourrait remplacer une fonction de carte pendant qu'une
-# autre requête est en train de l'appeler, et lui faire lire un module à moitié redéfini.
-# Mesure faite (voir test_serveur.py), un reload de carte.py coûte environ 0.2 ms : le tenir
-# fermé le temps du rendu d'une carte ne crée pas d'attente sensible.
+# Verrou du rechargement de la page. Il couvre le contrôle de fraîcheur, le reload
+# éventuel de chaque module ET l'appel aux fonctions de carte.py pendant tout le rendu d'une
+# réponse : sans cette dernière partie, un reload pourrait remplacer une fonction pendant
+# qu'une autre requête est en train de l'appeler, et lui faire lire un module à moitié
+# redéfini. Mesure faite (voir test_serveur.py, test_cout_reload_borne), recharger les six
+# modules ci-dessous coûte environ 0.6 ms au total : le tenir fermé le temps du rendu d'une
+# carte ne crée pas d'attente sensible.
 _VERROU_CARTE = threading.Lock()
 
-# mtime en nanosecondes de carte.py lors du dernier essai de rechargement, réussi ou non.
-# Un essai qui échoue n'est rejoué qu'au prochain changement du fichier : le retenter à
-# chaque requête paierait le même coût pour le même résultat tant que personne n'a retouché
-# le fichier cassé.
-_carte_mtime: int | None = None
+# mtime en nanosecondes de chaque module lors du dernier essai de rechargement, réussi ou
+# non. Un essai qui échoue n'est rejoué qu'au prochain changement du fichier concerné : le
+# retenter à chaque requête paierait le même coût pour le même résultat tant que personne
+# n'a retouché le fichier cassé. Clé : l'objet module lui-même, pas son nom -- ça laisse les
+# tests substituer un module factice sans avoir à faire coïncider un nom de chaîne.
+_mtimes: dict[object, int | None] = {}
 
-# Message du dernier échec de rechargement, ou None si le module en mémoire est à jour et
+# Message du dernier échec de rechargement de chaque module, ou None s'il est à jour et
 # valide. Sert de source à la page d'erreur : une source cassée doit se voir à l'écran, pas
 # disparaître derrière une carte périmée qui semble à jour.
-_carte_erreur: str | None = None
+_erreurs: dict[object, str | None] = {}
+
+
+def _modules_page() -> tuple:
+    """Modules dont la page dépend réellement, dans l'ordre où ils doivent être rechargés.
+
+    Recensement (imports internes de chaque module, lu dans le code, pas deviné) :
+    carte.py importe chantier, journal, routage, store et usage ; journal.py importe à son
+    tour chantier et store ; chantier.py importe store ; routage.py, store.py et usage.py
+    n'importent rien en interne. C'est tout le graphe -- aucun de ces modules n'en importe
+    d'autres qui ne soient déjà dans cette liste.
+
+    L'ordre place chaque module APRÈS tous ceux dont il dépend : store, routage et usage
+    n'ont pas de dépendance entre eux et peuvent venir dans n'importe quel ordre ; chantier
+    vient ensuite car il dépend de store ; journal après, car il dépend de chantier et
+    store ; carte en dernier, puisque c'est le seul à dépendre de tous les autres. Recharger
+    dans le sens inverse laisserait un module tenir une référence vers l'ancienne version de
+    celui dont il dépend -- le même mélange de versions qui a produit la panne du
+    2026-08-16 (chantier.py rechargé sans carte.py, ou ici l'inverse), déplacé d'un cran.
+    """
+    return (store, routage, usage, chantier, journal, carte)
 
 
 @contextmanager
 def _carte_a_jour():
-    """Contexte qui recharge carte.py si son fichier a changé, puis tient le verrou pour
-    tout le rendu qui suit. Cède le message d'erreur du dernier essai de rechargement, ou
-    None si le module servi est à jour et valide.
+    """Contexte qui recharge tout module de `_modules_page()` dont le fichier a changé,
+    dans l'ordre, puis tient le verrou pour tout le rendu qui suit. Cède le message
+    d'erreur du dernier module en échec, ou None si tout est à jour et valide.
 
-    Le coût du cas courant est un seul stat() : le navigateur interroge ce serveur en
-    continu, et la très grande majorité de ces requêtes tombent entre deux modifications du
-    fichier. Recharger à chaque requête, mesure faite, aurait été à peine plus cher (~0.2 ms
-    contre ~0.001 ms pour le stat seul) mais aurait payé ce coût même quand rien n'a changé.
+    Le coût du cas courant est un stat() par module : le navigateur interroge ce serveur en
+    continu, et la très grande majorité de ces requêtes tombent entre deux modifications de
+    fichier. Mesuré sur les six modules réels : environ 0,02 ms/requête en régime stable
+    (rien n'a changé), contre environ 0,61 ms quand les six rechargent à la fois -- ce
+    second cas ne survient qu'à l'instant où du code vient de changer. Voir
+    TestCoutRechargement dans test_serveur.py.
+
+    Dès qu'un module échoue à se recharger (ou est resté en échec depuis un essai
+    précédent), la boucle s'arrête : les modules suivants dépendent potentiellement de
+    celui-là, et les recharger quand même les ferait tourner contre une version cassée ou
+    à moitié réécrite.
     """
-    global _carte_mtime, _carte_erreur
     with _VERROU_CARTE:
-        try:
-            mtime = Path(carte.__file__).stat().st_mtime_ns
-        except OSError as exc:
-            _carte_mtime = None
-            _carte_erreur = f"carte.py introuvable : {exc}"
-        else:
-            if mtime != _carte_mtime:
-                try:
-                    importlib.reload(carte)
-                except Exception as exc:  # noqa: BLE001 - une source cassée se sert, ne tue pas le serveur
-                    _carte_erreur = f"{type(exc).__name__}: {exc}"
-                else:
-                    _carte_erreur = None
-                _carte_mtime = mtime
-        yield _carte_erreur
+        erreur: str | None = None
+        for module in _modules_page():
+            if erreur is not None:
+                break
+            nom = module.__name__.rsplit(".", 1)[-1]
+            try:
+                mtime = Path(module.__file__).stat().st_mtime_ns
+            except OSError as exc:
+                _mtimes[module] = None
+                _erreurs[module] = f"{nom}.py introuvable : {exc}"
+            else:
+                if mtime != _mtimes.get(module):
+                    try:
+                        importlib.reload(module)
+                    except Exception as exc:  # noqa: BLE001 - une source cassée se sert, ne tue pas le serveur
+                        _erreurs[module] = f"{nom}.py : {type(exc).__name__}: {exc}"
+                    else:
+                        _erreurs[module] = None
+                    _mtimes[module] = mtime
+            erreur = _erreurs.get(module)
+        yield erreur
 
 
 def _page_erreur_reload(erreur: str) -> str:

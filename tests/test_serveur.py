@@ -559,16 +559,22 @@ class TestRechargementCarte(ServeurVivantTestCase):
         sys.path.insert(0, str(self._carte_dir))
         importlib.invalidate_caches()
         self._vrai_carte = serveur.carte
-        self._mtime_avant = serveur._carte_mtime
-        self._erreur_avant = serveur._carte_erreur
         serveur.carte = importlib.import_module(self._nom_module)
-        serveur._carte_mtime = None
-        serveur._carte_erreur = None
+        # _modules_page() est patché pour ne porter QUE le faux carte : sans ce patch, le
+        # cycle de rechargement irait aussi recharger les vrais chantier/journal/store/
+        # routage/usage, alors que d'autres exécutantes écrivent certains de ces fichiers
+        # au moment même où ce test tourne.
+        self._patch_modules = mock.patch.object(
+            serveur, "_modules_page", return_value=(serveur.carte,)
+        )
+        self._patch_modules.start()
 
     def tearDown(self) -> None:
+        module_factice = serveur.carte
+        self._patch_modules.stop()
         serveur.carte = self._vrai_carte
-        serveur._carte_mtime = self._mtime_avant
-        serveur._carte_erreur = self._erreur_avant
+        serveur._mtimes.pop(module_factice, None)
+        serveur._erreurs.pop(module_factice, None)
         sys.modules.pop(self._nom_module, None)
         try:
             sys.path.remove(str(self._carte_dir))
@@ -672,3 +678,142 @@ class TestRechargementCarte(ServeurVivantTestCase):
         fil_ecrivain.join(timeout=5)
         self.assertEqual(erreurs, [])
         self.assertTrue(serveur.is_up(self.port))
+
+
+# ---------------------------------------------------------------------------
+# Rechargement des modules dont carte.py dépend (t-37)
+# ---------------------------------------------------------------------------
+#
+# Panne réelle du 2026-08-16 : carte.py était rechargé, chantier.py non, et le serveur a
+# fini par exécuter un carte.py de deux minutes contre un chantier.py de trois heures --
+# jusqu'à un 500 AttributeError sur une fonction pourtant bien écrite. Ces tests ne
+# touchent JAMAIS le vrai ordo/chantier.py ni le vrai ordo/carte.py : une autre exécutante
+# y travaille en même temps. Deux faux modules jouent leurs rôles -- une "dépendance"
+# factice, et une "carte" factice qui l'importe et appelle sa fonction, exactement comme
+# le vrai carte.py appelait chantier.ecart_estime_reel().
+
+_DEP_V1 = 'def valeur():\n    return "dep v1"\n'
+_DEP_V2 = 'def valeur():\n    return "dep v2"\n'
+# Erreur de syntaxe volontaire, comme _CARTE_CASSEE plus haut.
+_DEP_CASSE = 'def valeur():\n    return "dep casse\n'
+
+_CARTE_CHAINE_TMPL = (
+    'import {nom_dep}\n'
+    '\n'
+    'def page(poll=0):\n'
+    '    return "<!doctype html><html><body>" + {nom_dep}.valeur() + "</body></html>"\n'
+)
+
+
+class TestRechargementChaine(ServeurVivantTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._dir = Path(self._tmp) / "faux_chaine"
+        self._dir.mkdir()
+        self._nom_dep = f"dep_fake_{id(self)}"
+        self._nom_carte = f"carte_chaine_fake_{id(self)}"
+        self._fichier_dep = self._dir / f"{self._nom_dep}.py"
+        self._fichier_carte = self._dir / f"{self._nom_carte}.py"
+        self._fichier_dep.write_text(_DEP_V1, encoding="utf-8")
+        self._fichier_carte.write_text(
+            _CARTE_CHAINE_TMPL.format(nom_dep=self._nom_dep), encoding="utf-8"
+        )
+        self._mtimes_fake = {"dep": 1_000_000_000, "carte": 1_000_000_000}
+        os.utime(self._fichier_dep, ns=(self._mtimes_fake["dep"],) * 2)
+        os.utime(self._fichier_carte, ns=(self._mtimes_fake["carte"],) * 2)
+        self._bytecode_avant = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(self._dir))
+        importlib.invalidate_caches()
+        self._vrai_carte = serveur.carte
+        self._dep = importlib.import_module(self._nom_dep)
+        serveur.carte = importlib.import_module(self._nom_carte)
+        # Ordre : dep avant carte, comme _modules_page() place chantier avant carte --
+        # carte est seul à dépendre de l'autre.
+        self._patch_modules = mock.patch.object(
+            serveur, "_modules_page", return_value=(self._dep, serveur.carte)
+        )
+        self._patch_modules.start()
+
+    def tearDown(self) -> None:
+        dep, carte_factice = self._dep, serveur.carte
+        self._patch_modules.stop()
+        serveur.carte = self._vrai_carte
+        serveur._mtimes.pop(dep, None)
+        serveur._erreurs.pop(dep, None)
+        serveur._mtimes.pop(carte_factice, None)
+        serveur._erreurs.pop(carte_factice, None)
+        sys.modules.pop(self._nom_dep, None)
+        sys.modules.pop(self._nom_carte, None)
+        try:
+            sys.path.remove(str(self._dir))
+        except ValueError:
+            pass
+        sys.dont_write_bytecode = self._bytecode_avant
+        super().tearDown()
+
+    def _ecrire(self, cle: str, fichier: Path, contenu: str) -> None:
+        """Réécrit un des deux faux fichiers avec un mtime garanti différent du précédent."""
+        self._mtimes_fake[cle] += 1_000_000
+        fichier.write_text(contenu, encoding="utf-8")
+        os.utime(fichier, ns=(self._mtimes_fake[cle],) * 2)
+
+    def test_une_fonction_ajoutee_dans_le_module_dependant_est_servie_sans_redemarrage(self):
+        # c6 : le test qui aurait attrapé la panne -- une fonction neuve dans un module
+        # AUTRE que carte.py, appelée depuis carte.py, alors que carte.py lui-même ne
+        # change pas.
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("dep v1", corps)
+        self._ecrire("dep", self._fichier_dep, _DEP_V2)
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("dep v2", corps)
+        self.assertNotIn("dep v1", corps)
+
+    def test_un_module_dependant_casse_bloque_la_chaine_sans_tuer_le_serveur(self):
+        # c3 + c5 : l'échec du module dont dépend carte.py arrête la chaîne avant carte.py
+        # (l'ordre protège contre un mélange de versions), se sert en erreur explicite (le
+        # garde-fou de t-30, étendu), et se répare seul dès que le fichier redevient valide.
+        self._ecrire("dep", self._fichier_dep, _DEP_CASSE)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/")
+        self.assertEqual(ctx.exception.code, 500)
+        corps = ctx.exception.read().decode("utf-8")
+        ctx.exception.close()
+        self.assertIn(self._nom_dep, corps)
+        self.assertIn("SyntaxError", corps)
+        self.assertTrue(serveur.is_up(self.port))
+        self._ecrire("dep", self._fichier_dep, _DEP_V2)
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("dep v2", corps)
+
+    def test_le_module_dependant_change_seul_ne_derange_pas_carte(self):
+        # Le sens inverse de l'ordre : carte.py n'a pas changé, seule sa dépendance a
+        # bougé -- ça doit suffire, sans qu'il soit besoin de retoucher carte.py pour
+        # déclencher quoi que ce soit.
+        self._ecrire("dep", self._fichier_dep, _DEP_V2)
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("dep v2", corps)
+
+
+class TestCoutRechargement(unittest.TestCase):
+    """c4 : le coût mesuré à l'ajout d'un seul module (~0,2 ms, t-30) doit rester
+    négligeable une fois les six modules réels dont dépend la page inclus dans le cycle.
+
+    Mesuré à l'écriture sur les six modules réels (store, routage, usage, chantier,
+    journal, carte) : environ 0,02 ms/appel en régime stable, contre environ 0,61 ms quand
+    les six rechargent à la fois. La borne ci-dessous laisse une marge large contre le
+    bruit de la machine qui exécute le test, tout en restant nettement sous le coût d'un
+    rechargement complet -- de quoi rougir si le code se met à recharger à chaque appel au
+    lieu de se contenter d'un stat().
+    """
+
+    def test_regime_stable_reste_negligeable(self):
+        with serveur._carte_a_jour():
+            pass  # chauffe : aligne le mtime connu de chaque module sur le disque
+        n = 500
+        debut = time.perf_counter()
+        for _ in range(n):
+            with serveur._carte_a_jour():
+                pass
+        duree = (time.perf_counter() - debut) / n
+        self.assertLess(duree, 0.0002, f"{duree * 1000:.4f} ms/appel")

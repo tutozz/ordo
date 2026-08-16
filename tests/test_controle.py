@@ -825,3 +825,119 @@ class TestTickChantierIsolation(ControleTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCompaction(ControleTestCase):
+    """La compaction automatique d'une exécutante trop longue.
+
+    Mesure sur soixante transcripts réels : chaque jeton entré dans une session est
+    ensuite relu cent fois, et le dernier tiers d'une session coûte 2,3 fois son premier
+    tiers. Le contexte n'est pas gros, il est porté trop longtemps. Compacter le remet à
+    plat sans perdre ce que la session a appris, ce qu'un redémarrage, lui, perdrait.
+    """
+
+    def _executante(self, tours: int, pane: str = "%1", compactee_a: int | None = None):
+        """Une tâche qui tourne, avec un nombre de tours simulé. Rend son identifiant."""
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id=pane)
+        champs = {"claudeSessionId": "s-" + tid}
+        if compactee_a is not None:
+            champs["compactedAtTurn"] = compactee_a
+            champs["compactions"] = 1
+        self._set_task(tid, **champs)
+        self._tours = {tid: tours}
+        return cid, tid
+
+    def _tick(self, cid, tours_par_tache, busy=False, seuil=75):
+        """Lance la compaction avec des tours simulés et un pane au repos par défaut."""
+        def faux_usage(task):
+            n = tours_par_tache.get(task["id"])
+            return None if n is None else {"turns": n, "input": 0, "output": 0,
+                                           "cacheCreation": 0, "cacheRead": 0}
+        envois = []
+        with mock.patch.object(controle.usage, "pour", side_effect=faux_usage), \
+             mock.patch.object(controle.panes, "busy", return_value=busy), \
+             mock.patch.object(controle.panes, "send",
+                               side_effect=lambda p, t: envois.append((p, t))), \
+             mock.patch.object(controle, "COMPACT_TOURS", seuil):
+            evenements = controle._compacter(cid)
+        return envois, evenements
+
+    def test_une_executante_au_dela_du_seuil_recoit_la_compaction(self):
+        cid, tid = self._executante(tours=80)
+        envois, evenements = self._tick(cid, {tid: 80})
+        self.assertEqual(envois, [("%1", "/compact")])
+        self.assertTrue(any("compact" in e for e in evenements))
+
+    def test_une_executante_en_deca_du_seuil_est_laissee_tranquille(self):
+        cid, tid = self._executante(tours=74)
+        envois, _ = self._tick(cid, {tid: 74})
+        self.assertEqual(envois, [])
+
+    def test_le_meme_palier_ne_declenche_pas_deux_fois(self):
+        # Sans cette memoire, chaque battement de la veille renverrait /compact a une
+        # session deja compactee, et la session ne ferait plus que se compacter.
+        cid, tid = self._executante(tours=80)
+        self._tick(cid, {tid: 80})
+        etat = store.load()["taches"][tid]
+        self.assertEqual(etat["compactions"], 1)
+        self.assertEqual(etat["compactedAtTurn"], 80)
+        envois, _ = self._tick(cid, {tid: 90})
+        self.assertEqual(envois, [])
+
+    def test_le_palier_suivant_declenche_une_seconde_compaction(self):
+        cid, tid = self._executante(tours=160, compactee_a=80)
+        envois, _ = self._tick(cid, {tid: 160})
+        self.assertEqual(envois, [("%1", "/compact")])
+        self.assertEqual(store.load()["taches"][tid]["compactions"], 2)
+
+    def test_un_pane_occupe_est_epargne_et_retente_plus_tard(self):
+        # Envoyer /compact au milieu d'un outil couperait le travail en cours. Le
+        # battement suivant retentera, et rien n'est marque : la tache reste due.
+        cid, tid = self._executante(tours=80)
+        envois, _ = self._tick(cid, {tid: 80}, busy=True)
+        self.assertEqual(envois, [])
+        self.assertEqual(store.load()["taches"][tid].get("compactions", 0), 0)
+        envois, _ = self._tick(cid, {tid: 80}, busy=False)
+        self.assertEqual(envois, [("%1", "/compact")])
+
+    def test_un_seuil_nul_desactive_tout(self):
+        cid, tid = self._executante(tours=500)
+        envois, _ = self._tick(cid, {tid: 500}, seuil=0)
+        self.assertEqual(envois, [])
+
+    def test_une_tache_qui_ne_tourne_pas_n_est_jamais_compactee(self):
+        cid, tid = self._executante(tours=200)
+        self._set_task(tid, state="done")
+        envois, _ = self._tick(cid, {tid: 200})
+        self.assertEqual(envois, [])
+
+    def test_un_transcript_illisible_ne_fait_rien_echouer(self):
+        # usage.pour rend None quand il ne trouve pas le transcript. Sans transcript on
+        # ne sait pas combien de tours ont eu lieu, et on ne compacte pas au hasard.
+        cid, tid = self._executante(tours=200)
+        envois, _ = self._tick(cid, {})
+        self.assertEqual(envois, [])
+
+    def test_une_tache_sans_pane_est_ignoree(self):
+        cid, tid = self._executante(tours=200, pane=None)
+        self._set_task(tid, paneId=None)
+        envois, _ = self._tick(cid, {tid: 200})
+        self.assertEqual(envois, [])
+
+    def test_le_tick_declenche_la_compaction(self):
+        # Le cablage : sans cet appel dans tick(), _compacter() serait du code mort que
+        # ses neuf tests verifieraient consciencieusement sans que rien ne l'appelle.
+        cid, tid = self._executante(tours=200)
+        envois = []
+        with mock.patch.object(controle.usage, "pour",
+                               return_value={"turns": 200, "input": 0, "output": 0,
+                                             "cacheCreation": 0, "cacheRead": 0}), \
+             mock.patch.object(controle.panes, "busy", return_value=False), \
+             mock.patch.object(controle.panes, "alive", return_value=True), \
+             mock.patch.object(controle.panes, "send",
+                               side_effect=lambda p, t: envois.append((p, t))):
+            resultat = controle.tick(cid)
+        self.assertEqual(envois, [("%1", "/compact")])
+        self.assertTrue(any("compacted" in e for e in resultat["chantiers"][cid]["events"]))

@@ -307,3 +307,35 @@ class TestContratRole(PromptTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDisciplineDeContexte(PromptTestCase):
+    """La section qui dit à une exécutante de ne pas noyer sa propre conversation.
+
+    Mesure sur soixante transcripts réels : Bash apporte 47 % de ce qui entre dans le
+    contexte d'une session et Read 32 %, et chaque jeton entré est ensuite relu cent
+    fois. Une sortie de test déversée en entier dans la conversation n'est pas payée une
+    fois, elle est payée à chaque tour restant.
+    """
+
+    def test_le_brief_dit_de_rediriger_les_sorties_longues(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        contenu = Path(prompt.brief_executante(tid)).read_text(encoding="utf-8")
+        self.assertIn("## Context discipline", contenu)
+        self.assertIn("tail", contenu)
+
+    def test_le_brief_dit_de_lire_par_tranches(self):
+        cid = self._chantier()
+        tid = self._task(cid)
+        contenu = Path(prompt.brief_executante(tid)).read_text(encoding="utf-8")
+        self.assertIn("offset", contenu)
+
+    def test_le_brief_chiffre_la_raison(self):
+        # Une consigne sans sa raison se contourne des que l'executante croit bien
+        # faire ; le chiffre est ce qui la rend defendable.
+        cid = self._chantier()
+        tid = self._task(cid)
+        contenu = Path(prompt.brief_executante(tid)).read_text(encoding="utf-8")
+        self.assertIn("re-read on every later turn", contenu)
+        self.assertIn("100 times", contenu)

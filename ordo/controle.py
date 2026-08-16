@@ -23,7 +23,7 @@ import os
 from contextlib import suppress
 from datetime import datetime, timezone
 
-from . import capteur, chantier, journal, panes, plan, report, store
+from . import capteur, chantier, journal, panes, plan, report, store, usage
 
 # Delai de grace entre la constatation "pane mort, aucun rapport" et le blocage effectif
 # de la tache. Un pane peut mourir juste apres avoir ecrit son rapport, dont l'ecriture
@@ -50,6 +50,9 @@ _DEPENDANCE_MORTE_PREFIX = "dependency "
 # jamais un etat de repos legitime, il faut verifier que quelque chose avance encore.
 # Nomme et patchable, comme PANE_DEAD_GRACE_S.
 WAKE_IDLE_AFTER_S = 900.0
+
+# Tours entre deux compactions. Defini dans usage.py, ou la carte le lit aussi.
+COMPACT_TOURS = usage.SEUIL_TOURS
 
 
 class ControleError(Exception):
@@ -581,6 +584,11 @@ def _tick_one(chantier_id: str) -> list[str]:
     for pane_id, texte in to_send:
         panes.send(pane_id, texte)
 
+    # Etape 5.9 : compaction des sessions trop longues. Hors verrou, apres les envois
+    # ci-dessus : une reponse injectee a une tache qui reprend doit partir AVANT un
+    # /compact, sans quoi la reponse serait avalee par la compaction qu'elle precede.
+    events.extend(_compacter(chantier_id))
+
     # Etape 6 : capteur, entierement hors verrou (capteur.run() gere le sien, et ne
     # doit jamais etre appele depuis l'interieur d'un store.locked() deja detenu, sous
     # peine de LockTimeoutError puisque le verrou n'est pas reentrant).
@@ -642,6 +650,65 @@ def _expire_propositions() -> dict[str, list[str]]:
                 texte = f"proposal {pid} auto-rejected after deadline expiration: {prop.get('refus')}"
             by_chantier.setdefault(prop["chantier"], []).append(texte)
     return by_chantier
+
+
+def _compacter(chantier_id: str) -> list[str]:
+    """Envoie `/compact` aux exécutantes dont la session s'est trop allongée.
+
+    ENTIÈREMENT HORS VERROU, sauf le marquage. La décision demande de lire un transcript
+    de plusieurs méga-octets et d'interroger tmux ; tenir `store.locked()` pendant ces
+    deux appels bloquerait tout le reste d'Ordo pour une optimisation de confort.
+
+    Ce que cette fonction ne fait JAMAIS. Elle ne compacte pas un pane occupé : `/compact`
+    tapé au milieu d'un outil couperait le travail en cours, et le battement suivant
+    retentera de toute façon. Elle ne compacte pas deux fois le même palier, sans quoi
+    chaque battement de la veille renverrait la commande à une session déjà compactée,
+    qui ne ferait plus que se compacter. Et elle ne compacte pas une tâche dont le
+    transcript est introuvable : sans transcript on ignore combien de tours ont eu lieu,
+    et compacter au hasard coûte sans rien rendre.
+    """
+    if COMPACT_TOURS <= 0:
+        return []
+
+    state = store.load()
+    dus: list[tuple[str, str, int]] = []
+    for task in _sorted_tasks(state, chantier_id):
+        if task["state"] != "running":
+            continue
+        pane_id = task.get("paneId")
+        if not pane_id:
+            continue
+        mesure = usage.pour(task)
+        if not mesure:
+            continue
+        tours = mesure.get("turns") or 0
+        depuis = tours - (task.get("compactedAtTurn") or 0)
+        if depuis >= COMPACT_TOURS:
+            dus.append((task["id"], pane_id, tours))
+
+    events: list[str] = []
+    envoyes: list[tuple[str, int]] = []
+    for task_id, pane_id, tours in dus:
+        try:
+            if panes.busy(pane_id):
+                continue
+            panes.send(pane_id, "/compact")
+        except RuntimeError:
+            # tmux absent ou pane disparu entre la lecture et l'envoi : l'étape 3 du tick
+            # traite déjà les panes morts, ce n'est pas à la compaction de le faire.
+            continue
+        envoyes.append((task_id, tours))
+        events.append(f"{task_id} compacted at turn {tours}")
+
+    if envoyes:
+        with store.locked() as etat:
+            for task_id, tours in envoyes:
+                task = etat["taches"].get(task_id)
+                if task is None:
+                    continue
+                task["compactions"] = (task.get("compactions") or 0) + 1
+                task["compactedAtTurn"] = tours
+    return events
 
 
 def tick(chantier_id: str | None = None) -> dict:

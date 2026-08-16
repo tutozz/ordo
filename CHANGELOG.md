@@ -7,6 +7,32 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- Ordo now **compacts an executor's context** once its session passes 75 turns
+  (`ORDO_COMPACT_EVERY`, 0 disables). The number comes from a measurement, not a hunch:
+  across sixty real transcripts of two live campaigns, every token entering a session is
+  re-read about **102 times**, and a session's last third costs 2.3x its first. The context
+  is not large, it is carried too long. Simulated on those same series, compacting every 75
+  turns returns 21% of the total context billed, after paying for the write a compaction
+  itself costs. It never compacts a busy pane, never twice for the same turn count, and
+  never a task whose transcript it cannot read.
+- Every executor brief now carries a **context discipline** section, with the number behind
+  it. `Bash` contributes 47% of everything that enters a session's context and `Read` 32%,
+  and each of those tokens is then re-read on every later turn: a test log pasted in full is
+  not paid once, it is paid on every turn that follows. The section asks for redirected
+  output, targeted slices, and grep-before-read.
+- A task card now shows **where it runs and for how long**: its pane and its turn count,
+  and the count turns amber past the compaction threshold. Session length is the single
+  best predictor of what a task will cost, and it appeared nowhere.
+
+### Fixed
+
+- `ordo/usage.py` counted the same turn once per content block. Claude Code writes one
+  assistant turn across several transcript lines that each repeat the same `usage`, so
+  every token figure Ordo displayed was inflated: **output was counted twice** (+102%),
+  cache reads +59%, turns +68%, with a median duplication factor of 1.63 per session. A
+  token counter meant to decide what to launch and on which model was wrong, and wrong
+  upward. Deduplicated on `message.id`.
+
 - A question the orchestrator escalates now **reaches the wall**. `ordo ask ... --for-human`
   raises a **CHOIX A FAIRE** overlay on that campaign's column, with the question, its
   options, the task it belongs to, and the exact command that closes it, `ORDO_HOME`

@@ -161,6 +161,34 @@ def _section_interdits() -> str:
     )
 
 
+def _section_discipline_contexte() -> str:
+    """La section qui empeche une executante de noyer sa propre conversation.
+
+    Chiffree, parce qu'une consigne sans sa raison se contourne des que l'executante
+    croit bien faire. Mesure sur soixante transcripts reels de ce depot : Bash apporte
+    47 % de ce qui entre dans le contexte d'une session, Read 32 %, et chaque jeton entre
+    est ensuite RELU CENT FOIS -- une sortie de test deversee en entier n'est pas payee
+    une fois, elle est payee a chaque tour restant de la session.
+    """
+    return (
+        "## Context discipline\n"
+        "Every token you put in this conversation is re-read on every later turn of "
+        "this session - measured at about 100 times over a real session. A test log "
+        "pasted in full is not paid once, it is paid on every turn that follows. This "
+        "is not about tidiness, it is the single biggest cost in your session.\n\n"
+        "1. Long command output goes to a file, not into the conversation. Run "
+        "`npm test > /tmp/out.log 2>&1; tail -40 /tmp/out.log`, then grep that file for "
+        "what you actually need. Never let a build, a test suite, an install or a "
+        "`git log` print hundreds of lines here.\n"
+        "2. Read files in targeted slices, with `offset` and `limit`. Read a whole file "
+        "only when you genuinely need the whole file, and never twice: if you already "
+        "read it in this session, it is still in your context.\n"
+        "3. Search before you read. `grep -n` a pattern and read around the hits, "
+        "rather than loading a large file to find one function.\n"
+        "4. When a command fails, print the error, not the whole run."
+    )
+
+
 def brief_executante(task_id: str) -> str:
     """Compose et ecrit le brief d'une executante dans briefs/<chantier>/<tache>.md.
 
@@ -181,6 +209,7 @@ def brief_executante(task_id: str) -> str:
         _section_zones(task),
         _section_checklist(task),
         _section_protocole_rapport(task_id, report_path),
+        _section_discipline_contexte(),
         _section_interdits(),
     ]
     contenu = "\n\n".join(sections) + "\n"

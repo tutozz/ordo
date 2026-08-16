@@ -449,6 +449,7 @@ def model(
             "paneId": pane_id,
             "paneAlive": None if (alive is None or not pane_id) else bool(alive(pane_id)),
             "attempts": t.get("attempts", 0),
+            "compactions": t.get("compactions", 0),
             "model": modele,
             "modelWhy": motif_modele,
             "modelPredit": modele_predit,
@@ -635,6 +636,7 @@ def _facts(node: dict, jetons: dict | None = None) -> dict:
     faits = {
         "zones": ", ".join(node["touches"]) or "-",
         "modele": node["model"],
+        "compactions": str(node["compactions"]),
         "niveau": str(node["level"]),
         "depend de": " ".join(node["deps"]) or "-",
         "debloque": " ".join(node["dependants"]) or "-",
@@ -681,6 +683,7 @@ def vue(m: dict) -> dict:
     for tid in sorted(m["nodes"], key=_num_id):
         node = m["nodes"][tid]
         jetons = node.get("usage")
+        tours = (jetons or {}).get("turns") or 0
         tasks.append({
             "id": tid,
             "title": node["titre"],
@@ -701,6 +704,13 @@ def vue(m: dict) -> dict:
             "model": node["model"],
             "modelWhy": node["modelWhy"],
             "modelPredit": node["modelPredit"],
+            # Le pane et les tours sortent a part de facts, comme la duree et le modele :
+            # ce sont les chiffres qui disent OU une tache s'execute et depuis combien de
+            # temps elle traine son contexte, et le second predit son cout mieux que tout
+            # le reste. Les lire ne doit pas demander d'ouvrir la tache.
+            "pane": node["paneId"] or "",
+            "turns": tours,
+            "sessionLongue": bool(tours >= (usage.SEUIL_TOURS or float("inf"))),
             "tokens": usage.court(jetons["output"]) if jetons else "",
             "facts": _facts(node, jetons),
             "deps": node["deps"],
@@ -882,6 +892,13 @@ border-radius:4px;padding:0 4px;color:var(--dim2);flex:none}
 .mdl.sonnet{color:#6fa8dc;border-color:#274a68}
 .mdl.opus{color:#b892e0;border-color:#453060}
 .mdl.predit{border-style:dashed;opacity:.75}
+/* Le pane et les tours d'une session en cours. Les tours virent a l'orange au-dela du
+   seuil de compaction : c'est le seul chiffre qui predit ce qu'une session va coûter, et
+   il n'apparaissait nulle part. */
+.pane{color:var(--dim3)}
+.turns{color:var(--dim2)}
+.row.running .turns{color:var(--txt2)}
+.turns.longue{color:#e3b341;font-weight:600}
 .rlinks{margin-left:auto;flex:none;display:flex;gap:7px;font-size:10px}
 .row.focus .rlinks{font-size:12px;font-weight:600}
 .nup{color:var(--up)}.ndown{color:var(--down)}.nnone{color:#3a4049}
@@ -1109,6 +1126,17 @@ function rowNode(t){
   // Ils vivaient dans la ligne de meta, que la vue graphe n'affiche pas.
   if(t.duree)links.appendChild(el("span","dur",t.duree));
   if(t.tokens)links.appendChild(el("span","tok",t.tokens));
+  // Le pane dit OU la tache s'execute, les tours disent depuis combien de temps elle
+  // traine son contexte. Une session longue s'allume : au dela du seuil, chaque tour
+  // supplementaire relit tout ce qui precede.
+  if(t.pane)links.appendChild(el("span","pane",t.pane));
+  if(t.turns){
+    var tr=el("span","turns"+(t.sessionLongue?" longue":""),t.turns+"t");
+    tr.title=t.sessionLongue
+      ? "session longue : chaque tour relit tout le contexte accumulé"
+      : "tours de la session";
+    links.appendChild(tr);
+  }
   links.appendChild(el("span",t.deps.length?"nup":"nnone","↑"+t.deps.length));
   links.appendChild(el("span",t.dependants.length?"ndown":"nnone","↓"+t.dependants.length));
   head.appendChild(links);

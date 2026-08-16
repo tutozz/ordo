@@ -48,6 +48,25 @@ _CACHE: dict[str, dict] = {}
 # affirmation.
 _OCTETS = 0
 
+# Tours d'une session au-dela desquels son contexte merite d'etre remis a plat. 0 desactive.
+#
+# Mesure sur soixante transcripts reels de deux chantiers : chaque jeton entre dans une
+# session est ensuite relu CENT DEUX FOIS, et le dernier tiers d'une session coute 2,3 fois
+# son premier tiers. Le contexte n'est pas gros, il est porte trop longtemps. Simule sur ces
+# memes series, compacter tous les 75 tours rend 21 % du contexte total facture, une fois
+# payee l'ecriture qu'une compaction coute elle-meme.
+#
+# 75 plutot que 50, qui rendait 4 points de plus : la mediane des sessions est a 92 tours,
+# donc a 75 la moitie d'entre elles ne compactent jamais. Chaque compaction est une occasion
+# de perdre du contexte que la tache aurait utilise, et cette perte-la n'est mesurable dans
+# aucun transcript. On prend le gain qui se voit, pas le dernier point qui se paierait en
+# travail refait.
+#
+# Vit ICI et pas dans controle.py parce que deux modules le lisent -- la boucle qui compacte
+# et la carte qui signale une session longue -- et qu'une carte qui alerterait a 100 pendant
+# qu'Ordo compacte a 75 raconterait une autre histoire que celle qui se joue.
+SEUIL_TOURS = float(os.environ.get("ORDO_COMPACT_EVERY") or 75)
+
 _CHAMPS = {
     "input_tokens": "input",
     "output_tokens": "output",

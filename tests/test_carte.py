@@ -1043,3 +1043,71 @@ class TestMurEtQuestions(CarteTestCase):
         p = carte.panneau("/tmp/ordo-home", "c-7")
         self.assertIn("chantier introuvable", p)
         self.assertIn("serveur muet", p)
+
+
+class TestSessionSurLaCase(CarteTestCase):
+    """Ce qui exécute une tâche, et depuis combien de tours, lisible sans ouvrir la case.
+
+    Mesure sur soixante transcripts : le dernier tiers d'une session coûte 2,3 fois son
+    premier tiers. La longueur d'une session est donc le seul chiffre qui prédit ce
+    qu'elle va coûter, et c'est précisément celui qui n'apparaissait nulle part.
+    """
+
+    def test_une_tache_lancee_porte_son_pane_et_ses_tours(self):
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%126",
+                        claudeSessionId="ce85c8b5-0000")
+        t = carte.vue(carte.model(
+            self.chantier,
+            usage_de=lambda x: {"input": 0, "output": 900, "cacheCreation": 0,
+                                "cacheRead": 0, "turns": 180},
+        ))["tasks"][0]
+        self.assertEqual(t["pane"], "%126")
+        self.assertEqual(t["turns"], 180)
+
+    def test_une_session_trop_longue_est_signalee(self):
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%1")
+        longue = carte.vue(carte.model(
+            self.chantier,
+            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
+                                "cacheRead": 0, "turns": 200},
+        ))["tasks"][0]
+        self.assertTrue(longue["sessionLongue"])
+
+    def test_une_session_courte_n_est_pas_signalee(self):
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%1")
+        courte = carte.vue(carte.model(
+            self.chantier,
+            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
+                                "cacheRead": 0, "turns": 10},
+        ))["tasks"][0]
+        self.assertFalse(courte["sessionLongue"])
+
+    def test_une_tache_jamais_lancee_n_affiche_aucun_tour(self):
+        # Zero tour se lirait comme une session qui n'a rien fait ; la verite est qu'il
+        # n'y a pas de session du tout.
+        self._add("0.1 a")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["turns"], 0)
+        self.assertFalse(t["sessionLongue"])
+        self.assertEqual(t["pane"], "")
+
+    def test_les_compactions_deja_faites_sont_dans_les_faits(self):
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%1", compactions=2,
+                        compactedAtTurn=150)
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["facts"]["compactions"], "2")
+
+    def test_la_page_porte_le_pane_et_les_tours(self):
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", paneId="%126")
+        page = carte.html(carte.model(
+            self.chantier,
+            usage_de=lambda x: {"input": 0, "output": 0, "cacheCreation": 0,
+                                "cacheRead": 0, "turns": 200},
+        ))
+        self.assertIn('"pane"', page)
+        self.assertIn("sessionLongue", page)

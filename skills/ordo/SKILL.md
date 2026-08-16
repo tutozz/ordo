@@ -101,11 +101,28 @@ ordo plan <campaign> < plan.txt
 ordo accept <proposal>
 ```
 
-Keep each `--check` label to **60 characters max**, and aim for **3 to 5 items per task**.
-A verifiable post-condition, not an explanation - whatever does not fit in 60 characters is
-really two criteria. The executor ticks its own items as it goes (`ordo check <task>
-<item>`), and the map shows that progress live on the card while the task is still running:
-a checklist of five short items reads as advancement, one long item never does.
+**A checklist is a progress bar, not a definition of done.** Its job is to move on the
+human's screen while the task runs. Someone watching the map should see it advance every few
+minutes; if it jumps from 0 to everything at the end, it told them nothing during the hour
+they were waiting.
+
+So: **5 to 10 items**, each **60 characters max**. Err on the side of more items rather than
+bigger ones. The test for an item is not "is this important" but **"would I see the bar move
+within a few minutes of work?"** - an item worth half an hour is two or three items. Each one
+is a verifiable post-condition that can be ticked on its own; whatever does not fit in 60
+characters is really two criteria, and the width is a measured constraint, a card in a wall
+column is a few hundred pixels wide.
+
+Avoid the catch-all last item. "the full suite passes" as the fifth of five is where a third
+of the task hides; if the task ends with real verification work, say what that work is.
+
+The executor ticks its items as it goes and declares the one it is attacking
+(`ordo check <task> <item>`, `--doing` for the current one), and the card shows both live.
+
+> Finer checklists shift model routing: past `HAIKU_CHECKLIST_MAX` items, a mechanical task
+> is routed to `sonnet` instead of `haiku`. That threshold counts cases to cross, which is a
+> writing convention, not a measure of difficulty - so do not coarsen a checklist to win a
+> cheaper model. Write the right checklist; the routing is what has to follow.
 
 An undecided proposal is **accepted automatically after 45 s**. Say it at the moment you
 propose, otherwise the human thinks you are waiting.

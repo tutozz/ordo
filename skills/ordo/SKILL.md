@@ -478,6 +478,35 @@ unnoticed for fourteen days.
 
 ## Questions
 
+### Every question you put to the human is published first. No exception.
+
+**This rule is about YOUR questions, not only the ones you relay.** Most of what you ask the
+human never came from an executor at all: which of two approaches to take, whether to widen
+the scope, a business value only they hold, a go/no-go. Those are the ones that go
+unpublished, because nothing in the flow reminds you - you simply have a question and you
+ask it.
+
+Before **any** `AskUserQuestion`, whatever its origin:
+
+```bash
+ordo ask <campaign|task> "the question, one sentence" --for-human \
+  --option "first choice" --option "second choice"
+```
+
+Then call `AskUserQuestion`. **The wall shows, the terminal answers.**
+
+The human watches the wall, not your terminal. A question that lives only in your pane is a
+campaign stopped for nothing, and it has already happened here: an orchestrator sat waiting
+on an answer while its campaign showed, on the human's screen, exactly like a campaign that
+was working - one launchable task, no live executor, and no sign anywhere that a human was
+being waited on.
+
+When they answer, close it in the same turn - `ordo answer <question> "what they chose"`.
+An overlay that never goes off stops being read, and a question left open keeps their column
+marked forever.
+
+### Questions that come from executors
+
 An executor that hits a wall writes `state: "asking"` in its report and ends its turn. The
 question reaches **you**, not the human.
 
@@ -490,30 +519,10 @@ You answer everything that belongs to execution yourself. You **escalate only**:
 architecture decisions, business calls, money, irreversible or external actions, scope
 drift, information only the human holds.
 
-To escalate, use `AskUserQuestion`, never free text. A question asked in prose gets lost.
-
-**Publish it before you ask it.** The human is watching the wall, not your terminal, and a
-session stopped on a question they never saw is a campaign stopped for nothing.
-
-```bash
-ordo ask <campaign|task> "the question, one sentence" --for-human \
-  --option "first choice" --option "second choice"
-```
-
-`ask` takes a campaign id when the question belongs to no task in particular - run the next
-wave in parallel or in series, cut the phase now or later - which is what an escalation
-usually is. That command, and only that command, raises **CHOIX A FAIRE** on that
-campaign's column in the wall, with your question, your options and the command that closes
-it. Then call `AskUserQuestion` as you always did: the wall shows, the terminal answers.
-
-When they have answered, close it in the same turn:
-
-```bash
-ordo answer <question> "what they chose"
-```
-
-A question left open keeps the overlay on their column forever, and an alarm that never
-goes off stops being read. Closing it is part of answering it, not a courtesy.
+To escalate, use `AskUserQuestion`, never free text - and publish it first, per the rule
+above. `ask` takes a campaign id when the question belongs to no task in particular, which
+is what an escalation usually is; it is that command, and only that command, that raises
+**CHOIX A FAIRE** on the campaign's column.
 
 ---
 

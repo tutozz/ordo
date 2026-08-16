@@ -654,6 +654,86 @@ class TestTickWaitingReportReread(ControleTestCase):
         self.assertEqual(questions[0]["question"], "et maintenant ?")
 
 
+class TestTickBlockedReportReread(ControleTestCase):
+    """Jumeau exact du défaut waiting (TestTickWaitingReportReread ci-dessus) pour
+    l'état blocked : seules les tâches "running" puis "running"+"waiting" étaient
+    relues à l'étape 2, donc une tâche "blocked" ne voyait plus jamais son rapport
+    relu. Cas réel (brief t-35, constaté trois fois sur t-31) : une exécutante
+    débloquée par `ordo say` reprend, finit son travail, coche ses critères et écrit
+    un rapport "done" -- rien ne le lisait, la tâche restait "blocked" pour toujours
+    et ses dépendantes ne partaient jamais."""
+
+    def test_rapport_dune_tache_bloquee_est_relu(self):
+        # Un rapport "progress" est le plus discret : il ne change l'état de lui-même,
+        # il ne prouve donc la relecture QUE si son contenu est bien appliqué et le
+        # fichier consommé (garde-fou 2 du brief : aucun rapport n'est lu deux fois).
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._set_task(tid, state="blocked", error="obstacle réel rencontré")
+        self._write_report(tid, {"task": tid, "state": "progress", "note": "toujours bloquée"})
+        controle.tick(cid)
+        task = store.load()["taches"][tid]
+        self.assertEqual(task["state"], "blocked")
+        self.assertEqual(task["report"]["note"], "toujours bloquée")
+        self.assertFalse(report.path(tid, cid).exists(), "le rapport relu doit être consommé")
+
+    def test_rapport_done_sur_tache_bloquee_la_fait_passer_a_done(self):
+        # Séquence vécue trois fois sur t-31 : l'orchestratrice débloque par `ordo say`,
+        # l'exécutante reprend, coche ses critères et écrit "done". Rien d'autre que la
+        # relecture du rapport ne peut l'en sortir.
+        cid = self._chantier()
+        tid = self._task(cid, checklist=["c1"])
+        self._set_task(tid, state="blocked", error="obstacle réel rencontré")
+        self._write_report(
+            tid, {"task": tid, "state": "done", "note": "fini", "checked": ["c1"], "touched": []}
+        )
+        controle.tick(cid)
+        task = store.load()["taches"][tid]
+        self.assertEqual(task["state"], "done")
+        self.assertTrue(all(item["done"] for item in task["checklist"]))
+
+    def test_rapport_encore_blocked_reste_bloquee(self):
+        # Garde-fou 1 du brief t-35 : une tâche qui rend ENCORE "blocked" reste
+        # bloquée. On lit son rapport, on met à jour sa note et sa cause, mais on ne
+        # la ressuscite jamais -- seule l'orchestratrice décide qu'un blocage est levé.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._set_task(tid, state="blocked", error="premier obstacle")
+        self._write_report(
+            tid, {"task": tid, "state": "blocked", "note": "toujours le même obstacle"}
+        )
+        controle.tick(cid)
+        task = store.load()["taches"][tid]
+        self.assertEqual(task["state"], "blocked")
+        self.assertEqual(task["error"], "toujours le même obstacle")
+        self.assertFalse(report.path(tid, cid).exists(), "le rapport relu doit être consommé")
+
+    def test_dependante_debloquee_apres_que_la_bloquee_passe_a_done(self):
+        # Garde-fou 3 : sans la relecture, la dépendante d'une tâche "blocked" bloquée
+        # par propagation ne repart jamais, même après que la tâche-cause ait vraiment
+        # fini -- c'est tout l'intérêt du correctif (le graphe reste sinon figé en
+        # silence pour une moitié du chantier).
+        cid = self._chantier()
+        a = self._task(cid, titre="a", checklist=["c1"])
+        b = self._task(cid, titre="b", depends_on=[a])
+        self._set_task(a, state="blocked", error="obstacle réel rencontré")
+        controle.tick(cid)
+        self.assertEqual(store.load()["taches"][b]["state"], "blocked")
+        self.assertEqual(
+            store.load()["taches"][b]["blockedCause"], chantier.BLOCKED_CAUSE_PROPAGATION
+        )
+
+        self._write_report(
+            a, {"task": a, "state": "done", "note": "fini", "checked": ["c1"], "touched": []}
+        )
+        controle.tick(cid)
+
+        state = store.load()
+        self.assertEqual(state["taches"][a]["state"], "done")
+        self.assertEqual(state["taches"][b]["state"], "queued")
+        self.assertIsNone(state["taches"][b]["blockedCause"])
+
+
 class TestTickAnswerInjection(ControleTestCase):
     def test_reponse_injectee_dans_le_pane_reel_et_tache_reprend(self):
         cid = self._chantier()

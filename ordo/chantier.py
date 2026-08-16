@@ -229,7 +229,7 @@ def _alive_tasks(
     Point d'injection documente : panes.py n'est pas visible depuis ce module. Sans
     alive_check, toute tache "running" compte comme vivante (le seul signal disponible
     ici). Un appelant qui a acces a panes.alive(pane_id) peut passer cette fonction pour
-    verifier la vivacite reelle du pane plutot que de se fier au seul etat declare.
+    vérifier la vivacité réelle du pane plutôt que de se fier au seul état déclaré.
     """
     alive = []
     for task in state["taches"].values():

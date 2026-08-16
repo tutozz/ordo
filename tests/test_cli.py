@@ -415,6 +415,43 @@ class TestGrapheVerbs(CliTestCase):
             [("sans duree", None), ("avec duree", 12), ("encore sans", None)],
         )
 
+    def test_add_attribut_pose_un_attribut_a_la_creation(self):
+        # c3 du brief t-36 : un attribut posable dès `ordo add`, dans la même commande que
+        # la création du critère, pas seulement après coup.
+        cid = self._chantier()
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "lire le code",
+             "--attribut", "c1:geste=lire", "--json"]
+        )
+        self.assertEqual(data["checklist"][0]["attributs"], {"geste": "lire"})
+
+    def test_add_plusieurs_attribut_sur_des_items_differents(self):
+        cid = self._chantier()
+        data = self._run_json(
+            ["add", cid, "--title", "t", "--prompt", "p",
+             "--check", "premier", "--check", "second",
+             "--attribut", "c1:geste=lire", "--attribut", "c2:geste=publier", "--json"]
+        )
+        self.assertEqual(data["checklist"][0]["attributs"], {"geste": "lire"})
+        self.assertEqual(data["checklist"][1]["attributs"], {"geste": "publier"})
+
+    def test_add_attribut_mal_forme_refuse(self):
+        cid = self._chantier()
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "x",
+             "--attribut", "n'importe quoi"]
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("--attribut", err)
+
+    def test_add_attribut_cle_inconnue_refuse(self):
+        cid = self._chantier()
+        code, out, err = self._run(
+            ["add", cid, "--title", "t", "--prompt", "p", "--check", "x",
+             "--attribut", "c1:humeur=bonne"]
+        )
+        self.assertNotEqual(code, 0)
+
     def test_add_avertit_quand_un_critere_na_pas_de_duree(self):
         # même régime que l'avertissement des 40 caractères : jamais bloquant, juste dit.
         cid = self._chantier()
@@ -716,6 +753,18 @@ class TestGrapheVerbs(CliTestCase):
         self.assertIn(f"ordo check {t1} c1 --doing", contenu)
         self.assertIn(f"ordo check {t1} c1\n", contenu)
 
+    def test_brief_explique_comment_poser_un_attribut(self):
+        # c7 du brief t-36 : l'exécutante doit lire, dans son propre brief, comment
+        # nommer la nature d'un critère -- sinon elle n'utilise jamais ce verbe (même
+        # raisonnement que --doing juste au-dessus, brief t-22).
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["tests verts"])
+        from ordo import prompt as prompt_mod
+        brief_path = prompt_mod.brief_executante(t1)
+        contenu = Path(brief_path).read_text(encoding="utf-8")
+        self.assertIn(f"ordo checklist attribut {t1} <item-id> <key> <value>", contenu)
+        self.assertIn("geste", contenu)
+
     def test_carte_model_expose_currentItem(self):
         cid = self._chantier()
         t1 = self._tache(cid, checklist=["tests verts"])
@@ -827,6 +876,35 @@ class TestChecklistVerbs(CliTestCase):
         self._run_json(["checklist", "reword", t1, "c1", "libellé corrigé", "--json"])
         entries = self._run_json(["journal", "show", cid, "--json"])
         self.assertEqual(entries, [])
+
+    def test_attribut_pose_la_valeur(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        data = self._run_json(
+            ["checklist", "attribut", t1, "c1", "geste", "tester", "--json"]
+        )
+        self.assertEqual(data["checklist"][0]["attributs"], {"geste": "tester"})
+
+    def test_attribut_corrige_une_valeur_deja_posee(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        self._run_json(["checklist", "attribut", t1, "c1", "geste", "lire", "--json"])
+        data = self._run_json(
+            ["checklist", "attribut", t1, "c1", "geste", "publier", "--json"]
+        )
+        self.assertEqual(data["checklist"][0]["attributs"]["geste"], "publier")
+
+    def test_attribut_cle_inconnue_refuse(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        code, out, err = self._run(["checklist", "attribut", t1, "c1", "humeur", "bonne"])
+        self.assertNotEqual(code, 0)
+
+    def test_attribut_valeur_invalide_refuse(self):
+        cid = self._chantier()
+        t1 = self._tache(cid, checklist=["premier"])
+        code, out, err = self._run(["checklist", "attribut", t1, "c1", "geste", "danser"])
+        self.assertNotEqual(code, 0)
 
     def test_checklist_sans_action_affiche_aide(self):
         code, out, err = self._run(["checklist"])

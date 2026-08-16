@@ -197,6 +197,28 @@ def _parse_check(brut: str) -> dict:
     return {"label": trouve.group(1), "dureeMin": int(trouve.group(2))}
 
 
+# "item:clé=valeur", ex. "c1:geste=lire" (brief t-36). Volontairement une syntaxe séparée
+# de --check plutôt qu'un troisième segment collé au suffixe ":minutes" : le suffixe de
+# --check est ancré sur \d+ SEUL (voir _CHECK_DUREE_RE juste au-dessus), lui ajouter une
+# grammaire d'attributs casserait ce contrat pour tout libellé qui contient déjà un ":".
+_ATTRIBUT_RE = re.compile(r"^([^:=]+):([^:=]+)=([^:=]+)$")
+
+
+def _parse_attribut(brut: str) -> tuple[str, str, str]:
+    """Un `--attribut` accepte "item:clé=valeur", ex. "c1:geste=lire" (brief t-36).
+
+    Erreur de syntaxe pure, jamais métier : chantier.set_checklist_attribut() est celui
+    qui refuse une clé ou une valeur inconnue (ChantierError), cette fonction ne fait que
+    reconnaître la forme de la chaîne.
+    """
+    trouve = _ATTRIBUT_RE.match(brut)
+    if not trouve:
+        raise CliError(
+            f'malformed --attribut {brut!r}: expected "item:key=value", e.g. "c1:geste=lire"'
+        )
+    return trouve.group(1), trouve.group(2), trouve.group(3)
+
+
 def _avertissement_checklist_sans_duree(sans_duree: list[dict]) -> str | None:
     """Alerte quand un ou plusieurs critères créés n'ont reçu aucune estimation
     (chantier.checklist_sans_duree), même régime que _avertissement_checklist ci-dessus :
@@ -690,6 +712,13 @@ def cmd_add(args: argparse.Namespace) -> int:
         checklist=[_parse_check(c) for c in (args.check or [])],
         why=args.why or "",
     )
+    # Attributs posés à la création (c3, brief t-36) : une seule syntaxe séparée de
+    # --check (voir _parse_attribut), appliquée après coup sur la tâche fraîchement créée
+    # -- même appel `ordo add`, donc toujours "à la création" du point de vue de qui tape
+    # la commande, sans fragiliser le contrat déjà en place de --check.
+    for brut in args.attribut or []:
+        item_id, cle, valeur = _parse_attribut(brut)
+        t = chantier.set_checklist_attribut(t["id"], item_id, cle, valeur)
     if args.json:
         _print_json(t)
         return 0
@@ -969,6 +998,16 @@ def cmd_checklist_duree(args: argparse.Namespace) -> int:
         return 0
     item = next(i for i in t["checklist"] if i["id"] == args.item)
     print(f"{args.task}: {item['id']} estimated at {item['dureeMin']}m")
+    return 0
+
+
+def cmd_checklist_attribut(args: argparse.Namespace) -> int:
+    t = chantier.set_checklist_attribut(args.task, args.item, args.cle, args.valeur)
+    if args.json:
+        _print_json(t)
+        return 0
+    item = next(i for i in t["checklist"] if i["id"] == args.item)
+    print(f"{args.task}: {item['id']} {args.cle}={item['attributs'][args.cle]}")
     return 0
 
 
@@ -2261,6 +2300,13 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
         help='checklist item; optional Claude-minutes estimate as "label:20"',
     )
     p.add_argument(
+        "--attribut",
+        action="append",
+        metavar="ITEM:KEY=VALUE",
+        help='set a criterion attribute at creation, e.g. "c1:geste=lire" '
+        f"(keys: {', '.join(chantier.ATTRIBUTS_VALEURS)})",
+    )
+    p.add_argument(
         "--why",
         default="",
         help="why this task exists and why here in the split, not what it does",
@@ -2410,6 +2456,18 @@ def _build_parser() -> dict[str, argparse.ArgumentParser]:
     p.add_argument("item")
     p.add_argument("minutes", type=int)
     p.set_defaults(func=cmd_checklist_duree)
+
+    p = checklist_sub.add_parser(
+        "attribut",
+        parents=[json_parent],
+        help="set or correct one attribute of a criterion "
+        f"({', '.join(chantier.ATTRIBUTS_VALEURS)})",
+    )
+    p.add_argument("task")
+    p.add_argument("item")
+    p.add_argument("cle", metavar="key")
+    p.add_argument("valeur", metavar="value")
+    p.set_defaults(func=cmd_checklist_attribut)
 
     # Plan
     p = verbs.add_parser("plan", parents=[json_parent], help="propose a graph from stdin")

@@ -239,6 +239,62 @@ def ecart_estime_reel(task: dict) -> dict | None:
     return {"estimeMin": estime_min, "reelMin": reel_min, "ecartMin": reel_min - estime_min}
 
 
+# Types d'événements du journal machine (t-34, voir journal.enregistrer_evenement) que
+# duree_mesuree_par_critere() sait lire. Écrits par cli.py à chaque `ordo check` reçu, en
+# direct : "checklist-doing" quand un item est déclaré attaqué, "checklist-coche" quand il
+# est vraiment franchi.
+_EVENEMENTS_DUREE = ("checklist-doing", "checklist-coche")
+
+
+def duree_mesuree_par_critere(task: dict, evenements: Iterable[dict]) -> dict[str, float]:
+    """Durée réelle mesurée INDIVIDUELLEMENT par critère (brief t-36), à partir des faits
+    "checklist-doing" et "checklist-coche" du journal machine (t-34) : l'écart entre la
+    déclaration --doing d'un critère (ou, à défaut, la coche précédente de la même tâche,
+    ou au tout début son lancement) et sa propre coche.
+
+    Remplace, pour qui veut la durée d'UN critère précis, la seule mesure disponible
+    jusqu'ici (_duree_reelle_par_critere ci-dessus) : celle-ci divise la durée totale de la
+    tâche par son nombre de critères et suppose donc qu'ils se valent tous -- ils ne se
+    valent pas, les mesures réelles vont de 1,3 à 11 minutes selon le critère (brief t-36).
+
+    Fonction PURE, comme le reste de ce fichier : evenements est fourni par l'appelant
+    (typiquement journal.lire_evenements(chantier_id)), jamais lu ici -- chantier.py ne
+    peut pas importer journal.py, qui l'importe déjà, sous peine de cycle. evenements n'a
+    besoin d'être ni filtré ni trié par l'appelant : seuls les faits de CETTE tâche et des
+    types "checklist-doing"/"checklist-coche" sont retenus, retriés par "at" plutôt que de
+    faire confiance à l'ordre d'entrée.
+
+    Un critère jamais coché, ou coché sans aucun repère de départ exploitable (horodatage
+    illisible, ou coche antérieure ou égale à son repère -- horloges qui divergent),
+    n'apparaît pas dans le résultat plutôt que d'y porter une valeur fausse ou négative qui
+    fausserait toute médiane calculée dessus plus tard.
+    """
+    pertinents = sorted(
+        (
+            evt
+            for evt in evenements
+            if evt.get("tache") == task["id"] and evt.get("type") in _EVENEMENTS_DUREE
+        ),
+        key=lambda evt: evt.get("at") or "",
+    )
+    depart_doing: dict[str, float] = {}
+    repere = _epoch(task.get("startedAt"))
+    durees: dict[str, float] = {}
+    for evt in pertinents:
+        item_id = evt.get("item")
+        at = _epoch(evt.get("at"))
+        if not item_id or at is None:
+            continue
+        if evt["type"] == "checklist-doing":
+            depart_doing[item_id] = at
+            continue
+        depart = depart_doing.pop(item_id, repere)
+        if depart is not None and at > depart:
+            durees[item_id] = (at - depart) / 60
+        repere = at
+    return durees
+
+
 def _session_unique(state: dict, slug: str, chantier_id: str) -> str:
     """Point A : nom de session tmux, unique par construction.
 
@@ -731,6 +787,87 @@ def set_checklist_duree(task_id: str, item_id: str, minutes: int) -> dict:
         for item in task["checklist"]:
             if item["id"] == item_id:
                 item["dureeMin"] = minutes
+                break
+        else:
+            raise ChantierError(
+                f"item not found: {item_id} does not exist in the checklist of {task_id}"
+            )
+    return task
+
+
+# Jeu d'attributs ARRETE (brief t-36), sur décision d'architecture de l'humain : un
+# critère porte des attributs qui décrivent sa NATURE, posés dès la création ou révisés
+# après coup -- jamais une prédiction de durée, seulement une description objective sur
+# laquelle une durée mesurée (voir duree_mesuree_par_critere) pourra un jour s'entraîner.
+#
+# Cinq clés, chacune fermée à un petit jeu de valeurs -- jamais du texte libre, sinon
+# l'attribut redevient un jugement, exactement ce qu'il doit remplacer :
+#
+# - geste : la nature du travail que fait l'exécutante sur ce critère. lire/ecrire
+#   distinguent la lecture pure de la production de code ; tester isole la preuve
+#   automatisée ; mesurer couvre toute observation empirique (capture, log, sortie d'une
+#   commande) qui n'est pas un test au sens strict ; publier couvre tout geste externe
+#   (déploiement, envoi) dont le coût n'a rien à voir avec le reste.
+# - etendue : le nombre de fichiers concernés par le critère, tel qu'écrit dans son
+#   libellé ou son brief -- un fichier nommé, plusieurs (un module), ou le chantier
+#   entier (une invariante qui traverse tout le dépôt).
+# - dépendance : ce dont le critère a besoin en dehors du code source lui-même. Distincte
+#   de "geste" : un même geste "tester" peut ne dépendre de rien (assertion pure) ou d'un
+#   pane tmux bien réel.
+# - incertitude : le chemin de la correction ou de l'ajout est-il déjà nommé dans le
+#   brief (connu), ou faut-il d'abord chercher/diagnostiquer avant d'agir (a_trouver) --
+#   c'est l'écart le plus net observé entre les critères les plus lents et les plus
+#   rapides du dépôt (brief t-36, section "regarde les critères qui ont pris 11 minutes").
+# - validation : ce qui tranche que le critère est vraiment franchi. assertion quand un
+#   test suffit, déterministe ; observation quand il faut regarder un résultat (rendu,
+#   capture, sortie) et en juger la conformité -- orthogonal à "geste", un critère "tester"
+#   peut relever de l'un ou de l'autre selon qu'il s'agit d'une assertion ou d'un témoin à
+#   lire.
+#
+# Validés contre les 350 critères réels du dépôt (mesure de durée moyenne par tâche,
+# 0,8 à 11 minutes) plutôt que devinées : voir le rapport de t-36 pour le détail des
+# exemples retenus et rejetés. Volontairement PAS de septième ni huitième attribut :
+# au-delà de sept personne ne les pose correctement (brief t-36), la donnée deviendrait du
+# bruit plutôt qu'un signal.
+ATTRIBUTS_VALEURS = {
+    "geste": ("lire", "ecrire", "tester", "mesurer", "publier"),
+    "etendue": ("fichier", "module", "chantier"),
+    "dependance": ("aucune", "tmux", "reseau", "navigateur"),
+    "incertitude": ("connu", "a_trouver"),
+    "validation": ("assertion", "observation"),
+}
+
+
+def set_checklist_attribut(task_id: str, item_id: str, cle: str, valeur: str) -> dict:
+    """Pose ou corrige UN attribut d'un critère (brief t-36), même régime que
+    set_checklist_duree juste au-dessus : posable à la création comme après coup, ouvert à
+    l'exécutante elle-même, une seule clé à la fois pour que chaque appel reste explicite
+    sur ce qui a changé.
+
+    clé doit être l'une des ATTRIBUTS_VALEURS ci-dessus et valeur l'une des valeurs
+    permises pour cette clé -- refuse sinon (I8) : une clé ou une valeur libres rendraient
+    l'attribut subjectif, exactement ce que le brief interdit (objectif, vérifiable sans
+    jugement).
+
+    Un critère qui n'a jamais reçu cet appel n'a pas la clé "attributs" du tout (piège du
+    brief, c6) : les 350 critères déjà sur disque, et tout nouveau critère tant que
+    personne ne pose un attribut dessus, restent parfaitement valides sans elle.
+    """
+    valeurs_permises = ATTRIBUTS_VALEURS.get(cle)
+    if valeurs_permises is None:
+        raise ChantierError(
+            f"attribute refused: {cle!r} is not one of {', '.join(ATTRIBUTS_VALEURS)}"
+        )
+    if valeur not in valeurs_permises:
+        raise ChantierError(
+            f"attribute refused: {valeur!r} is not a valid value for {cle} "
+            f"({', '.join(valeurs_permises)})"
+        )
+    with store.locked() as state:
+        task = _get_task(state, task_id)
+        for item in task["checklist"]:
+            if item["id"] == item_id:
+                item.setdefault("attributs", {})[cle] = valeur
                 break
         else:
             raise ChantierError(

@@ -664,6 +664,73 @@ class TestChecklistDuree(ChantierTestCase):
             chantier.set_checklist_duree(self.task_id, "c1", -5)
 
 
+class TestChecklistAttribut(ChantierTestCase):
+    """set_checklist_attribut() : les attributs d'un critère (brief t-36), posables à la
+    création comme révisables après coup -- même régime que set_checklist_duree ci-dessus,
+    une clé à la fois. Objectifs par construction : clé et valeur sont pris dans
+    ATTRIBUTS_VALEURS, jamais du texte libre."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=["premier critère"]
+        )["id"]
+
+    def test_pose_un_attribut(self):
+        t = chantier.set_checklist_attribut(self.task_id, "c1", "geste", "ecrire")
+        self.assertEqual(t["checklist"][0]["attributs"], {"geste": "ecrire"})
+
+    def test_pose_plusieurs_attributs_sur_le_meme_critere(self):
+        chantier.set_checklist_attribut(self.task_id, "c1", "geste", "tester")
+        t = chantier.set_checklist_attribut(self.task_id, "c1", "etendue", "fichier")
+        self.assertEqual(
+            t["checklist"][0]["attributs"], {"geste": "tester", "etendue": "fichier"}
+        )
+
+    def test_corrige_un_attribut_deja_pose(self):
+        chantier.set_checklist_attribut(self.task_id, "c1", "geste", "lire")
+        t = chantier.set_checklist_attribut(self.task_id, "c1", "geste", "publier")
+        self.assertEqual(t["checklist"][0]["attributs"]["geste"], "publier")
+
+    def test_ne_touche_ni_au_libelle_ni_a_letat_ni_a_la_duree(self):
+        chantier.check(self.task_id, "c1")
+        chantier.set_checklist_duree(self.task_id, "c1", 12)
+        t = chantier.set_checklist_attribut(self.task_id, "c1", "geste", "lire")
+        self.assertEqual(t["checklist"][0]["label"], "premier critère")
+        self.assertTrue(t["checklist"][0]["done"])
+        self.assertEqual(t["checklist"][0]["dureeMin"], 12)
+
+    def test_cle_inconnue_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_attribut(self.task_id, "c1", "humeur", "bonne")
+
+    def test_valeur_invalide_pour_une_cle_connue_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_attribut(self.task_id, "c1", "geste", "danser")
+
+    def test_item_inconnu_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_attribut(self.task_id, "c-inconnu", "geste", "lire")
+
+    def test_tache_inconnue_leve(self):
+        with self.assertRaises(chantier.ChantierError):
+            chantier.set_checklist_attribut("t-99", "c1", "geste", "lire")
+
+    def test_critere_sans_attribut_reste_valide(self):
+        # c6 du brief t-36 : 350 critères existent déjà sans "attributs" au monde, et rien
+        # ne doit lever ni sur leur lecture ni sur leur passage dans les autres fonctions
+        # de checklist -- l'absence est le cas courant, pas une erreur.
+        t = store.load()["taches"][self.task_id]
+        self.assertIsNone(t["checklist"][0].get("attributs"))
+        # cocher, découper, reformuler, dater fonctionnent toujours sans qu'aucun attribut
+        # n'ait jamais été posé.
+        chantier.check(self.task_id, "c1")
+        chantier.reword_checklist_item(self.task_id, "c1", "autre libellé")
+        t = store.load()["taches"][self.task_id]
+        self.assertTrue(t["checklist"][0]["done"])
+
+
 class TestChecklistNeverShrinks(ChantierTestCase):
     """c4/c8 : rien, dans le contrat public de chantier.py, ne peut retirer un critère.
 
@@ -1263,6 +1330,121 @@ class TestEcartEstimeReel(ChantierTestCase):
         with store.locked() as state:
             state["taches"][t]["state"] = "done"
         self.assertIsNone(chantier.ecart_estime_reel(store.load()["taches"][t]))
+
+
+class TestDureeMesureeParCritere(ChantierTestCase):
+    """duree_mesuree_par_critere() : la durée réelle INDIVIDUELLE de chaque critère (brief
+    t-36), à partir des faits "checklist-doing" et "checklist-coche" du journal machine
+    (t-34) -- remplace la seule mesure disponible jusqu'ici (_duree_reelle_par_critere),
+    qui divise la durée totale d'une tâche par son nombre de critères et suppose donc
+    qu'ils se valent tous.
+
+    Fonction pure : les événements sont passés en paramètre, jamais lus sur disque ici
+    (chantier.py ne peut pas importer journal.py, qui l'importe déjà -- voir le
+    commentaire d'en-tête du fichier) ; c'est à l'appelant (cli.py, un test) de les
+    obtenir via journal.lire_evenements()."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.chantier_id = chantier.start(str(self._projet()), "obj")["id"]
+        self.task_id = chantier.add_task(
+            self.chantier_id, "t", "prompt", checklist=["premier", "second", "troisième"]
+        )["id"]
+        with store.locked() as state:
+            state["taches"][self.task_id]["startedAt"] = "2026-08-01T00:00:00Z"
+
+    def _task(self) -> dict:
+        return store.load()["taches"][self.task_id]
+
+    def test_ecart_entre_le_doing_et_sa_propre_coche(self):
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:01:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:04:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {"c1": 3.0})
+
+    def test_sans_doing_utilise_la_coche_precedente(self):
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:02:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c2",
+             "at": "2026-08-01T00:07:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        # c1 : startedAt (00:00) -> sa coche (00:02) = 2 minutes.
+        # c2 : coche précédente, celle de c1 (00:02) -> sa coche (00:07) = 5 minutes.
+        self.assertEqual(durees, {"c1": 2.0, "c2": 5.0})
+
+    def test_premier_critere_sans_doing_utilise_le_lancement_de_la_tache(self):
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:05:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {"c1": 5.0})
+
+    def test_criteres_de_taches_differentes_ne_se_melangent_pas(self):
+        autre = chantier.add_task(self.chantier_id, "autre", "prompt", checklist=["x"])["id"]
+        evenements = [
+            {"tache": autre, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:00:30Z"},
+            {"tache": autre, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:09:00Z"},
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:01:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:02:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {"c1": 1.0})
+
+    def test_evenements_hors_ordre_decriture_sont_retries(self):
+        # Le journal est append-only donc déjà chronologique, mais la fonction ne DOIT
+        # pas en dépendre : elle retrie par "at" plutôt que de faire confiance à l'ordre
+        # d'entrée, qu'un futur appelant pourrait un jour fournir mélangé.
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:02:00Z"},
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:01:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {"c1": 1.0})
+
+    def test_critere_jamais_coche_absent_du_resultat(self):
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:01:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {})
+
+    def test_aucun_evenement_rend_un_dict_vide(self):
+        self.assertEqual(chantier.duree_mesuree_par_critere(self._task(), []), {})
+
+    def test_ignore_les_evenements_dun_autre_type(self):
+        evenements = [
+            {"tache": self.task_id, "type": "tache-bloquee", "item": "c1",
+             "at": "2026-08-01T00:01:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {})
+
+    def test_coche_anterieure_ou_egale_a_son_repere_est_ignoree(self):
+        # Horodatage incohérent (coche au même instant ou avant son point de départ,
+        # ex. horloges qui divergent) : jamais une durée de zéro ou négative, qui
+        # fausserait toute médiane ultérieure -- même parti pris que _duree_reelle_min.
+        evenements = [
+            {"tache": self.task_id, "type": "checklist-doing", "item": "c1",
+             "at": "2026-08-01T00:05:00Z"},
+            {"tache": self.task_id, "type": "checklist-coche", "item": "c1",
+             "at": "2026-08-01T00:05:00Z"},
+        ]
+        durees = chantier.duree_mesuree_par_critere(self._task(), evenements)
+        self.assertEqual(durees, {})
 
 
 if __name__ == "__main__":

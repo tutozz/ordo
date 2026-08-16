@@ -57,11 +57,27 @@ HERITE = "herite"
 # fois, plus le temps humain du diagnostic.
 HAIKU_PROMPT_MAX = 600
 HAIKU_TOUCHES_MAX = 2
-# Relevé de 2 à 4 avec la convention de labels courts (60 caractères, 3 à 5 items par
-# tâche) : sur des libellés courts, le NOMBRE d'items ne mesure plus la difficulté de la
-# tâche, il mesure la finesse du découpage. Le seuil garde son rôle de plafond contre une
-# tâche à dix critères ; il cesse d'être un proxy de "petite tâche".
-HAIKU_CHECKLIST_MAX = 4
+# Relevé de 4 à 10 quand la convention d'écriture est passée à 5-10 items de 40
+# caractères par tâche (contre 3-5 avant) : la barre de progression doit bouger toutes
+# les quelques minutes sous les yeux de l'humain, ce qui découpe plus finement un travail
+# de même taille. Le compte ne mesurait déjà plus la difficulté depuis le relèvement
+# précédent (2 -> 4) ; il ne mesure maintenant que la finesse d'écriture, et un seuil à 4
+# aurait disqualifié TOUTE tâche correctement rédigée, y compris un renommage mécanique
+# découpé en huit étapes. Ce qui distingue une tâche mécanique reste ce que ce module
+# regarde déjà ailleurs : le geste au TITRE, le périmètre NOMMÉ (touches / fichier cité),
+# la taille du BRIEF (HAIKU_PROMPT_MAX) -- jamais le nombre de cases à cocher. Le seuil
+# remonte donc au plafond de la convention elle-même : une tâche qui le dépasse n'est plus
+# finement écrite, elle est réellement découpée au-delà de ce qu'un geste mécanique
+# justifie, et c'est ce débordement-là, pas le compte en soi, qui écarte haiku.
+#
+# Mesure avant/après sur les 139 tâches réelles des trois ORDO_HOME (voir rapport de
+# t-20) : 0 bascule de modèle sur ce corpus, relevé ou supprimé. Raison mesurée : sur 166
+# tâches (le corpus a grandi depuis la mesure de référence), seules 4 portent un verbe
+# mécanique au titre, et 3 des 4 sont déjà écartées de haiku par HAIKU_PROMPT_MAX, avant
+# même d'atteindre ce seuil. Le risque de ce changement est donc prospectif, pas mesuré
+# sur l'existant : il protège la PROCHAINE tâche mécanique écrite sous la nouvelle
+# convention, que l'ancien seuil aurait à tort envoyée sur sonnet.
+HAIKU_CHECKLIST_MAX = 10
 
 # Une decision non prise dans le brief sera prise par l'executante. Autant qu'elle le
 # soit par le modele qui decide le mieux.

@@ -214,9 +214,9 @@ class TestSonnetSurSpecificationVerifiable(unittest.TestCase):
             tache(
                 titre="Appliquer la route GET /api/tapes",
                 prompt="Mettre a jour lib/tapes.js selon docs/15-API.md.",
-                # 5, au-dessus de HAIKU_CHECKLIST_MAX (4) : ce test vérifie l'ancrage par
-                # fichier cité, pas la frontière haiku/sonnet, qui a ses tests dédiés.
-                checklist=coche(5),
+                # 11, au-dessus de HAIKU_CHECKLIST_MAX (10) : ce test vérifie l'ancrage
+                # par fichier cité, pas la frontière haiku/sonnet, qui a ses tests dédiés.
+                checklist=coche(11),
                 touches=[],
             )
         )
@@ -261,36 +261,55 @@ class TestHaikuSurGesteMecanique(unittest.TestCase):
         self.assertEqual(m, "sonnet")
 
     def test_checklist_dense_disqualifie_haiku(self):
+        """Au-delà du plafond de la convention (10 items), le découpage cesse d'être
+        une question de finesse d'écriture : c'est un signal de complexité réelle."""
         m, _ = routage.classer(
             tache(
                 titre="Renommer le fichier",
                 prompt="Renommer a.py en b.py.",
-                checklist=coche(6),
+                checklist=coche(15),
                 touches=["a.py"],
             )
         )
         self.assertEqual(m, "sonnet")
 
-    def test_quatre_coches_pile_au_seuil_donnent_encore_haiku(self):
-        """HAIKU_CHECKLIST_MAX vaut 4 : la borne elle-même reste du côté haiku."""
+    def test_checklist_fine_dans_la_convention_reste_haiku(self):
+        """Un renommage mécanique découpé en huit étapes reste un renommage
+        mécanique : 8 items est dans la convention d'écriture (5 à 10), le compte ne
+        doit plus le disqualifier de haiku. C'est le défaut mesuré et corrigé par t-20 :
+        avec l'ancien seuil (4), ce cas serait passé à sonnet pour rien."""
         m, motif = routage.classer(
             tache(
                 titre="Renommer switch.component.tsx",
                 prompt="Renommer switch.component.tsx en toggle.component.tsx "
                 "et mettre a jour les deux imports.",
-                checklist=coche(4),
+                checklist=coche(8),
                 touches=["src/switch.component.tsx"],
             )
         )
         self.assertEqual(m, "haiku", motif)
 
-    def test_cinq_coches_juste_au_dessus_du_seuil_repassent_en_sonnet(self):
+    def test_dix_coches_pile_au_seuil_donnent_encore_haiku(self):
+        """HAIKU_CHECKLIST_MAX vaut 10, le plafond de la convention (5 à 10 items) :
+        la borne elle-même reste du côté haiku."""
+        m, motif = routage.classer(
+            tache(
+                titre="Renommer switch.component.tsx",
+                prompt="Renommer switch.component.tsx en toggle.component.tsx "
+                "et mettre a jour les deux imports.",
+                checklist=coche(10),
+                touches=["src/switch.component.tsx"],
+            )
+        )
+        self.assertEqual(m, "haiku", motif)
+
+    def test_onze_coches_juste_au_dessus_du_seuil_repassent_en_sonnet(self):
         m, _ = routage.classer(
             tache(
                 titre="Renommer switch.component.tsx",
                 prompt="Renommer switch.component.tsx en toggle.component.tsx "
                 "et mettre a jour les deux imports.",
-                checklist=coche(5),
+                checklist=coche(11),
                 touches=["src/switch.component.tsx"],
             )
         )

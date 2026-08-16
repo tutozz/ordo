@@ -600,6 +600,32 @@ def _print_launch_result(task_id: str, participe: str, result: dict, as_json: bo
 # ---------------------------------------------------------------------------
 
 
+def _inscrire_au_registre() -> None:
+    """Fait connaître ce ORDO_HOME au serveur de cartes, sans jamais l'allumer.
+
+    Inscrire à l'ouverture du chantier, et pas seulement au premier `watch`, répare un
+    défaut mesuré : un projet ouvert puis piloté à la main n'apparaissait dans aucun menu
+    du serveur, alors même qu'il tournait. Rien à l'écran ne disait qu'il manquait une
+    inscription, et le seul remède était de connaître `ordo serve` par cœur.
+
+    register() et pas ensure() : ouvrir un chantier n'est pas une raison d'allumer un
+    daemon. La vie du serveur reste la décision de `watch`, qui en a besoin.
+
+    ORDO_NO_SERVE coupe l'inscription, pour la même raison que dans serveur.ensure() : une
+    suite de tests ne doit rien écrire dans le registre de la machine. Un échec, lui, est
+    avalé : ne pas figurer dans un menu est un désagrément, ne pas pouvoir ouvrir son
+    chantier est un blocage.
+    """
+    if os.environ.get("ORDO_NO_SERVE"):
+        return
+    try:
+        from . import serveur
+
+        serveur.register(store.home())
+    except Exception as exc:  # noqa: BLE001 - voir le commentaire ci-dessus
+        print(f"map registry unavailable: {exc}", file=sys.stderr, flush=True)
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     ch = chantier.start(
         args.project,
@@ -610,6 +636,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         home_partage=args.shared_home,
         keep_panes=args.keep_panes,
     )
+    _inscrire_au_registre()
     if args.json:
         _print_json(ch)
         return 0

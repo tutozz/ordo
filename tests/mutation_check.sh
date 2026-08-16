@@ -704,8 +704,63 @@ run_case "INT3" "interdit : acte irreversible sans question" \
     "tests.test_prompt.TestBriefExecutante.test_irreversible_sans_question_interdit_dans_le_brief" \
     "$LIB_DIR/prompt.py" "$S" "$R"
 
+# ---------------------------------------------------------------------------
+# REG1 -- ouvrir un chantier l'inscrit au registre du serveur de cartes.
+# Mutation : l'appel disparaît de cmd_start. Le chantier tourne alors sans
+# figurer dans aucun menu, exactement le défaut qui a coûté un diagnostic.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/s16"; R="$WORKDIR/r16"
+cat >"$S" <<'ORDO_EOF'
+    _inscrire_au_registre()
+    if args.json:
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    if args.json:
+ORDO_EOF
+run_case "REG1" "ouvrir un chantier l'inscrit au registre" \
+    "tests.test_cli.TestChantierVerbs.test_start_inscrit_le_home_au_registre_du_serveur" \
+    "$LIB_DIR/cli.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# REG2 -- inscrire, jamais allumer. Mutation : ensure() à la place de
+# register(). Ouvrir un chantier démarrerait un daemon que personne n'a demandé.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/s17"; R="$WORKDIR/r17"
+cat >"$S" <<'ORDO_EOF'
+        serveur.register(store.home())
+    except Exception as exc:  # noqa: BLE001 - voir le commentaire ci-dessus
+        print(f"map registry unavailable: {exc}", file=sys.stderr, flush=True)
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+        serveur.ensure()
+    except Exception as exc:  # noqa: BLE001 - voir le commentaire ci-dessus
+        print(f"map registry unavailable: {exc}", file=sys.stderr, flush=True)
+ORDO_EOF
+run_case "REG2" "start inscrit sans jamais allumer de serveur" \
+    "tests.test_cli.TestChantierVerbs.test_start_n_allume_aucun_serveur" \
+    "$LIB_DIR/cli.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
+# REG3 -- ORDO_NO_SERVE coupe l'inscription. Mutation : la garde saute, et une
+# suite de tests écrit dans le registre réel de la machine.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/s18"; R="$WORKDIR/r18"
+cat >"$S" <<'ORDO_EOF'
+    if os.environ.get("ORDO_NO_SERVE"):
+        return
+    try:
+        from . import serveur
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+    try:
+        from . import serveur
+ORDO_EOF
+run_case "REG3" "ORDO_NO_SERVE coupe l'inscription de start" \
+    "tests.test_cli.TestChantierVerbs.test_start_sous_ORDO_NO_SERVE_n_inscrit_rien" \
+    "$LIB_DIR/cli.py" "$S" "$R"
+
 echo ""
-echo "Verification de restauration finale :"
+echo "Vérification de restauration finale :"
 restore_lib_tree
 RESTORE_RC=$?
 RESTORE_ALREADY_DONE=1

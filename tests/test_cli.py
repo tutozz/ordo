@@ -165,6 +165,37 @@ class TestChantierVerbs(CliTestCase):
         )
         self.assertEqual(code2, 0)
 
+    def test_start_inscrit_le_home_au_registre_du_serveur(self):
+        """Un chantier neuf est visible au mur sans attendre le premier `watch`.
+
+        Avant, seuls `watch` et `serve` inscrivaient : un projet ouvert puis piloté à la
+        main restait absent du menu du serveur, et rien à l'écran ne disait pourquoi.
+        """
+        from ordo import serveur
+
+        os.environ.pop("ORDO_NO_SERVE", None)
+        projet = self._projet()
+        self._run(["start", str(projet), "--goal", "obj"])
+        self.assertIn(store.canon(self._tmp), serveur.homes())
+
+    def test_start_n_allume_aucun_serveur(self):
+        """L'inscription, jamais le démarrage : ouvrir un chantier n'est pas allumer un
+        daemon. C'est `watch` qui décide de la vie du serveur, et lui seul."""
+        from ordo import serveur
+
+        os.environ.pop("ORDO_NO_SERVE", None)
+        projet = self._projet()
+        with mock.patch.object(serveur, "ensure") as ensure:
+            self._run(["start", str(projet), "--goal", "obj"])
+        ensure.assert_not_called()
+
+    def test_start_sous_ORDO_NO_SERVE_n_inscrit_rien(self):
+        """La porte de sortie vaut aussi pour `start` : sous ORDO_NO_SERVE, aucune écriture
+        hors du home, donc aucun fichier de registre créé."""
+        projet = self._projet()
+        self._run(["start", str(projet), "--goal", "obj"])
+        self.assertFalse(Path(os.environ["ORDO_REGISTRY"]).exists())
+
     def test_start_permissions_invalide_refuse_par_argparse(self):
         projet = self._projet()
         with self.assertRaises(SystemExit) as ctx:

@@ -26,6 +26,12 @@ All notable changes to this project are documented here. This project follows
 
 ### Fixed
 
+- `ordo start` now **registers its `ORDO_HOME`** with the map server, instead of leaving
+  that to the first `ordo watch`. A campaign opened and then driven by hand appeared in no
+  menu of a running server, and nothing on screen said an entry was missing: the only cure
+  was knowing `ordo serve` by heart. It registers, it never starts a daemon - the server's
+  life stays `watch`'s decision - and `ORDO_NO_SERVE` still switches the whole thing off.
+
 - `ordo/usage.py` counted the same turn once per content block. Claude Code writes one
   assistant turn across several transcript lines that each repeat the same `usage`, so
   every token figure Ordo displayed was inflated: **output was counted twice** (+102%),

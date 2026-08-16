@@ -115,9 +115,22 @@ Forty characters is short on purpose, and it is a measured constraint, not a pre
 card in a wall column is a few hundred pixels wide, and the label sits next to the id, the
 model badge, the elapsed time and the context size. Anything longer is truncated on the very
 screen it was written for. It is also a good filter - what does not fit in forty characters
-is almost always two criteria wearing one label. Write `report consumed after apply`, not
-`the report is consumed after it has been applied`: the reader has the task's title and its
-`--why` right there, the item only has to name the step.
+is almost always two criteria wearing one label.
+
+**Write labels as noun phrases, capitalised, never as sentences.** Leading capital, then
+lower case. No leading article, no verb where a noun does the job, no subordinate clause. The
+reader has the task's title and its `--why` right beside it; the label only has to name the
+step.
+
+| Write this | Not this |
+|---|---|
+| `Rapport consommé après apply` | `le rapport est consommé après avoir été appliqué` |
+| `Progression visible en vue graphe` | `la case porte la progression, même en vue graphe` |
+| `Aucun débordement en colonne` | `rien ne déborde à la largeur d'une colonne de mur` |
+| `Refus de suppression testé` | `un test couvre le refus de suppression d'un critère` |
+
+The right-hand column is not wrong, it is just prose where a label was needed - and it is
+what a whole campaign of this repository was written with before the rule existed.
 
 Avoid the catch-all last item. "the full suite passes" as the fifth of five is where a third
 of the task hides; if the task ends with real verification work, say what that work is.

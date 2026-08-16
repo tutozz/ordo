@@ -68,7 +68,11 @@ PLAN_SCHEMA = json.dumps({
                     "checklist": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "post-conditions to tick once the task is done",
+                        "description": (
+                            "verifiable post-conditions to tick once the task is done; "
+                            f"{chantier.CHECKLIST_LABEL_MAX} characters max each, 3 to 5 "
+                            "per task"
+                        ),
                     },
                     "parallelisable": {
                         "type": "boolean",

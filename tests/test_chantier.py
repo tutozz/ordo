@@ -237,6 +237,44 @@ class TestAddTask(ChantierTestCase):
         self.assertEqual(b["dependsOn"], [a])
 
 
+class TestChecklistHorsConvention(unittest.TestCase):
+    """checklist_hors_convention() est pure : aucun ORDO_HOME requis."""
+
+    def test_aucun_label_trop_long_rend_liste_vide(self):
+        checklist = [
+            {"id": "c1", "label": "ok", "done": False},
+            {"id": "c2", "label": "toujours ok", "done": False},
+        ]
+        self.assertEqual(chantier.checklist_hors_convention(checklist), [])
+
+    def test_un_label_trop_long_est_signale_avec_sa_longueur_reelle(self):
+        checklist = [{"id": "c1", "label": "x" * 63, "done": False}]
+        self.assertEqual(
+            chantier.checklist_hors_convention(checklist), [{"id": "c1", "length": 63}]
+        )
+
+    def test_la_limite_pile_au_seuil_ne_declenche_rien(self):
+        checklist = [
+            {"id": "c1", "label": "x" * chantier.CHECKLIST_LABEL_MAX, "done": False}
+        ]
+        self.assertEqual(chantier.checklist_hors_convention(checklist), [])
+
+    def test_un_cran_au_dessus_du_seuil_declenche(self):
+        checklist = [
+            {"id": "c1", "label": "x" * (chantier.CHECKLIST_LABEL_MAX + 1), "done": False}
+        ]
+        self.assertEqual(
+            chantier.checklist_hors_convention(checklist),
+            [{"id": "c1", "length": chantier.CHECKLIST_LABEL_MAX + 1}],
+        )
+
+    def test_ne_modifie_pas_la_checklist_recue(self):
+        checklist = [{"id": "c1", "label": "x" * 70, "done": False}]
+        avant = [dict(item) for item in checklist]
+        chantier.checklist_hors_convention(checklist)
+        self.assertEqual(checklist, avant)
+
+
 class TestDependConfinedToChantier(ChantierTestCase):
     """Point F : une dependance ne peut jamais traverser deux chantiers.
 

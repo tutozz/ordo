@@ -57,7 +57,11 @@ HERITE = "herite"
 # fois, plus le temps humain du diagnostic.
 HAIKU_PROMPT_MAX = 600
 HAIKU_TOUCHES_MAX = 2
-HAIKU_CHECKLIST_MAX = 2
+# Relevé de 2 à 4 avec la convention de labels courts (60 caractères, 3 à 5 items par
+# tâche) : sur des libellés courts, le NOMBRE d'items ne mesure plus la difficulté de la
+# tâche, il mesure la finesse du découpage. Le seuil garde son rôle de plafond contre une
+# tâche à dix critères ; il cesse d'être un proxy de "petite tâche".
+HAIKU_CHECKLIST_MAX = 4
 
 # Une decision non prise dans le brief sera prise par l'executante. Autant qu'elle le
 # soit par le modele qui decide le mieux.

@@ -62,6 +62,20 @@ def _runner(stdout: str, returncode: int = 0, stderr: str = ""):
     return run
 
 
+class TestPlanSchemaChecklistDescription(unittest.TestCase):
+    """Le planificateur ne lit que ce schéma : la convention doit y être écrite, pas
+    seulement vécue par _materialize() en aval."""
+
+    def test_la_description_enonce_la_convention_de_label(self):
+        schema = json.loads(plan.PLAN_SCHEMA)
+        description = schema["properties"]["taches"]["items"]["properties"]["checklist"][
+            "description"
+        ]
+        self.assertIn(str(chantier.CHECKLIST_LABEL_MAX), description)
+        self.assertIn("3", description)
+        self.assertIn("5", description)
+
+
 class PlanTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.mkdtemp(prefix="ordo-plan-test-")

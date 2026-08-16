@@ -45,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import carte, chantier, panes, store, usage
+from . import carte, chantier, panes, quota, store, usage
 
 # Port fixe, et fixe volontairement. Un port tire au hasard obligerait a le retrouver a
 # chaque fois, ce qui interdit le favori qui fait tout l'interet de la chose.
@@ -267,6 +267,10 @@ def snapshot() -> dict:
         "service": SIGNATURE,
         "campaigns": campagnes,
         "problems": problemes,
+        # Peut être None : quota.lire() ne ment jamais un chiffre quand le fichier
+        # du hook statusline est absent, illisible ou périmé. La page décide seule
+        # de ce qu'elle en montre.
+        "quota": quota.lire(),
         "at": store.now(),
     }
 

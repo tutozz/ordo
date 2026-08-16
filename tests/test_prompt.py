@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -126,6 +127,41 @@ class TestBriefExecutante(PromptTestCase):
         contenu = Path(chemin).read_text(encoding="utf-8")
         self.assertIn("tests verts", contenu)
         self.assertIn("migration reversible", contenu)
+
+    def test_brief_donne_la_commande_ordo_check_prete_a_copier_par_item(self):
+        # défaut à corriger : la checklist ne bougeait qu'au rapport final. Le brief doit
+        # maintenant donner, item par item, la commande exacte à lancer dès qu'un critère
+        # est vérifié - pas seulement son identifiant.
+        cid = self._chantier()
+        tid = self._task(cid)
+        chemin = prompt.brief_executante(tid)
+        contenu = Path(chemin).read_text(encoding="utf-8")
+        home = shlex.quote(str(store.home()))
+        self.assertIn(f"ORDO_HOME={home} ordo check {tid} c1", contenu)
+        self.assertIn(f"ORDO_HOME={home} ordo check {tid} c2", contenu)
+
+    def test_home_avec_espace_est_correctement_echappe_dans_la_commande(self):
+        # même raison qu'à carte.py:731-734 : un ORDO_HOME peut contenir une espace, et une
+        # commande affichée puis copiée telle quelle doit marcher au premier essai.
+        home_avec_espace = Path(self._tmp) / "home avec espace"
+        home_avec_espace.mkdir()
+        os.environ["ORDO_HOME"] = str(home_avec_espace)
+        cid = self._chantier()
+        tid = self._task(cid)
+        chemin = prompt.brief_executante(tid)
+        contenu = Path(chemin).read_text(encoding="utf-8")
+        attendu = shlex.quote(str(store.home()))
+        self.assertIn("'", attendu)  # vérifie que ce test porte bien sur un home à espace
+        self.assertIn(f"ORDO_HOME={attendu} ordo check {tid} c1", contenu)
+
+    def test_le_rapport_reste_le_filet_apres_la_checklist(self):
+        # le champ "checked" du rapport garde son rôle : cocher au fil de l'eau ne le
+        # rend pas obsolète, il ne fait que doubler un item déjà coché, sans conséquence.
+        cid = self._chantier()
+        tid = self._task(cid)
+        chemin = prompt.brief_executante(tid)
+        contenu = Path(chemin).read_text(encoding="utf-8")
+        self.assertIn("safety net", contenu.lower())
 
     def test_brief_contains_report_file_path_as_absolute(self):
         cid = self._chantier()

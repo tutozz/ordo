@@ -49,23 +49,67 @@ _CACHE: dict[str, dict] = {}
 _OCTETS = 0
 
 # Tours d'une session au-dela desquels son contexte merite d'etre remis a plat. 0 desactive.
+# Sa propre variable d'environnement, distincte de celle de SEUIL_CONTEXTE (voir plus bas
+# pourquoi les confondre est dangereux).
 #
-# Mesure sur soixante transcripts reels de deux chantiers : chaque jeton entre dans une
-# session est ensuite relu CENT DEUX FOIS, et le dernier tiers d'une session coute 2,3 fois
-# son premier tiers. Le contexte n'est pas gros, il est porte trop longtemps. Simule sur ces
-# memes series, compacter tous les 75 tours rend 21 % du contexte total facture, une fois
-# payee l'ecriture qu'une compaction coute elle-meme.
+# DÉPASSÉ : le déclencheur réel vit désormais dans SEUIL_CONTEXTE ci-dessous, mesuré sur le
+# contexte porté plutôt que sur les tours. Raison du remplacement, chiffrée sur cinquante-neuf
+# sessions réelles de deux chantiers : au seuil de 75 tours, 16 sur 59 étaient RATÉES parce
+# qu'elles atteignaient un gros contexte avant d'atteindre 75 tours (exemple : une session à
+# 290 505 jetons de contexte en seulement 49 tours). La corrélation tours/contexte est forte
+# (r = 0,92) mais pas assez pour servir de proxy : le contexte par tour varie d'un facteur 5
+# d'une session à l'autre (médiane 2 419, min 1 188, max 6 251).
 #
-# 75 plutot que 50, qui rendait 4 points de plus : la mediane des sessions est a 92 tours,
-# donc a 75 la moitie d'entre elles ne compactent jamais. Chaque compaction est une occasion
-# de perdre du contexte que la tache aurait utilise, et cette perte-la n'est mesurable dans
-# aucun transcript. On prend le gain qui se voit, pas le dernier point qui se paierait en
-# travail refait.
-#
-# Vit ICI et pas dans controle.py parce que deux modules le lisent -- la boucle qui compacte
-# et la carte qui signale une session longue -- et qu'une carte qui alerterait a 100 pendant
-# qu'Ordo compacte a 75 raconterait une autre histoire que celle qui se joue.
+# Cette constante reste lue par carte.py, qui n'a pas encore basculé sur SEUIL_CONTEXTE ; elle
+# reste donc EXACTE et INCHANGÉE pour ne pas casser ce lecteur. controle.py, lui, ne la lit
+# plus.
 SEUIL_TOURS = float(os.environ.get("ORDO_COMPACT_EVERY") or 75)
+
+# Contexte porté (voir dernierContexte, rendu par pour()) au-delà duquel une session mérite
+# d'être remise à plat. 0 désactive. Remplace SEUIL_TOURS comme déclencheur de la compaction :
+# une session peut porter un gros contexte en peu de tours, et le nombre de tours ne le voit
+# jamais venir (voir le commentaire de SEUIL_TOURS pour les 16 sessions ratées).
+#
+# Sa propre variable d'environnement, ORDO_COMPACT_EVERY_CONTEXTE -- SURTOUT PAS
+# ORDO_COMPACT_EVERY, lue par SEUIL_TOURS ci-dessus. Les deux échelles diffèrent d'un facteur
+# mille (tours contre jetons) : les confondre a longtemps mis, en posant ORDO_COMPACT_EVERY
+# pour régler la cadence en tours, ce seuil-ci à quelques dizaines de jetons, déclenchant la
+# compaction à chaque tour, pour toujours.
+#
+# Choisi par SIMULATION sur les 55 sessions exploitables (au moins 5 tours) des 59 transcripts
+# réels du chantier camcast. Pour chaque seuil candidat, simulation du contexte total facturé
+# sur la session entière en repartant à 42 000 jetons (le contexte mesuré d'un premier tour
+# réel) après chaque compaction. Sans aucune compaction, ces sessions facturent 1,90 milliard
+# de jetons de contexte cumulés (baseline).
+#
+# Chaque compaction facture 315 000 jetons -- mais d'ÉCRITURE de cache, pas de relecture, et
+# les deux n'ont pas le même prix : une écriture coûte 1,25 fois un jeton d'entrée, une
+# relecture 0,1 fois. Un jeton écrit coûte donc 12,5 jetons relus. La première version de
+# cette simulation facturait les 315 000 jetons d'écriture au prix d'une relecture, ce qui
+# sous-évaluait chaque compaction d'un facteur 12,5 et faisait paraître rentable un seuil bien
+# trop bas : à 75 000, 345 compactions × 315 000 × 12,5 ≈ 1,36 milliard de jetons
+# équivalent-relecture à elles seules, à comparer aux 1,90 milliard de la baseline entière.
+#
+#      seuil     gain net   compactions   tours moyens entre deux compactions
+#     75 000        5,3 %       349                     21   <- ancien seuil, quasi annulé
+#    100 000       32,2 %       196                     38
+#    125 000       41,3 %       129                     57
+#    150 000       44,6 %        94                     79   <- retenu
+#    170 000       44,6 %        75                     99
+#    200 000       42,8 %        55                    134
+#    300 000       32,5 %        19                    389
+#
+# Le plateau se déplace de 70 000-80 000 à 140 000-180 000 (moins de 1 point d'écart) : le
+# coût d'écriture, désormais 12,5 fois plus cher, ne se rentabilise qu'en espaçant nettement
+# plus les compactions. 150 000 est un nombre rond au sommet de ce plateau, une cadence d'un
+# tour sur environ quatre-vingts.
+#
+# Repère de plausibilité : la même correction appliquée à la simulation par NOMBRE DE TOURS
+# donne 21 % de gain net à 75 tours et 25 % à 50 tours, contre 44,6 % ici. L'écart est réel
+# mais s'explique : le déclencheur par tours compacte des sessions au contexte encore léger
+# simplement parce qu'elles ont duré, payant des écritures pour rien -- exactement ce que ce
+# seuil-ci a été introduit pour éviter (voir le commentaire de SEUIL_TOURS).
+SEUIL_CONTEXTE = float(os.environ.get("ORDO_COMPACT_EVERY_CONTEXTE") or 150000)
 
 _CHAMPS = {
     "input_tokens": "input",
@@ -73,6 +117,12 @@ _CHAMPS = {
     "cache_creation_input_tokens": "cacheCreation",
     "cache_read_input_tokens": "cacheRead",
 }
+
+# Champs de _CHAMPS qui composent le contexte PORTÉ par un tour -- ce que le modèle a
+# effectivement lu pour répondre. La sortie en est exclue : elle n'est jamais relue par le
+# tour qui l'a produite, seulement par les tours suivants (et elle est alors comptée dans
+# leur propre cache_read, pas ici).
+_CHAMPS_CONTEXTE = ("input", "cacheCreation", "cacheRead")
 
 
 def racine() -> Path:
@@ -104,7 +154,8 @@ def _trouver(session_id: str) -> Path | None:
 
 
 def _vide() -> dict:
-    return {"input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0, "turns": 0}
+    return {"input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0, "turns": 0,
+            "dernierContexte": 0}
 
 
 # Valeur du « dernier identifiant vu » quand il n'y en a pas encore. None ne convient pas :
@@ -169,13 +220,20 @@ def _avaler(entree: dict, chemin: Path) -> None:
             continue
         entree["dernier"] = _AUCUN if identifiant is None else identifiant
         vu = False
+        contexte_tour = 0
         for brut, nom in _CHAMPS.items():
             valeur = u.get(brut)
             if isinstance(valeur, int):
                 totaux[nom] += valeur
                 vu = True
+                if nom in _CHAMPS_CONTEXTE:
+                    contexte_tour += valeur
         if vu:
             totaux["turns"] += 1
+            # Écrase, n'additionne pas : c'est le contexte de CE tour, pas la somme de tous
+            # les tours de la session. Un tour non vu (ligne dupliquée, dédoublonnée plus
+            # haut) laisse la valeur précédente en place, ce qui est le comportement voulu.
+            totaux["dernierContexte"] = contexte_tour
 
 
 def pour(task: dict) -> dict | None:
@@ -185,6 +243,11 @@ def pour(task: dict) -> dict | None:
     cache cree, cache relu, chacun a part. Les additionner en un seul nombre ferait passer
     vingt-cinq millions de jetons de cache relu pour l'equivalent de vingt-cinq millions de
     jetons ecrits, ce qu'ils ne sont ni en cout ni en sens.
+
+    Porte aussi "dernierContexte" : la taille du contexte du DERNIER tour lu (input +
+    cache_creation + cache_read de ce tour, sortie exclue), pas une somme sur la session.
+    C'est ce que lit la compaction (voir SEUIL_CONTEXTE) pour décider si une session porte
+    un contexte trop lourd, quel que soit son nombre de tours.
     """
     session_id = task.get("claudeSessionId")
     if not session_id:

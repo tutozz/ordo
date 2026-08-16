@@ -323,6 +323,63 @@ class TestApplyProgress(ReportTestCase):
         self.assertIsNotNone(task["lastReportAt"])
 
 
+class TestApplyConsumesReport(ReportTestCase):
+    """La racine du bug des questions dupliquées (docs/diagnostic-envoi.md) : un
+    rapport reste sur disque après avoir été appliqué et redevient un signal neuf
+    dès que la tâche repasse "running" (cas "asking") ou au tick suivant (cas
+    "progress", qui ne change pas l'état). apply() doit donc consommer le fichier
+    de rapport qu'il vient de lire, pour toute tâche dont le contenu a été compris.
+    """
+
+    def test_apply_supprime_le_fichier_de_rapport_sur_disque(self):
+        state = self._state_with_task()
+        p = report.path("t-01", "c-01")
+        raw = '{"state": "done", "note": "termine"}'
+        p.write_text(raw, encoding="utf-8")
+        report.apply(state, "t-01", raw)
+        self.assertFalse(p.exists())
+
+    def test_un_rapport_asking_applique_ne_redevient_jamais_un_signal_neuf(self):
+        # Reproduction 1 du diagnostic : le même rapport "asking", relu à un tick
+        # suivant, crée une deuxième question identique. La consommation du
+        # fichier après application est ce qui l'empêche.
+        state = self._state_with_task()
+        p = report.path("t-01", "c-01")
+        raw = '{"state": "asking", "question": "quelle branche cibler ?"}'
+        p.write_text(raw, encoding="utf-8")
+        report.apply(state, "t-01", raw)
+        self.assertIsNone(report.read("t-01", "c-01"))
+
+    def test_apply_progress_supprime_aussi_le_rapport(self):
+        # La tâche reste "running" après un rapport "progress" : sans
+        # consommation, le même rapport serait relu et réappliqué à chaque tick
+        # suivant, dupliquant les notes indéfiniment.
+        state = self._state_with_task(state="running")
+        p = report.path("t-01", "c-01")
+        raw = '{"state": "progress", "note": "moitie faite"}'
+        p.write_text(raw, encoding="utf-8")
+        report.apply(state, "t-01", raw)
+        self.assertFalse(p.exists())
+
+    def test_apply_ne_supprime_pas_le_rapport_dun_autre_chantier(self):
+        state = self._state_with_task()
+        garde = report.path("t-01", "c-02")
+        garde.write_text('{"state": "done"}', encoding="utf-8")
+        report.apply(state, "t-01", '{"state": "done"}')
+        self.assertTrue(garde.exists())
+
+    def test_apply_illisible_conserve_le_fichier_pour_inspection(self):
+        # I2 : un rapport illisible bloque la tâche et n'est jamais "appliqué" au
+        # sens propre. Contrairement au chemin qui réussit, le fichier reste sur
+        # disque : c'est la seule trace de ce que l'exécutante a écrit.
+        state = self._state_with_task(state="running")
+        p = report.path("t-01", "c-01")
+        raw = "n'importe quoi, aucun JSON ici"
+        p.write_text(raw, encoding="utf-8")
+        report.apply(state, "t-01", raw)
+        self.assertTrue(p.exists())
+
+
 class TestApplyIllisible(ReportTestCase):
     def test_i2_rapport_illisible_bloque_jamais_reussi(self):
         # I2, le plus important du module : un rapport illisible bloque la tache, il

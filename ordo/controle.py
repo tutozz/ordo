@@ -51,8 +51,10 @@ _DEPENDANCE_MORTE_PREFIX = "dependency "
 # Nomme et patchable, comme PANE_DEAD_GRACE_S.
 WAKE_IDLE_AFTER_S = 900.0
 
-# Tours entre deux compactions. Defini dans usage.py, ou la carte le lit aussi.
-COMPACT_TOURS = usage.SEUIL_TOURS
+# Contexte porté au-delà duquel une exécutante est compactée. Défini dans usage.py, avec le
+# raisonnement et la simulation qui l'ont fixé (voir usage.SEUIL_CONTEXTE) ; ne lit plus
+# usage.SEUIL_TOURS, gardé uniquement pour carte.py.
+SEUIL_CONTEXTE = usage.SEUIL_CONTEXTE
 
 
 class ControleError(Exception):
@@ -441,11 +443,45 @@ def wake_new(chantier_id: str) -> list[dict]:
 # ===========================================================================
 
 
-def _latest_question(state: dict, task_id: str) -> dict | None:
-    candidates = [q for q in state["questions"].values() if q["tache"] == task_id]
+def _num_id(identifiant: str) -> int:
+    """Partie numérique d'un identifiant séquentiel ("q-01" -> 1), pour un tri qui ne se
+    fait jamais tromper par la représentation texte (ni par le zero-padding, ni par un
+    identifiant à trois chiffres qui trierait avant "q-99" en comparaison de chaînes).
+    Un identifiant illisible trie en dernier plutôt que de lever : ce n'est qu'un ordre
+    de départage, jamais une validation.
+    """
+    _, _, suffixe = identifiant.partition("-")
+    try:
+        return int(suffixe)
+    except ValueError:
+        return 1 << 30
+
+
+def _question_a_injecter(state: dict, task_id: str) -> dict | None:
+    """La question de task_id répondue mais pas encore injectée, ou None.
+
+    Cible expressément la question RÉPONDUE ET NON ENCORE INJECTÉE, jamais "la plus
+    récente" : une tâche qui accumule une question plus récente non répondue (second
+    tour de questions/réponses) ne doit jamais masquer une réponse plus ancienne déjà
+    donnée et pas encore acheminée. C'était le bug exact de l'ancienne
+    _latest_question(), qui ne regardait que la question la plus récente par "askedAt"
+    sans jamais vérifier si une réponse plus ancienne attendait toujours d'être
+    injectée (voir docs/diagnostic-envoi.md, reproduction 2).
+
+    Départage par identifiant, jamais par "askedAt" : store.now() est horodaté à la
+    seconde (store.py:66), deux questions nées dans la même seconde ne sont pas
+    distinguables par leur horodatage alors que leur identifiant, attribué en séquence
+    par store.next_id() sous verrou, l'est toujours. Plusieurs candidates simultanées
+    (cas limite) sont injectées dans l'ordre de création (la plus ancienne d'abord).
+    """
+    candidates = [
+        q
+        for q in state["questions"].values()
+        if q["tache"] == task_id and q["answer"] is not None and q.get("injectedAt") is None
+    ]
     if not candidates:
         return None
-    return max(candidates, key=lambda q: q["askedAt"])
+    return min(candidates, key=lambda q: _num_id(q["id"]))
 
 
 def _tick_one(chantier_id: str) -> list[str]:
@@ -468,12 +504,24 @@ def _tick_one(chantier_id: str) -> list[str]:
     # capteur.run() qui relache le verrou autour de l'execution du script (voir
     # capteur.py). --------------------------------------------------------------
     running = [t for t in _sorted_tasks(state, chantier_id) if t["state"] == "running"]
+    # Défaut principal mesuré sur la production (docs/diagnostic-envoi.md) : une tâche
+    # sortie de "running" ne voyait plus JAMAIS son rapport relu, puisque seule la liste
+    # "running" était parcourue ici. Une tâche "waiting" dont le rapport arrive à l'état
+    # "done" restait donc figée, ignorée, sans qu'aucune réponse ne puisse l'en sortir.
+    # report.apply() (voir ordo/report.py) consomme désormais le fichier à chaque lecture
+    # (clear()), donc relire une tâche waiting est sans risque de réappliquer un rapport
+    # périmé : soit rien de neuf n'est arrivé, soit un nouveau rapport réclame d'être lu.
+    waiting_tasks = [t for t in _sorted_tasks(state, chantier_id) if t["state"] == "waiting"]
     report_raw: dict[str, str] = {}
     pane_alive: dict[str, bool] = {}
-    for t in running:
+    for t in running + waiting_tasks:
         rp = report.path(t["id"], t["chantier"])
         if rp.exists():
             report_raw[t["id"]] = rp.read_text(encoding="utf-8")
+    # L'état du pane ne sert qu'à l'étape 3 (pane mort -> blocked), qui ne concerne QUE
+    # les tâches "running" : une tâche "waiting" protège son pane, il ne doit jamais être
+    # jugé mort ni relancé depuis ce module (voir étape 3 plus bas).
+    for t in running:
         pane_id = t.get("paneId")
         if pane_id:
             pane_alive[t["id"]] = panes.alive(pane_id)
@@ -484,12 +532,14 @@ def _tick_one(chantier_id: str) -> list[str]:
         if chantier_id not in state["chantiers"]:
             raise ControleError(f"campaign not found: {chantier_id}")
 
-        # Etape 2 (I2) : le rapport est lu EN PREMIER. S'il est present, il tranche
-        # seul ; l'etape 3 ci-dessous ne regarde jamais le pane d'une tache deja
-        # traitee ici.
-        for t in running:
+        # Étape 2 (I2) : le rapport est lu EN PREMIER. S'il est présent, il tranche
+        # seul ; l'étape 3 ci-dessous ne regarde jamais le pane d'une tâche déjà
+        # traitée ici. Parcourt "running" ET "waiting" (voir plus haut) : une tâche
+        # waiting relue qui reçoit un rapport "done"/"blocked" en sort ici même, par la
+        # seule mutation de task["state"] que report.apply() effectue déjà.
+        for t in running + waiting_tasks:
             task = state["taches"].get(t["id"])
-            if task is None or task["state"] != "running":
+            if task is None or task["state"] not in ("running", "waiting"):
                 continue
             raw = report_raw.get(t["id"])
             if raw is None:
@@ -514,6 +564,7 @@ def _tick_one(chantier_id: str) -> list[str]:
                     "answer": None,
                     "askedAt": store.now(),
                     "answeredAt": None,
+                    "injectedAt": None,
                 }
                 events.append(f"{qid} created for {t['id']}")
 
@@ -554,13 +605,14 @@ def _tick_one(chantier_id: str) -> list[str]:
         # dans le pane (envoi effectif fait hors verrou, ci-dessous), tache reprise.
         waiting = [tt for tt in _sorted_tasks(state, chantier_id) if tt["state"] == "waiting"]
         for task in waiting:
-            q = _latest_question(state, task["id"])
-            if q is None or q["answer"] is None:
+            q = _question_a_injecter(state, task["id"])
+            if q is None:
                 continue
             pane_id = task.get("paneId")
             if not pane_id:
                 continue
             to_send.append((pane_id, f"Answer: {q['answer']}"))
+            q["injectedAt"] = store.now()
             task["state"] = "running"
             events.append(f"{task['id']} resumes, answer injected")
 
@@ -624,7 +676,17 @@ def _tick_one(chantier_id: str) -> list[str]:
         with store.locked() as state:
             ch = state["chantiers"].get(chantier_id)
             if ch is not None:
-                ch["lastEvent"] = store.now()
+                # Un événement purement répétitif (texte identique à un événement déjà
+                # vu au tour précédent : une dérive de scope non corrigée, un capteur
+                # "waking"/"frozen" qui redit le même constat tant que rien ne bouge)
+                # ne repousse pas lastEvent. Sans cette garde, le journal n'est jamais
+                # silencieux et control-round (WAKE_IDLE_AFTER_S) ne se déclenche
+                # jamais, précisément dans la situation qu'il existe pour rattraper
+                # (voir docs/diagnostic-envoi.md).
+                deja_vus = set(ch.get("lastEventTexts") or [])
+                if any(e not in deja_vus for e in events):
+                    ch["lastEvent"] = store.now()
+                ch["lastEventTexts"] = events
 
     return events
 
@@ -664,14 +726,21 @@ def _compacter(chantier_id: str) -> list[str]:
     retentera de toute façon. Elle ne compacte pas deux fois le même palier, sans quoi
     chaque battement de la veille renverrait la commande à une session déjà compactée,
     qui ne ferait plus que se compacter. Et elle ne compacte pas une tâche dont le
-    transcript est introuvable : sans transcript on ignore combien de tours ont eu lieu,
+    transcript est introuvable : sans transcript on ignore quel contexte elle porte,
     et compacter au hasard coûte sans rien rendre.
+
+    Le déclencheur est le CONTEXTE du dernier tour, pas le nombre de tours (voir
+    usage.SEUIL_CONTEXTE) : une session courte peut porter un gros contexte, et le nombre
+    de tours ne le voit jamais venir. Les tours restent lus, mais seulement comme garde
+    contre le double envoi : tant qu'aucun tour nouveau n'est apparu depuis la dernière
+    compaction, le contexte mesuré est encore celui d'avant, et le retester ne ferait que
+    renvoyer `/compact` en boucle à une session déjà compactée.
     """
-    if COMPACT_TOURS <= 0:
+    if SEUIL_CONTEXTE <= 0:
         return []
 
     state = store.load()
-    dus: list[tuple[str, str, int]] = []
+    dus: list[tuple[str, str, int, int]] = []
     for task in _sorted_tasks(state, chantier_id):
         if task["state"] != "running":
             continue
@@ -682,13 +751,15 @@ def _compacter(chantier_id: str) -> list[str]:
         if not mesure:
             continue
         tours = mesure.get("turns") or 0
-        depuis = tours - (task.get("compactedAtTurn") or 0)
-        if depuis >= COMPACT_TOURS:
-            dus.append((task["id"], pane_id, tours))
+        if tours <= (task.get("compactedAtTurn") or 0):
+            continue
+        contexte = mesure.get("dernierContexte") or 0
+        if contexte >= SEUIL_CONTEXTE:
+            dus.append((task["id"], pane_id, tours, contexte))
 
     events: list[str] = []
     envoyes: list[tuple[str, int]] = []
-    for task_id, pane_id, tours in dus:
+    for task_id, pane_id, tours, contexte in dus:
         try:
             if panes.busy(pane_id):
                 continue
@@ -698,7 +769,7 @@ def _compacter(chantier_id: str) -> list[str]:
             # traite déjà les panes morts, ce n'est pas à la compaction de le faire.
             continue
         envoyes.append((task_id, tours))
-        events.append(f"{task_id} compacted at turn {tours}")
+        events.append(f"{task_id} compacted at turn {tours}, context {contexte}")
 
     if envoyes:
         with store.locked() as etat:

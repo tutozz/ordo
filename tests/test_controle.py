@@ -597,6 +597,62 @@ class TestTickAsking(ControleTestCase):
         self.assertIsNone(questions[0]["answer"])
 
 
+class TestTickWaitingReportReread(ControleTestCase):
+    """Défaut principal mesuré sur la production (docs/diagnostic-envoi.md) : seule la
+    liste "running" était relue à l'étape 2, donc une tâche passée "waiting" ne voyait
+    plus jamais son rapport relu, et rien ne pouvait plus l'en sortir sauf l'injection
+    d'une réponse. Cas réels : loko t-56 (rapport done sur disque, jamais vu) et camcast
+    t-74 (rapport asking relu sans qu'aucune question n'existe)."""
+
+    def test_rapport_dune_tache_waiting_est_relu(self):
+        # Un rapport "progress" est le plus discret : il ne change l'état de lui-même,
+        # il ne prouve donc la relecture QUE si son contenu est bien appliqué et le
+        # fichier consommé.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999")
+        with store.locked() as state:
+            state["taches"][tid]["state"] = "waiting"
+        self._write_report(tid, {"task": tid, "state": "progress", "note": "toujours la"})
+        controle.tick(cid)
+        task = store.load()["taches"][tid]
+        self.assertEqual(task["state"], "waiting")
+        self.assertEqual(task["report"]["note"], "toujours la")
+        self.assertFalse(report.path(tid, cid).exists(), "le rapport relu doit être consommé")
+
+    def test_rapport_done_sort_la_tache_de_waiting(self):
+        # Cas loko t-56 : rapport state=done sur disque, tâche toujours "waiting" dans
+        # l'état d'Ordo, pane vivant au repos. Rien d'autre que la relecture du rapport
+        # ne peut l'en sortir.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999")
+        with store.locked() as state:
+            state["taches"][tid]["state"] = "waiting"
+        self._write_report(tid, {"task": tid, "state": "done", "note": "fini", "touched": []})
+        controle.tick(cid)
+        self.assertEqual(store.load()["taches"][tid]["state"], "done")
+
+    def test_rapport_asking_sur_tache_waiting_cree_une_question(self):
+        # Cas camcast t-74 : rapport state=asking relu pour une tâche déjà waiting, sans
+        # qu'aucune question n'existe encore pour elle. Personne ne pouvait plus
+        # répondre à un état totalement fermé.
+        cid = self._chantier()
+        tid = self._task(cid)
+        self._make_running(tid, pane_id="%999")
+        with store.locked() as state:
+            state["taches"][tid]["state"] = "waiting"
+        self._write_report(
+            tid, {"task": tid, "state": "asking", "note": "", "question": "et maintenant ?"}
+        )
+        controle.tick(cid)
+        state = store.load()
+        self.assertEqual(state["taches"][tid]["state"], "waiting")
+        questions = [q for q in state["questions"].values() if q["tache"] == tid]
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["question"], "et maintenant ?")
+
+
 class TestTickAnswerInjection(ControleTestCase):
     def test_reponse_injectee_dans_le_pane_reel_et_tache_reprend(self):
         cid = self._chantier()
@@ -631,6 +687,58 @@ class TestTickAnswerInjection(ControleTestCase):
             }
         controle.tick(cid)
         self.assertEqual(store.load()["taches"][tid]["state"], "waiting")
+
+    def test_reponse_a_la_question_repondue_injectee_malgre_une_plus_recente_sans_reponse(self):
+        # Reproduction 2 du diagnostic (docs/diagnostic-envoi.md) : une tâche accumule
+        # deux questions, la plus ancienne répondue, la plus récente pas encore.
+        # L'ancienne _latest_question() ciblait la plus récente et, la trouvant sans
+        # réponse, n'injectait rien -- pour toujours : la réponse à q-01 restait
+        # invisible tant que q-02 elle-même n'était pas répondue.
+        cid = self._chantier()
+        tid = self._task(cid)
+        session, pane_id = self._real_pane()
+        self._make_running(tid, pane_id=pane_id)
+        with store.locked() as state:
+            state["taches"][tid]["state"] = "waiting"
+            q1 = store.next_id(state, "question")
+            state["questions"][q1] = {
+                "id": q1, "chantier": cid, "tache": tid, "question": "la première ?",
+                "options": [], "pourHumain": False, "answer": "réponse-ancienne",
+                "askedAt": store.now(), "answeredAt": store.now(), "injectedAt": None,
+            }
+            q2 = store.next_id(state, "question")
+            state["questions"][q2] = {
+                "id": q2, "chantier": cid, "tache": tid, "question": "la seconde ?",
+                "options": [], "pourHumain": False, "answer": None,
+                "askedAt": store.now(), "answeredAt": None, "injectedAt": None,
+            }
+        controle.tick(cid)
+        self.assertEqual(store.load()["taches"][tid]["state"], "running")
+        captured = _wait_for(lambda: "réponse-ancienne" in panes.capture(pane_id, lines=40))
+        self.assertTrue(
+            captured, "la réponse à la question la plus ancienne aurait dû être injectée"
+        )
+        self.assertIsNotNone(store.load()["questions"][q1]["injectedAt"])
+
+    def test_departage_par_identifiant_pas_par_ordre_texte(self):
+        # store.py:66 : store.now() est horodaté à la seconde. _question_a_injecter()
+        # ne doit jamais départager par cet horodatage (deux questions nées dans la
+        # même seconde y sont indiscernables), et jamais par un tri texte des
+        # identifiants ("q-100" < "q-99" en chaînes, l'inverse en nombres).
+        cid = self._chantier()
+        tid = self._task(cid)
+        with store.locked() as state:
+            for qid_texte in ("q-99", "q-100"):
+                state["questions"][qid_texte] = {
+                    "id": qid_texte, "chantier": cid, "tache": tid, "question": "?",
+                    "options": [], "pourHumain": False, "answer": qid_texte,
+                    "askedAt": store.now(), "answeredAt": store.now(), "injectedAt": None,
+                }
+        q = controle._question_a_injecter(store.load(), tid)
+        self.assertEqual(
+            q["id"], "q-99",
+            "q-99 est numériquement plus ancienne que q-100, même si le tri texte les inverse",
+        )
 
 
 class TestTickPropagation(ControleTestCase):
@@ -763,6 +871,31 @@ class TestTickJournal(ControleTestCase):
         controle.tick(cid)
         self.assertIsNotNone(store.load()["chantiers"][cid]["lastEvent"])
 
+    def test_evenement_purement_repetitif_ne_rafraichit_pas_last_event(self):
+        # docs/diagnostic-envoi.md : lastEvent est rafraîchi dès qu'au moins un
+        # événement est produit, sans distinguer un fait neuf d'un fait déjà journalisé
+        # au tour précédent. Une dérive de scope non corrigée se recalcule à l'identique
+        # à chaque tick (étape 7) : c'est un exemple réel, indépendant du bug des
+        # questions dupliquées déjà refermé par report.clear(), d'un événement purement
+        # répétitif qui désarmerait control-round (WAKE_IDLE_AFTER_S) s'il continuait à
+        # repousser lastEvent indéfiniment.
+        cid = self._chantier()
+        tid = self._task(cid, touches=["dedans"])
+        self._set_task(tid, state="done", report={"state": "done", "touched": ["dehors"]})
+
+        controle.tick(cid)
+        premier = store.load()["chantiers"][cid]["lastEvent"]
+        self.assertIsNotNone(premier, "la derive est neuve au premier tour, lastEvent doit bouger")
+
+        sentinelle = "2000-01-01T00:00:00Z"
+        with store.locked() as state:
+            state["chantiers"][cid]["lastEvent"] = sentinelle
+        controle.tick(cid)  # même dérive, rien de neuf
+        self.assertEqual(
+            store.load()["chantiers"][cid]["lastEvent"], sentinelle,
+            "un evenement identique au tour precedent ne doit pas rafraichir lastEvent",
+        )
+
 
 class TestTickReturnShape(ControleTestCase):
     def test_tick_sans_argument_traite_tous_les_chantiers_ouverts(self):
@@ -828,16 +961,19 @@ if __name__ == "__main__":
 
 
 class TestCompaction(ControleTestCase):
-    """La compaction automatique d'une exécutante trop longue.
+    """La compaction automatique d'une exécutante au contexte trop lourd.
 
-    Mesure sur soixante transcripts réels : chaque jeton entré dans une session est
-    ensuite relu cent fois, et le dernier tiers d'une session coûte 2,3 fois son premier
-    tiers. Le contexte n'est pas gros, il est porté trop longtemps. Compacter le remet à
-    plat sans perdre ce que la session a appris, ce qu'un redémarrage, lui, perdrait.
+    Mesuré sur cinquante-neuf sessions réelles de deux chantiers : le nombre de tours et
+    le contexte portés sont corrélés (r = 0,92) mais pas assez pour servir de proxy l'un
+    à l'autre -- le contexte par tour varie d'un facteur 5 d'une session à l'autre. Un
+    seuil en tours en a raté 16 sur 59, qui atteignaient un gros contexte en peu de tours.
+    Le déclencheur lit donc le CONTEXTE du dernier tour (voir usage.SEUIL_CONTEXTE), et
+    les tours ne servent plus qu'à détecter qu'un nouveau tour est arrivé depuis la
+    dernière compaction.
     """
 
-    def _executante(self, tours: int, pane: str = "%1", compactee_a: int | None = None):
-        """Une tâche qui tourne, avec un nombre de tours simulé. Rend son identifiant."""
+    def _executante(self, pane: str = "%1", compactee_a: int | None = None):
+        """Une tâche qui tourne. Rend son identifiant."""
         cid = self._chantier()
         tid = self._task(cid)
         self._make_running(tid, pane_id=pane)
@@ -846,93 +982,113 @@ class TestCompaction(ControleTestCase):
             champs["compactedAtTurn"] = compactee_a
             champs["compactions"] = 1
         self._set_task(tid, **champs)
-        self._tours = {tid: tours}
         return cid, tid
 
-    def _tick(self, cid, tours_par_tache, busy=False, seuil=75):
-        """Lance la compaction avec des tours simulés et un pane au repos par défaut."""
+    def _tick(self, cid, mesures, busy=False, seuil=75000):
+        """Lance la compaction avec des mesures simulées : {task_id: (tours, contexte)}."""
         def faux_usage(task):
-            n = tours_par_tache.get(task["id"])
-            return None if n is None else {"turns": n, "input": 0, "output": 0,
-                                           "cacheCreation": 0, "cacheRead": 0}
+            m = mesures.get(task["id"])
+            if m is None:
+                return None
+            tours, contexte = m
+            return {"turns": tours, "dernierContexte": contexte, "input": 0, "output": 0,
+                    "cacheCreation": 0, "cacheRead": 0}
         envois = []
         with mock.patch.object(controle.usage, "pour", side_effect=faux_usage), \
              mock.patch.object(controle.panes, "busy", return_value=busy), \
              mock.patch.object(controle.panes, "send",
                                side_effect=lambda p, t: envois.append((p, t))), \
-             mock.patch.object(controle, "COMPACT_TOURS", seuil):
+             mock.patch.object(controle, "SEUIL_CONTEXTE", seuil):
             evenements = controle._compacter(cid)
         return envois, evenements
 
     def test_une_executante_au_dela_du_seuil_recoit_la_compaction(self):
-        cid, tid = self._executante(tours=80)
-        envois, evenements = self._tick(cid, {tid: 80})
+        cid, tid = self._executante()
+        envois, evenements = self._tick(cid, {tid: (80, 80000)})
         self.assertEqual(envois, [("%1", "/compact")])
         self.assertTrue(any("compact" in e for e in evenements))
 
     def test_une_executante_en_deca_du_seuil_est_laissee_tranquille(self):
-        cid, tid = self._executante(tours=74)
-        envois, _ = self._tick(cid, {tid: 74})
+        cid, tid = self._executante()
+        envois, _ = self._tick(cid, {tid: (80, 70000)})
+        self.assertEqual(envois, [])
+
+    def test_une_session_courte_a_gros_contexte_est_compactee(self):
+        # Exactement le cas que l'ancien seuil en tours ratait : 10 tours, très loin des
+        # 75 d'avant, mais un contexte déjà au-delà du seuil.
+        cid, tid = self._executante()
+        envois, _ = self._tick(cid, {tid: (10, 200000)})
+        self.assertEqual(envois, [("%1", "/compact")])
+
+    def test_beaucoup_de_tours_mais_petit_contexte_n_est_pas_compacte(self):
+        # Le garde-fou du garde-fou : si le déclencheur repassait au comptage de tours,
+        # ce test échouerait, puisque 500 tours dépassait déjà largement l'ancien seuil
+        # de 75.
+        cid, tid = self._executante()
+        envois, _ = self._tick(cid, {tid: (500, 20000)})
         self.assertEqual(envois, [])
 
     def test_le_meme_palier_ne_declenche_pas_deux_fois(self):
-        # Sans cette memoire, chaque battement de la veille renverrait /compact a une
-        # session deja compactee, et la session ne ferait plus que se compacter.
-        cid, tid = self._executante(tours=80)
-        self._tick(cid, {tid: 80})
+        # Sans cette mémoire, chaque battement de la veille renverrait /compact à une
+        # session déjà compactée, et la session ne ferait plus que se compacter.
+        cid, tid = self._executante()
+        self._tick(cid, {tid: (80, 80000)})
         etat = store.load()["taches"][tid]
         self.assertEqual(etat["compactions"], 1)
         self.assertEqual(etat["compactedAtTurn"], 80)
-        envois, _ = self._tick(cid, {tid: 90})
+        # Le transcript n'a pas avancé (toujours au tour 80) : même si le contexte lu
+        # reste au-delà du seuil, rien n'est renvoyé.
+        envois, _ = self._tick(cid, {tid: (80, 80000)})
         self.assertEqual(envois, [])
 
     def test_le_palier_suivant_declenche_une_seconde_compaction(self):
-        cid, tid = self._executante(tours=160, compactee_a=80)
-        envois, _ = self._tick(cid, {tid: 160})
+        cid, tid = self._executante(compactee_a=80)
+        envois, _ = self._tick(cid, {tid: (90, 78000)})
         self.assertEqual(envois, [("%1", "/compact")])
         self.assertEqual(store.load()["taches"][tid]["compactions"], 2)
 
     def test_un_pane_occupe_est_epargne_et_retente_plus_tard(self):
         # Envoyer /compact au milieu d'un outil couperait le travail en cours. Le
-        # battement suivant retentera, et rien n'est marque : la tache reste due.
-        cid, tid = self._executante(tours=80)
-        envois, _ = self._tick(cid, {tid: 80}, busy=True)
+        # battement suivant retentera, et rien n'est marqué : la tâche reste due.
+        cid, tid = self._executante()
+        envois, _ = self._tick(cid, {tid: (80, 80000)}, busy=True)
         self.assertEqual(envois, [])
         self.assertEqual(store.load()["taches"][tid].get("compactions", 0), 0)
-        envois, _ = self._tick(cid, {tid: 80}, busy=False)
+        envois, _ = self._tick(cid, {tid: (80, 80000)}, busy=False)
         self.assertEqual(envois, [("%1", "/compact")])
 
     def test_un_seuil_nul_desactive_tout(self):
-        cid, tid = self._executante(tours=500)
-        envois, _ = self._tick(cid, {tid: 500}, seuil=0)
+        cid, tid = self._executante()
+        envois, _ = self._tick(cid, {tid: (500, 500000)}, seuil=0)
         self.assertEqual(envois, [])
 
     def test_une_tache_qui_ne_tourne_pas_n_est_jamais_compactee(self):
-        cid, tid = self._executante(tours=200)
+        cid, tid = self._executante()
         self._set_task(tid, state="done")
-        envois, _ = self._tick(cid, {tid: 200})
+        envois, _ = self._tick(cid, {tid: (200, 200000)})
         self.assertEqual(envois, [])
 
     def test_un_transcript_illisible_ne_fait_rien_echouer(self):
         # usage.pour rend None quand il ne trouve pas le transcript. Sans transcript on
-        # ne sait pas combien de tours ont eu lieu, et on ne compacte pas au hasard.
-        cid, tid = self._executante(tours=200)
+        # ne sait pas quel contexte la session porte, et on ne compacte pas au hasard.
+        cid, tid = self._executante()
         envois, _ = self._tick(cid, {})
         self.assertEqual(envois, [])
 
     def test_une_tache_sans_pane_est_ignoree(self):
-        cid, tid = self._executante(tours=200, pane=None)
+        cid, tid = self._executante(pane=None)
         self._set_task(tid, paneId=None)
-        envois, _ = self._tick(cid, {tid: 200})
+        envois, _ = self._tick(cid, {tid: (200, 200000)})
         self.assertEqual(envois, [])
 
     def test_le_tick_declenche_la_compaction(self):
-        # Le cablage : sans cet appel dans tick(), _compacter() serait du code mort que
-        # ses neuf tests verifieraient consciencieusement sans que rien ne l'appelle.
-        cid, tid = self._executante(tours=200)
+        # Le câblage : sans cet appel dans tick(), _compacter() serait du code mort que
+        # ses tests vérifieraient consciencieusement sans que rien ne l'appelle.
+        cid, tid = self._executante()
         envois = []
         with mock.patch.object(controle.usage, "pour",
-                               return_value={"turns": 200, "input": 0, "output": 0,
+                               return_value={"turns": 200, "dernierContexte": 200000,
+                                             "input": 0, "output": 0,
                                              "cacheCreation": 0, "cacheRead": 0}), \
              mock.patch.object(controle.panes, "busy", return_value=False), \
              mock.patch.object(controle.panes, "alive", return_value=True), \

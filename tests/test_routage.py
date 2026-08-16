@@ -214,7 +214,9 @@ class TestSonnetSurSpecificationVerifiable(unittest.TestCase):
             tache(
                 titre="Appliquer la route GET /api/tapes",
                 prompt="Mettre a jour lib/tapes.js selon docs/15-API.md.",
-                checklist=coche(3),
+                # 5, au-dessus de HAIKU_CHECKLIST_MAX (4) : ce test vérifie l'ancrage par
+                # fichier cité, pas la frontière haiku/sonnet, qui a ses tests dédiés.
+                checklist=coche(5),
                 touches=[],
             )
         )
@@ -265,6 +267,31 @@ class TestHaikuSurGesteMecanique(unittest.TestCase):
                 prompt="Renommer a.py en b.py.",
                 checklist=coche(6),
                 touches=["a.py"],
+            )
+        )
+        self.assertEqual(m, "sonnet")
+
+    def test_quatre_coches_pile_au_seuil_donnent_encore_haiku(self):
+        """HAIKU_CHECKLIST_MAX vaut 4 : la borne elle-même reste du côté haiku."""
+        m, motif = routage.classer(
+            tache(
+                titre="Renommer switch.component.tsx",
+                prompt="Renommer switch.component.tsx en toggle.component.tsx "
+                "et mettre a jour les deux imports.",
+                checklist=coche(4),
+                touches=["src/switch.component.tsx"],
+            )
+        )
+        self.assertEqual(m, "haiku", motif)
+
+    def test_cinq_coches_juste_au_dessus_du_seuil_repassent_en_sonnet(self):
+        m, _ = routage.classer(
+            tache(
+                titre="Renommer switch.component.tsx",
+                prompt="Renommer switch.component.tsx en toggle.component.tsx "
+                "et mettre a jour les deux imports.",
+                checklist=coche(5),
+                touches=["src/switch.component.tsx"],
             )
         )
         self.assertEqual(m, "sonnet")

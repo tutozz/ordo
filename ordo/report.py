@@ -270,4 +270,14 @@ def apply(state: dict, task_id: str, raw: str) -> list[str]:
     else:  # "progress" : simple avancement, aucune transition d'etat
         events.append(f"{task_id} progressing: {report['note'] or 'no note'}")
 
+    # Le rapport est maintenant appliqué à l'état (task["report"], checklist,
+    # transition) : le fichier sur disque devient périmé et doit disparaître.
+    # Sans ce clear(), un rapport "asking" redevient un signal neuf dès que la
+    # tâche repasse "running" après l'injection de la réponse (racine du bug des
+    # questions dupliquées, voir docs/diagnostic-envoi.md), et un rapport
+    # "progress" - qui ne change pas l'état - serait relu et réappliqué à chaque
+    # tick suivant. Un rapport illisible, lui, n'est jamais arrivé jusqu'ici : il
+    # reste sur disque pour inspection (I2).
+    clear(task_id, task["chantier"])
+
     return events

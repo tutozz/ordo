@@ -14,6 +14,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
@@ -314,6 +315,45 @@ class TestServeurVivant(ServeurVivantTestCase):
 
     def test_le_serveur_n_ecoute_que_sur_la_boucle_locale(self):
         self.assertEqual(self.httpd.server_address[0], "127.0.0.1")
+
+
+class TestEtatPorteLeQuota(ServeurVivantTestCase):
+    """La consommation du compte Claude, dans /api/state -- voir ordo/quota.py.
+
+    snapshot() ne fait qu'exposer quota.lire() tel quel : ces tests portent sur la
+    traversée, pas sur l'interprétation du fichier, déjà couverte par
+    tests/test_quota.py.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._quota_tmp = Path(self._tmp) / "quota"
+        self._prev_quota = os.environ.get("ORDO_QUOTA_FILE")
+        os.environ["ORDO_QUOTA_FILE"] = str(self._quota_tmp)
+
+    def tearDown(self) -> None:
+        if self._prev_quota is None:
+            os.environ.pop("ORDO_QUOTA_FILE", None)
+        else:
+            os.environ["ORDO_QUOTA_FILE"] = self._prev_quota
+        super().tearDown()
+
+    def test_un_quota_lisible_traverse_snapshot(self):
+        maintenant = int(time.time())
+        self._quota_tmp.write_text(
+            f"34 50 {maintenant} {maintenant + 3600} {maintenant + 3 * 86400}\n",
+            encoding="utf-8",
+        )
+        data = json.loads(self._get("/api/state").read())
+        self.assertIsNotNone(data["quota"])
+        cles = {f["cle"] for f in data["quota"]["fenetres"]}
+        self.assertEqual(cles, {"5h", "7j"})
+
+    def test_un_quota_absent_traverse_null(self):
+        # Le fichier n'existe pas encore : la page doit recevoir null, jamais une
+        # jauge inventée à zéro.
+        data = json.loads(self._get("/api/state").read())
+        self.assertIsNone(data["quota"])
 
 
 class TestEnsure(ServeurTestCase):

@@ -30,6 +30,8 @@ serait une commande a distance sans authentification sur une machine de developp
 
 from __future__ import annotations
 
+import html
+import importlib
 import json
 import os
 import socket
@@ -306,6 +308,72 @@ def _vivants() -> Callable[[str], bool] | None:
     return lambda pane_id: pane_id in ids
 
 
+# Verrou du rechargement de carte.py. Il couvre le contrôle de fraîcheur, le reload
+# éventuel ET l'appel aux fonctions du module pendant tout le rendu d'une réponse : sans
+# cette dernière partie, un reload pourrait remplacer une fonction de carte pendant qu'une
+# autre requête est en train de l'appeler, et lui faire lire un module à moitié redéfini.
+# Mesure faite (voir test_serveur.py), un reload de carte.py coûte environ 0.2 ms : le tenir
+# fermé le temps du rendu d'une carte ne crée pas d'attente sensible.
+_VERROU_CARTE = threading.Lock()
+
+# mtime en nanosecondes de carte.py lors du dernier essai de rechargement, réussi ou non.
+# Un essai qui échoue n'est rejoué qu'au prochain changement du fichier : le retenter à
+# chaque requête paierait le même coût pour le même résultat tant que personne n'a retouché
+# le fichier cassé.
+_carte_mtime: int | None = None
+
+# Message du dernier échec de rechargement, ou None si le module en mémoire est à jour et
+# valide. Sert de source à la page d'erreur : une source cassée doit se voir à l'écran, pas
+# disparaître derrière une carte périmée qui semble à jour.
+_carte_erreur: str | None = None
+
+
+@contextmanager
+def _carte_a_jour():
+    """Contexte qui recharge carte.py si son fichier a changé, puis tient le verrou pour
+    tout le rendu qui suit. Cède le message d'erreur du dernier essai de rechargement, ou
+    None si le module servi est à jour et valide.
+
+    Le coût du cas courant est un seul stat() : le navigateur interroge ce serveur en
+    continu, et la très grande majorité de ces requêtes tombent entre deux modifications du
+    fichier. Recharger à chaque requête, mesure faite, aurait été à peine plus cher (~0.2 ms
+    contre ~0.001 ms pour le stat seul) mais aurait payé ce coût même quand rien n'a changé.
+    """
+    global _carte_mtime, _carte_erreur
+    with _VERROU_CARTE:
+        try:
+            mtime = Path(carte.__file__).stat().st_mtime_ns
+        except OSError as exc:
+            _carte_mtime = None
+            _carte_erreur = f"carte.py introuvable : {exc}"
+        else:
+            if mtime != _carte_mtime:
+                try:
+                    importlib.reload(carte)
+                except Exception as exc:  # noqa: BLE001 - une source cassée se sert, ne tue pas le serveur
+                    _carte_erreur = f"{type(exc).__name__}: {exc}"
+                else:
+                    _carte_erreur = None
+                _carte_mtime = mtime
+        yield _carte_erreur
+
+
+def _page_erreur_reload(erreur: str) -> str:
+    """Page HTML minimale, indépendante de carte.py, pour un rechargement en échec.
+
+    Ne rend jamais via carte.py : le module qui a échoué à se recharger est justement celui
+    en qui on ne peut plus avoir confiance pour dessiner quoi que ce soit.
+    """
+    return (
+        "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\">"
+        "<title>ordo - carte indisponible</title></head><body>"
+        "<h1>carte.py ne se recharge pas</h1>"
+        f"<pre>{html.escape(erreur)}</pre>"
+        "<p>La carte reviendra dès que le fichier redeviendra valide, sans rien à faire.</p>"
+        "</body></html>"
+    )
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ordo"
     sys_version = ""
@@ -353,22 +421,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"service": SIGNATURE, "at": store.now()})
             return
         if route.path in ("/", "/index.html"):
-            self._envoyer(200, carte.page().encode("utf-8"), "text/html; charset=utf-8")
+            with _carte_a_jour() as erreur:
+                if erreur:
+                    self._envoyer(
+                        500, _page_erreur_reload(erreur).encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                    return
+                self._envoyer(200, carte.page().encode("utf-8"), "text/html; charset=utf-8")
             return
         if route.path == "/panel":
-            # Une colonne du mur. Elle ne porte aucune donnee : elle recoit sa cible ici et
-            # va lire /api/map elle-meme, ou le controle du registre a bien lieu. Refuser
-            # une cible vide plutot que servir la page : sans campagne, la colonne
+            # Une colonne du mur. Elle ne porte aucune donnée : elle recoit sa cible ici et
+            # va lire /api/map elle-meme, ou le contrôle du registre a bien lieu. Refuser
+            # une cible vide plutôt que servir la page : sans campagne, la colonne
             # interrogerait /api/map dans le vide et resterait grise sans dire pourquoi.
             home = (params.get("home") or [""])[0]
             campaign = (params.get("campaign") or [""])[0]
             if not home or not campaign:
                 self._json(400, {"error": "panel needs home and campaign"})
                 return
-            self._envoyer(
-                200, carte.panneau(home, campaign).encode("utf-8"),
-                "text/html; charset=utf-8",
-            )
+            with _carte_a_jour() as erreur:
+                if erreur:
+                    self._envoyer(
+                        500, _page_erreur_reload(erreur).encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                    return
+                self._envoyer(
+                    200, carte.panneau(home, campaign).encode("utf-8"),
+                    "text/html; charset=utf-8",
+                )
             return
         if route.path == "/api/state":
             self._json(200, snapshot())
@@ -377,7 +459,11 @@ class _Handler(BaseHTTPRequestHandler):
             home = (params.get("home") or [""])[0]
             campaign = (params.get("campaign") or [""])[0]
             try:
-                self._json(200, carte_de(home, campaign))
+                with _carte_a_jour() as erreur:
+                    if erreur:
+                        self._json(500, {"error": f"carte.py: {erreur}"})
+                        return
+                    self._json(200, carte_de(home, campaign))
             except PermissionError as exc:
                 self._json(403, {"error": str(exc)})
             except chantier.ChantierError as exc:

@@ -7,6 +7,7 @@ serveur reel de la machine, et le ferait echouer une fois sur deux.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -501,3 +502,173 @@ class TestPorteDeSortie(ServeurTestCase):
         vivant = self._home_avec_chantier("a")
         serveur.register(vivant)
         self.assertEqual(list(serveur._lire_registre()["homes"]), [vivant])
+
+
+# ---------------------------------------------------------------------------
+# Rechargement de carte.py sans redémarrage
+# ---------------------------------------------------------------------------
+#
+# Ces tests ne touchent JAMAIS le vrai ordo/carte.py : une autre exécutante y travaille en
+# même temps. Ils font tenir à `serveur.carte` un faux module, chargé depuis un fichier
+# temporaire que chaque test peut réécrire à volonté -- y compris avec du code cassé -- sans
+# le moindre risque pour le reste du dépôt.
+
+_CARTE_V1 = (
+    'def page(poll=0):\n'
+    '    return "<!doctype html><html><body>carte v1</body></html>"\n'
+    '\n'
+    'def panneau(home, campaign, poll=0):\n'
+    '    return "<!doctype html><html><body>panel v1 " + campaign + "</body></html>"\n'
+    '\n'
+    'def model(campaign, alive=None, usage_de=None):\n'
+    '    return {"campaign": {"id": campaign}, "version": "v1"}\n'
+    '\n'
+    'def vue(m):\n'
+    '    return {"tasks": [], "phases": [], "campaign": m["campaign"], "version": m["version"]}\n'
+)
+
+_CARTE_V2 = _CARTE_V1.replace("v1", "v2")
+
+# Erreur de syntaxe volontaire : une chaîne jamais refermée, exactement le genre d'accident
+# qu'un fichier à moitié écrit produit.
+_CARTE_CASSEE = 'def page(poll=0):\n    return "<!doctype html>\n'
+
+
+class TestRechargementCarte(ServeurVivantTestCase):
+    """t-30 : la page servie reflète le code présent sur le disque, sans redémarrage.
+
+    Le faux module vit dans un dossier ajouté à sys.path et s'importe par son nom, comme
+    ordo.carte s'importe réellement : importlib.reload() a besoin de retrouver le spec du
+    module par ce chemin, un module chargé à la main via spec_from_file_location() ne lui
+    suffit pas. sys.dont_write_bytecode coupe le cache .pyc pour la durée du test : son
+    horodatage ne garde que la seconde, et deux versions écrites dans la même seconde
+    partageraient sinon un cache périmé.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._carte_dir = Path(self._tmp) / "faux_carte"
+        self._carte_dir.mkdir()
+        self._nom_module = f"carte_fake_{id(self)}"
+        self._carte_fichier = self._carte_dir / f"{self._nom_module}.py"
+        self._carte_fichier.write_text(_CARTE_V1, encoding="utf-8")
+        self._mtime_ns = 1_000_000_000
+        os.utime(self._carte_fichier, ns=(self._mtime_ns, self._mtime_ns))
+        self._bytecode_avant = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(self._carte_dir))
+        importlib.invalidate_caches()
+        self._vrai_carte = serveur.carte
+        self._mtime_avant = serveur._carte_mtime
+        self._erreur_avant = serveur._carte_erreur
+        serveur.carte = importlib.import_module(self._nom_module)
+        serveur._carte_mtime = None
+        serveur._carte_erreur = None
+
+    def tearDown(self) -> None:
+        serveur.carte = self._vrai_carte
+        serveur._carte_mtime = self._mtime_avant
+        serveur._carte_erreur = self._erreur_avant
+        sys.modules.pop(self._nom_module, None)
+        try:
+            sys.path.remove(str(self._carte_dir))
+        except ValueError:
+            pass
+        sys.dont_write_bytecode = self._bytecode_avant
+        super().tearDown()
+
+    def _ecrire_carte(self, contenu: str) -> None:
+        """Réécrit le faux carte.py avec un mtime garanti différent du précédent."""
+        self._mtime_ns += 1_000_000
+        self._carte_fichier.write_text(contenu, encoding="utf-8")
+        os.utime(self._carte_fichier, ns=(self._mtime_ns, self._mtime_ns))
+
+    def test_la_page_reflete_le_fichier_modifie_sans_action_humaine(self):
+        # c2 : le code sur le disque, pas celui chargé au démarrage du process.
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("carte v1", corps)
+        self._ecrire_carte(_CARTE_V2)
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("carte v2", corps)
+        self.assertNotIn("carte v1", corps)
+
+    def test_aucun_redemarrage_n_a_lieu_pour_voir_le_changement(self):
+        # c3 : même thread, même port, du début à la fin -- la seule action est une requête
+        # HTTP ordinaire, jamais un arrêt/relance du serveur.
+        thread_avant, port_avant = self._thread.ident, self.port
+        self._get("/").read()
+        self._ecrire_carte(_CARTE_V2)
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("carte v2", corps)
+        self.assertEqual(self._thread.ident, thread_avant)
+        self.assertEqual(self.port, port_avant)
+        self.assertTrue(self._thread.is_alive())
+
+    def test_une_source_cassee_sert_une_erreur_visible_sans_tuer_le_serveur(self):
+        # c5 : le cas qui se produira -- une exécutante en plein milieu d'une écriture.
+        self._ecrire_carte(_CARTE_CASSEE)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/")
+        self.assertEqual(ctx.exception.code, 500)
+        corps = ctx.exception.read().decode("utf-8")
+        ctx.exception.close()
+        self.assertIn("SyntaxError", corps)
+        # Le serveur répond toujours -- l'erreur s'est servie, elle ne l'a pas tué.
+        self.assertTrue(serveur.is_up(self.port))
+        # Et la carte revient d'elle-même dès que le fichier redevient valide.
+        self._ecrire_carte(_CARTE_V2)
+        corps = self._get("/").read().decode("utf-8")
+        self.assertIn("carte v2", corps)
+
+    def test_une_source_cassee_sur_api_map_rend_du_json_pas_une_trace(self):
+        # Même garantie sur la route JSON qu'interroge chaque colonne du mur.
+        data = json.loads(self._get("/api/state").read())
+        c = data["campaigns"][0]
+        self._ecrire_carte(_CARTE_CASSEE)
+        url = f"/api/map?home={quote(c['home'])}&campaign={quote(c['id'])}"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get(url)
+        self.assertEqual(ctx.exception.code, 500)
+        data = json.loads(ctx.exception.read())
+        ctx.exception.close()
+        self.assertIn("carte.py", data["error"])
+
+    def test_des_requetes_concurrentes_ne_cassent_rien_pendant_un_reload(self):
+        # c6 : plusieurs requêtes à la fois, un reload qui alterne en continu pendant ce
+        # temps -- aucune ne doit jamais recevoir une réponse coupée ou mélangée.
+        #
+        # Quatre lecteurs, pas huit : mesuré isolément (writer coupé), ThreadingHTTPServer
+        # rend déjà des "Connection reset by peer" à partir de six clients qui martèlent le
+        # port en boucle serrée, sans le moindre reload en jeu -- une limite de http.server
+        # sous cette charge, pas une régression de _carte_a_jour(). Ce test cible ce que
+        # _carte_a_jour() doit garantir : une réponse jamais coupée ni mélangée pendant un
+        # reload concurrent, pas la tenue de http.server en rafale.
+        arret = threading.Event()
+        erreurs: list[str] = []
+
+        def ecrivain() -> None:
+            n = 0
+            while not arret.is_set():
+                n += 1
+                self._ecrire_carte(_CARTE_V2 if n % 2 else _CARTE_V1)
+
+        def lecteur() -> None:
+            try:
+                for _ in range(15):
+                    corps = self._get("/").read().decode("utf-8")
+                    if "carte v1" not in corps and "carte v2" not in corps:
+                        erreurs.append(f"réponse incohérente: {corps[:200]!r}")
+            except Exception as exc:  # noqa: BLE001 - le test veut voir toute casse
+                erreurs.append(f"{type(exc).__name__}: {exc}")
+
+        fil_ecrivain = threading.Thread(target=ecrivain, daemon=True)
+        fils_lecteurs = [threading.Thread(target=lecteur) for _ in range(4)]
+        fil_ecrivain.start()
+        for f in fils_lecteurs:
+            f.start()
+        for f in fils_lecteurs:
+            f.join(timeout=30)
+        arret.set()
+        fil_ecrivain.join(timeout=5)
+        self.assertEqual(erreurs, [])
+        self.assertTrue(serveur.is_up(self.port))

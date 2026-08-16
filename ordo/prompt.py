@@ -192,7 +192,11 @@ def _section_checklist_evolution(task_id: str, home: str) -> str:
         '<item-id> "<new label>"` (same id, same checked state)\n'
         f'- an estimate is missing or turns out wrong, once you have read the code: '
         f'`ordo checklist duree {task_id} <item-id> <minutes>` (Claude-minutes, same id, '
-        'same label, same checked state)\n\n'
+        'same label, same checked state)\n'
+        f'- a criterion\'s nature is worth naming, at creation or after the fact: '
+        f'`ordo checklist attribut {task_id} <item-id> <key> <value>` (keys: '
+        f'{", ".join(chantier.ATTRIBUTS_VALEURS)}; same id, same label, same checked '
+        'state; optional, a criterion with none stays perfectly valid)\n\n'
         "What you CANNOT do, on purpose: remove a criterion. There is no verb for it, and "
         "there never will be for you -- an executor able to drop a criterion could declare "
         "itself done by dropping the one in its way, and the contract formally forbids "

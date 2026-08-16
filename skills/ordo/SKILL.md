@@ -106,12 +106,18 @@ human's screen while the task runs. Someone watching the map should see it advan
 minutes; if it jumps from 0 to everything at the end, it told them nothing during the hour
 they were waiting.
 
-So: **5 to 10 items**, each **60 characters max**. Err on the side of more items rather than
+So: **5 to 10 items**, each **40 characters max**. Err on the side of more items rather than
 bigger ones. The test for an item is not "is this important" but **"would I see the bar move
 within a few minutes of work?"** - an item worth half an hour is two or three items. Each one
-is a verifiable post-condition that can be ticked on its own; whatever does not fit in 60
-characters is really two criteria, and the width is a measured constraint, a card in a wall
-column is a few hundred pixels wide.
+is a verifiable post-condition that can be ticked on its own.
+
+Forty characters is short on purpose, and it is a measured constraint, not a preference: a
+card in a wall column is a few hundred pixels wide, and the label sits next to the id, the
+model badge, the elapsed time and the context size. Anything longer is truncated on the very
+screen it was written for. It is also a good filter - what does not fit in forty characters
+is almost always two criteria wearing one label. Write `report consumed after apply`, not
+`the report is consumed after it has been applied`: the reader has the task's title and its
+`--why` right there, the item only has to name the step.
 
 Avoid the catch-all last item. "the full suite passes" as the fifth of five is where a third
 of the task hides; if the task ends with real verification work, say what that work is.

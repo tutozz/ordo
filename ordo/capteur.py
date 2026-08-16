@@ -414,3 +414,43 @@ def due(chantier_id: str, every: int = 120) -> bool:
         return True
     elapsed = (datetime.now(timezone.utc) - _parse_iso(cap["runs"][-1]["at"])).total_seconds()
     return elapsed >= every
+
+
+# ===========================================================================
+# pane_silencieux : mesure d'activité tmux, distincte du capteur-script ci-dessus
+# ===========================================================================
+#
+# Un second sens de "capteur" cohabite dans ce fichier depuis ici : la mesure de
+# l'activité d'un pane tmux (verbe en cours, chronomètre, compteur de jetons -- voir
+# ordo/panes.py:BUSY_MARKERS et panes.busy()), sans lien avec le script installé/adopté
+# par le reste de ce module. Les invariants I9/I10/I12 documentés en tête de fichier
+# (mesuré vs déclaré, aucune valeur par défaut, signal filtré avant adoption) sont
+# propres au capteur-script et ne s'appliquent pas ici.
+
+
+def pane_silencieux(occupe: bool, ecoule: float, seuil: float) -> bool:
+    """True si un pane vivant doit être signalé silencieux, jamais quand `occupe` est
+    vrai -- même si `ecoule` (secondes depuis le dernier changement observé) dépasse
+    `seuil`.
+
+    `occupe` vient de `panes.busy()`, qui lit les marqueurs d'activité de Claude Code
+    (BUSY_MARKERS : verbe en cours, chronomètre, compteur de jetons) dans le texte
+    récemment capturé du pane. Ce garde-fou existe parce qu'une session en pleine
+    réflexion (effort xhigh) peut afficher ces marqueurs en continu pendant dix à
+    quinze minutes sans que le reste du texte du pane ne change -- exactement ce que le
+    seul appelant de cette fonction, `ordo/cli.py`'s `cmd_watch`, confondait avec un
+    pane mort avant ce correctif : quatre alertes "silent" mesurées le 16 août 2026 sur
+    trois exécutantes réelles de ce dépôt, toutes en pleine réflexion, donc toutes
+    fausses. Un signal faux à chaque fois est pire qu'absent : il apprend à ignorer
+    l'alerte, et le jour où un pane meurt vraiment, le signal se noie dans les
+    précédents.
+
+    Vérifié le 16 août 2026 sur les panes vivants réels de la campagne c-01 (%27, %28,
+    %135) : les trois affichaient un compteur de jetons ("↓ NN.Nk tokens") en continu
+    pendant une réflexion prolongée (jusqu'à 22 min sans interruption sur %28), déjà
+    capté par BUSY_MARKERS ("tokens", "· ↓") -- aucun marqueur n'y manquait, seule la
+    garde ci-dessous manquait à l'appelant.
+    """
+    if occupe:
+        return False
+    return ecoule >= seuil

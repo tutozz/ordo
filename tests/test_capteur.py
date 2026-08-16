@@ -415,5 +415,30 @@ class TestCleDeStockageParId(CapteurTestCase):
             capteur.run(c2)
 
 
+# ===========================================================================
+# pane_silencieux
+# ===========================================================================
+
+
+class TestPaneSilencieux(unittest.TestCase):
+    """Fonction pure, aucun ORDO_HOME requis : voir son docstring pour la mesure du
+    16 août 2026 sur les panes réels qui a motivé ce garde-fou (brief t-25, volet 3)."""
+
+    def test_silencieux_quand_fige_pour_de_bon_et_le_seuil_est_depasse(self):
+        self.assertTrue(capteur.pane_silencieux(False, 900.0, 600.0))
+
+    def test_pas_silencieux_avant_le_seuil_meme_non_occupe(self):
+        self.assertFalse(capteur.pane_silencieux(False, 100.0, 600.0))
+
+    def test_pas_silencieux_quand_occupe_meme_tres_longtemps(self):
+        # Le cas mesuré en vrai : une session en réflexion xhigh porte son indicateur
+        # d'activité (compteur de jetons, chronomètre) en continu pendant bien plus que
+        # le seuil, sans jamais être silencieuse pour autant.
+        self.assertFalse(capteur.pane_silencieux(True, 10_000.0, 600.0))
+
+    def test_occupe_gagne_meme_pile_au_seuil(self):
+        self.assertFalse(capteur.pane_silencieux(True, 600.0, 600.0))
+
+
 if __name__ == "__main__":
     unittest.main()

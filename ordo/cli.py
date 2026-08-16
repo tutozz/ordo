@@ -1147,7 +1147,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         s["silence_dite"] = False
                     s["busy"] = occupe
                     ecoule = time.monotonic() - s["depuis"]
-                    if not s["silence_dite"] and ecoule >= args.silence:
+                    # occupe gagne toujours : un pane qui réfléchit longtemps (effort
+                    # xhigh, dix à quinze minutes) porte son indicateur d'activité en
+                    # continu sans jamais retoucher "depuis", donc "ecoule" grossit
+                    # pendant qu'il travaille -- capteur.pane_silencieux() refuse
+                    # d'émettre tant que occupe est vrai, seule façon de ne pas confondre
+                    # une session qui pense avec une session morte (voir son docstring).
+                    if not s["silence_dite"] and capteur.pane_silencieux(
+                        occupe, ecoule, args.silence
+                    ):
                         s["silence_dite"] = True
                         emettre(f"silent {tid} {int(ecoule)}s")
                 s["alive"] = vivant

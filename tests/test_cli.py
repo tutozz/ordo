@@ -1412,6 +1412,41 @@ class TestSignalVerbs(CliTestCase):
         all_after = self._run_json(["questions", "--all", "--json"])
         self.assertEqual(len(all_after), 1)
 
+    def test_ask_accepte_un_chantier_a_la_place_d_une_tache(self):
+        # Une orchestratrice escalade le plus souvent une question qui n'appartient a
+        # AUCUNE tache : lancer la suite en parallele ou en serie, decouper maintenant ou
+        # plus tard. Exiger une tache la forcait a en designer une au hasard.
+        cid = self._chantier()
+        q = self._run_json(["ask", cid, "parallele ou serie ?", "--for-human", "--json"])
+        self.assertEqual(q["chantier"], cid)
+        self.assertIsNone(q["tache"])
+        self.assertTrue(q["pourHumain"])
+
+    def test_une_question_de_chantier_n_affiche_jamais_le_mot_None(self):
+        # Sans cible de repli, la ligne affichait "q-01  None  ...", ce qui se lit comme
+        # un defaut de la commande et non comme une question qui porte sur la campagne.
+        cid = self._chantier()
+        code, out, err = self._run(["ask", cid, "parallele ou serie ?"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("None", out)
+        self.assertIn(cid, out)
+        code, out, err = self._run(["questions"])
+        self.assertNotIn("None", out)
+        self.assertIn(cid, out)
+
+    def test_une_question_de_chantier_se_liste_et_se_repond_comme_les_autres(self):
+        cid = self._chantier()
+        q = self._run_json(["ask", cid, "parallele ou serie ?", "--json"])
+        self.assertEqual(len(self._run_json(["questions", "--json"])), 1)
+        self._run_json(["answer", q["id"], "parallele", "--json"])
+        self.assertEqual(self._run_json(["questions", "--json"]), [])
+
+    def test_ask_refuse_un_identifiant_qui_n_est_ni_tache_ni_chantier(self):
+        self._chantier()
+        code, out, err = self._run(["ask", "z-99", "q ?"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("z-99", err)
+
     def test_answer_refuse_si_deja_repondue(self):
         cid = self._chantier()
         t1 = self._tache(cid)

@@ -231,6 +231,38 @@ class TestServeurVivant(ServeurVivantTestCase):
             self.assertIn(cle, c)
         self.assertNotIn("tasks", c)
 
+    def _question(self, texte, pour_humain=True, reponse=None):
+        """Pose une question dans le home servi. Rend (chantier, question)."""
+        precedent = os.environ["ORDO_HOME"]
+        os.environ["ORDO_HOME"] = self.home
+        try:
+            with store.locked() as state:
+                cid = next(iter(state["chantiers"]))
+                qid = store.next_id(state, "question")
+                state["questions"][qid] = {
+                    "id": qid, "chantier": cid, "tache": None, "question": texte,
+                    "options": [], "pourHumain": pour_humain, "answer": reponse,
+                    "askedAt": store.now(),
+                    "answeredAt": store.now() if reponse else None,
+                }
+            return cid, qid
+        finally:
+            os.environ["ORDO_HOME"] = precedent
+
+    def test_le_menu_dit_combien_de_choix_attendent_l_humain(self):
+        # Le mur ne charge aucune carte : sans ce compteur dans le menu, une colonne
+        # sortie de l'ecran pourrait attendre un arbitrage sans que rien ne le dise.
+        cid, _ = self._question("parallele ou serie ?")
+        self._question("deja repondue", reponse="oui")
+        self._question("pas pour l humain", pour_humain=False)
+        data = json.loads(self._get("/api/state").read())
+        c = next(x for x in data["campaigns"] if x["id"] == cid)
+        self.assertEqual(c["asking"], 1)
+
+    def test_un_chantier_sans_question_annonce_zero(self):
+        data = json.loads(self._get("/api/state").read())
+        self.assertEqual(data["campaigns"][0]["asking"], 0)
+
     def test_le_detail_d_un_chantier_sert_la_vue_complete(self):
         data = json.loads(self._get("/api/state").read())
         c = data["campaigns"][0]

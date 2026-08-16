@@ -402,6 +402,29 @@ drift, information only the human holds.
 
 To escalate, use `AskUserQuestion`, never free text. A question asked in prose gets lost.
 
+**Publish it before you ask it.** The human is watching the wall, not your terminal, and a
+session stopped on a question they never saw is a campaign stopped for nothing.
+
+```bash
+ordo ask <campaign|task> "the question, one sentence" --for-human \
+  --option "first choice" --option "second choice"
+```
+
+`ask` takes a campaign id when the question belongs to no task in particular - run the next
+wave in parallel or in series, cut the phase now or later - which is what an escalation
+usually is. That command, and only that command, raises **CHOIX A FAIRE** on that
+campaign's column in the wall, with your question, your options and the command that closes
+it. Then call `AskUserQuestion` as you always did: the wall shows, the terminal answers.
+
+When they have answered, close it in the same turn:
+
+```bash
+ordo answer <question> "what they chose"
+```
+
+A question left open keeps the overlay on their column forever, and an alarm that never
+goes off stops being read. Closing it is part of answering it, not a courtesy.
+
 ---
 
 ## The sensor

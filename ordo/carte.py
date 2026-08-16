@@ -50,6 +50,7 @@ import calendar
 import hashlib
 import json
 import re
+import shlex
 import time
 from collections.abc import Callable
 
@@ -188,6 +189,40 @@ def _groupes_declares(ch: dict) -> dict[str, dict]:
         else:
             declares[cle] = {"label": str(valeur), "why": ""}
     return declares
+
+
+def _questions(chantier_id: str, state: dict, tasks: dict[str, dict]) -> list[dict]:
+    """Ce qui attend un choix de l'humain sur ce chantier, et rien d'autre.
+
+    Deux filtres, et chacun ferme un défaut distinct. Une question déjà répondue sort :
+    une alerte qui ne s'éteint jamais cesse d'être lue, et celle-là resterait allumée pour
+    toujours. Une question qui n'est pas marquée `pourHumain` sort aussi : elle appartient
+    à l'orchestratrice, la montrer ici ferait répondre l'humain à la place de la session,
+    ce qui est l'inverse exact du contrat.
+
+    `tache` peut être nul. Une question d'orchestratrice porte le plus souvent sur le
+    chantier -- lancer la suite en parallèle ou en série -- et n'appartient à aucune tâche.
+    """
+    sorties = []
+    for qid in sorted(state.get("questions") or {}, key=_num_id):
+        q = state["questions"][qid]
+        if q.get("chantier") != chantier_id or not q.get("pourHumain"):
+            continue
+        if q.get("answer") is not None:
+            continue
+        tid = q.get("tache") or ""
+        sorties.append({
+            "id": qid,
+            "task": tid,
+            # Le titre voyage avec l'identifiant, jamais l'identifiant seul : "t-12" oblige
+            # à traduire mentalement, et c'est exactement ce qu'un humain revenu à froid ne
+            # peut pas faire.
+            "taskTitle": (tasks.get(tid) or {}).get("titre", ""),
+            "text": q.get("question") or "",
+            "options": list(q.get("options") or []),
+            "askedAt": q.get("askedAt"),
+        })
+    return sorties
 
 
 def _modele(task: dict) -> tuple[str, str, bool]:
@@ -485,6 +520,10 @@ def model(
             "tmuxSession": ch.get("tmuxSession"),
             "createdAt": ch.get("createdAt"),
             "closedAt": ch.get("closedAt"),
+            # Le home voyage avec la campagne parce que toute commande qu'on affiche à
+            # l'humain doit le porter. Un `ordo answer` tapé depuis un autre projet ne
+            # trouve pas la question, et ne dit pas pourquoi.
+            "home": str(store.home()),
         },
         "counts": counts,
         "phases": {
@@ -509,6 +548,7 @@ def model(
             if dep in nodes
         ],
         "decisions": decisions,
+        "questions": _questions(chantier_id, state, tasks),
         "warnings": _avertissements(ch, tasks, niveaux, alive),
         "generatedAt": store.now(),
     }
@@ -678,8 +718,18 @@ def vue(m: dict) -> dict:
             ],
             "docs": _docs(node),
         })
+    # La commande de réponse se compose ici et pas dans la page : elle porte le home, que
+    # seul Python connaît, et son échappement est le genre de détail qu'un JS refait mal.
+    # shlex.quote, parce qu'un ORDO_HOME peut contenir une espace, et qu'une commande
+    # affichée puis copiée telle quelle doit marcher au premier essai.
+    home = shlex.quote(m["campaign"].get("home") or "")
+    questions = [
+        dict(q, answerCmd=f'ORDO_HOME={home} ordo answer {q["id"]} "votre réponse"')
+        for q in m["questions"]
+    ]
     vu = {
         "campaign": m["campaign"],
+        "questions": questions,
         "counts": m["counts"],
         "phasesInfo": m["phases"],
         "terminals": m["terminals"],
@@ -892,6 +942,39 @@ display:flex;gap:8px;align-items:center}
 border:1px solid var(--line);border-top:none;border-radius:0 0 6px 6px;padding:9px;
 margin:-2px 0 0;font-size:11px;line-height:1.55;color:#b8c1cb;max-height:340px;overflow:auto}
 .doc:not(.open) pre{display:none}
+
+/* Le calque des questions. Une orchestratrice qui s'arrête pour demander un arbitrage le
+   fait dans son terminal ; l'humain, lui, regarde cette page. Sans ce calque la campagne
+   attend sans que rien ne le dise à l'endroit qu'il a sous les yeux. Reprend la teinte des
+   avertissements, la seule de cette palette qui serve déjà à appeler le regard. */
+#askchip{border-color:#63541f;color:#e3b341;cursor:pointer;
+animation:ordopulse 2.2s ease-in-out infinite}
+#ask{position:fixed;inset:0;z-index:40;background:rgba(6,8,11,.62);display:flex;
+align-items:center;justify-content:center;padding:18px}
+#ask[hidden]{display:none}
+.askbox{width:100%;max-width:430px;background:#191408;border:1px solid #63541f;
+border-radius:9px;padding:13px 14px;box-shadow:0 14px 40px rgba(0,0,0,.55)}
+.askhead{display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:.11em;
+text-transform:uppercase;color:#e3b341;font-weight:600}
+.askmore{margin-left:auto;font-size:10px;color:var(--dim2);letter-spacing:0;
+text-transform:none}
+.askx{background:transparent;border:1px solid #3a3524;border-radius:5px;color:var(--dim2);
+font:inherit;font-size:12px;line-height:1;padding:2px 6px;cursor:pointer}
+.askx:hover{color:var(--txt)}
+.askwho{margin-top:8px;font-size:10.5px;color:var(--dim)}
+.askwho.link{cursor:pointer;text-decoration:underline;text-decoration-color:#3a3524}
+.asktext{margin-top:5px;font-size:13px;line-height:1.45;color:var(--txt);text-wrap:pretty}
+.askopts{margin-top:8px;display:flex;flex-wrap:wrap;gap:5px}
+.askopt{font-size:11px;color:var(--txt2);border:1px solid #3a3524;border-radius:5px;
+padding:2px 7px}
+.askcmd{margin-top:10px;display:flex;align-items:center;gap:6px}
+.askcmd code{flex:1 1 auto;min-width:0;overflow:auto;white-space:nowrap;background:var(--bg);
+border:1px solid var(--line);border-radius:5px;padding:5px 7px;font-size:10.5px;
+color:#b8c1cb}
+.askcmd button{flex:none;background:#241a0c;border:1px solid #63541f;border-radius:5px;
+color:#e3b341;font:inherit;font-size:10.5px;padding:5px 8px;cursor:pointer}
+.asktip{margin-top:7px;font-size:10.5px;color:var(--dim2);line-height:1.45;
+text-wrap:pretty}
 
 #legend{position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--bg);
 border-top:1px solid var(--line);padding:6px 14px;display:flex;gap:12px;align-items:center;
@@ -1245,12 +1328,87 @@ function paintTop(){
     try{cache=sessionStorage.getItem(K("warn"))==="1"}catch(e){}
     wb.hidden=!D.warnings.length||cache;
   }
+  paintAsk();
   var bouts=["survol = liens · clic = détail · échap = fermer"];
   if(D.missingWhy.length)bouts.unshift(D.missingWhy.length+" sans explication");
   var annoncees=D.phases.filter(function(p){return p.planned&&p.key})
     .map(function(p){return p.key});
   if(annoncees.length)bouts.unshift("phases annoncées non découpées : "+annoncees.join(", "));
   document.getElementById("foot").textContent=bouts.join(" · ");
+}
+
+// Ce qui attend un choix de l'humain. Le calque se reconstruit SEULEMENT quand la question
+// affichee change : le battement tombe toutes les trois secondes, et refaire les noeuds
+// sous les doigts detacherait le bouton qu'on est en train de cliquer.
+function paintAsk(){
+  var box=document.getElementById("ask"), chip=document.getElementById("askchip");
+  if(!box||!chip)return;
+  var qs=(D&&D.questions)||[];
+  chip.hidden=!qs.length;
+  if(!qs.length){box.hidden=true;box.removeAttribute("data-q");return}
+  var q=qs[0];
+  chip.textContent=qs.length>1?qs.length+" choix à faire":"choix à faire";
+  // Le masquage ne vaut que pour LA question masquee. Sans cette egalite, un seul clic de
+  // fermeture rendrait sourd pour tout le reste du chantier, y compris aux questions
+  // suivantes, qui sont justement celles qu'on n'a pas encore vues.
+  var masque=null;
+  try{masque=sessionStorage.getItem(K("ask"))}catch(e){}
+  box.hidden=(masque===q.id);
+  if(box.getAttribute("data-q")===q.id)return;
+  box.setAttribute("data-q",q.id);
+  box.innerHTML="";
+
+  var carte2=el("div","askbox");
+  var head=el("div","askhead");
+  head.appendChild(el("span",null,"choix à faire"));
+  head.appendChild(el("span","askmore",qs.length>1?"+"+(qs.length-1)+" autre"+
+    (qs.length>2?"s":""):""));
+  var x=el("button","askx","×");
+  x.title="masquer jusqu'à la prochaine question";
+  x.addEventListener("click",function(){
+    box.hidden=true;
+    try{sessionStorage.setItem(K("ask"),q.id)}catch(e){}
+  });
+  head.appendChild(x);
+  carte2.appendChild(head);
+
+  var qui=el("div","askwho"+(q.task?" link":""),
+    q.id+(q.task?" · "+q.task+" "+q.taskTitle:" · toute la campagne"));
+  if(q.task)qui.addEventListener("click",function(){box.hidden=true;select(q.task)});
+  carte2.appendChild(qui);
+  carte2.appendChild(el("div","asktext",q.text));
+
+  if(q.options&&q.options.length){
+    var opts=el("div","askopts");
+    q.options.forEach(function(o){opts.appendChild(el("span","askopt",o))});
+    carte2.appendChild(opts);
+  }
+
+  var cmd=el("div","askcmd");
+  var code=document.createElement("code");code.className="m";code.textContent=q.answerCmd||"";
+  cmd.appendChild(code);
+  var cp=el("button",null,"copier");
+  cp.addEventListener("click",function(){
+    var fait=function(){cp.textContent="copié";setTimeout(function(){cp.textContent="copier"},1400)};
+    // 127.0.0.1 est un contexte sûr, donc le presse-papier est joignable ; en file:// il
+    // ne l'est pas toujours, d'où la sélection en repli plutôt qu'un bouton mort.
+    if(navigator.clipboard&&navigator.clipboard.writeText)
+      navigator.clipboard.writeText(code.textContent).then(fait,function(){selectionner(code)});
+    else selectionner(code);
+  });
+  cmd.appendChild(cp);
+  carte2.appendChild(cmd);
+  carte2.appendChild(el("div","asktip",
+    "la session orchestratrice attend votre réponse dans son terminal. "+
+    "Cette commande referme la question ; elle ne la débloque pas à sa place."));
+  box.appendChild(carte2);
+}
+
+function selectionner(noeud){
+  try{
+    var r=document.createRange();r.selectNodeContents(noeud);
+    var s=window.getSelection();s.removeAllRanges();s.addRange(r);
+  }catch(e){}
 }
 
 // Le graphe est en couches : un prerequis est toujours a un rang plus petit que sa
@@ -1322,6 +1480,17 @@ var wb=document.getElementById("warn"),wc=document.getElementById("warnchip");
 if(wb&&wc){wc.addEventListener("click",function(){
   wb.hidden=!wb.hidden;try{sessionStorage.setItem(K("warn"),wb.hidden?"1":"0")}catch(e){}});
   try{if(sessionStorage.getItem(K("warn"))==="1")wb.hidden=true}catch(e){}}
+var ac=document.getElementById("askchip");
+if(ac)ac.addEventListener("click",function(){
+  var box=document.getElementById("ask");
+  if(!box)return;
+  box.hidden=!box.hidden;
+  // Rouvrir efface le masquage, sinon le prochain battement le refermerait aussitot.
+  try{
+    if(box.hidden)sessionStorage.setItem(K("ask"),box.getAttribute("data-q")||"");
+    else sessionStorage.removeItem(K("ask"));
+  }catch(e){}
+});
 window.addEventListener("keydown",function(e){if(e.key==="Escape"&&S.sel){S.sel=null;render()}});
 window.addEventListener("resize",draw);
 try{var last=sessionStorage.getItem(K("sel"));if(last)S.sel=last}catch(e){}
@@ -1380,10 +1549,12 @@ def html(m: dict, interval: int = 0) -> str:
     <button class="pill" id="f-reste">reste<b class="m" id="n-reste"></b></button>
     <button class="pill" id="f-tout">tout<b class="m" id="n-tout"></b></button>
     <span class="pill" id="warnchip" hidden></span>
+    <span class="pill" id="askchip" hidden></span>
     <div id="views"><button id="v-graphe">graphe</button><button id="v-liste">liste</button></div>
   </div>
 </div>
 <div id="warn" hidden></div>
+<div id="ask" hidden></div>
 <div id="board"><svg id="wires"></svg></div>
 <div id="legend">
   <span class="item"><span class="sw" style="background:#46a35a"></span>fait</span>
@@ -1441,13 +1612,25 @@ body{padding-bottom:30px}
 _PANNEAU_JS = r"""
 (function(){
 var POLL=__POLL__, C=window.ORDO_CIBLE, empreinte=null, timer=null, premier=true;
-function muet(oui){var d=document.getElementById("dead");if(d)d.hidden=!oui}
+// Deux pannes, deux messages. Le serveur qui ne repond plus et le chantier qu'il refuse
+// de servir se ressemblent a l'ecran et ne se reparent pas pareil : dire "serveur muet"
+// quand le serveur repond parfaitement envoie chercher la panne au mauvais endroit.
+function muet(texte){
+  var d=document.getElementById("dead");
+  if(!d)return;
+  d.hidden=!texte;
+  if(texte)d.textContent=texte;
+}
 function charger(){
   fetch("/api/map?home="+encodeURIComponent(C.home)+
         "&campaign="+encodeURIComponent(C.campaign))
-    .then(function(r){if(!r.ok)throw new Error(r.status);return r.json()})
+    .then(function(r){
+      if(r.status===403||r.status===404)throw new Error("introuvable");
+      if(!r.ok)throw new Error(r.status);
+      return r.json();
+    })
     .then(function(vue){
-      muet(false);
+      muet("");
       // Redessine seulement si le contenu a change. L'empreinte ignore l'horodatage, sans
       // quoi chaque battement paraitrait different du precedent et la colonne se
       // reconstruirait toutes les trois secondes pour rien.
@@ -1461,7 +1644,10 @@ function charger(){
       // sous les doigts de qui est en train de la lire.
       if(premier){premier=false;window.ordoRestoreScroll()}
     })
-    .catch(function(){muet(true)});
+    .catch(function(e){
+      muet(String(e&&e.message)==="introuvable"
+        ? "chantier introuvable" : "serveur muet");
+    });
 }
 charger();
 timer=setInterval(charger,POLL*1000);
@@ -1507,11 +1693,13 @@ def panneau(home: str, campaign: str, poll: int = POLL_S) -> str:
     <button class="pill" id="f-reste">reste<b class="m" id="n-reste"></b></button>
     <button class="pill" id="f-tout">tout<b class="m" id="n-tout"></b></button>
     <span class="pill" id="warnchip" hidden></span>
-    <span class="pill" id="dead" hidden>serveur muet</span>
+    <span class="pill" id="askchip" hidden></span>
+    <span class="pill" id="dead" hidden></span>
     <div id="views"><button id="v-graphe">graphe</button><button id="v-liste">liste</button></div>
   </div>
 </div>
 <div id="warn" hidden></div>
+<div id="ask" hidden></div>
 <div id="board"><svg id="wires"></svg><div id="wait">lecture du chantier...</div></div>
 <div id="legend"><span id="foot"></span></div>
 <script>window.ORDO_CIBLE={cible};window.ORDO_NS={espace};</script>
@@ -1534,6 +1722,10 @@ transition:opacity .3s}
 border-radius:20px;padding:2px 8px;white-space:nowrap}
 #wtop .tag.live{border-color:#63541f;color:#d3a03a}
 #wtop .tag.err{border-color:#5a2f2f;color:#e05252}
+#wtop .tag.ask{border-color:#63541f;color:#e3b341;
+animation:ordopulse 2.2s ease-in-out infinite}
+.col.ask{border-right-color:#63541f}
+.col.ask .chead{background:#241a0c;border-bottom-color:#63541f}
 #lgd{display:flex;gap:10px;margin-left:auto;font-size:10px;color:var(--dim2)}
 #lgd span.item{display:flex;align-items:center;gap:4px;white-space:nowrap}
 #lgd .sw{width:7px;height:7px;border-radius:2px;display:inline-block}
@@ -1571,8 +1763,13 @@ function pulse(vivant){
 }
 function cle(c){return c.home+" "+c.campaign}
 function cleDe(c){return c.home+" "+c.id}
+function trouver(k){
+  for(var i=0;i<campagnes.length;i++)if(cleDe(campagnes[i])===k)return campagnes[i];
+  return null;
+}
 function libelle(c){
   return (c.slug||c.id)+" · "+c.done+"/"+c.total+
+    (c.asking?" · CHOIX A FAIRE":"")+
     (c.running?" · "+c.running+" en cours":"")+(c.state==="open"?"":" · "+c.state);
 }
 // La disposition survit au rechargement : un mur qu'il faut remonter a chaque ouverture
@@ -1648,6 +1845,11 @@ function dessiner(){
     if(!col.node)hote.appendChild(creer(col));
     vivants[col.uid]=1;
     options(col);
+    // La colonne entiere se teinte quand son chantier attend un arbitrage. Le calque, lui,
+    // vit DANS la colonne : sur un mur de six colonnes en plein ecran, il faut d'abord
+    // savoir laquelle regarder.
+    var etat=trouver(cle(col));
+    col.node.classList.toggle("ask",!!(etat&&etat.asking));
     var url="/panel?home="+encodeURIComponent(col.home)+
             "&campaign="+encodeURIComponent(col.campaign);
     // Meme raison : la source ne se reecrit que si la cible a vraiment change, sinon
@@ -1702,6 +1904,10 @@ function battement(){
     var pb=document.getElementById("pbs");
     pb.hidden=!etat.problems.length;
     if(etat.problems.length)pb.textContent=etat.problems.length+" home illisible";
+    var choix=campagnes.reduce(function(n,c){return n+(c.asking||0)},0);
+    var ak=document.getElementById("asks");
+    ak.hidden=!choix;
+    ak.textContent=choix+" choix à faire";
     pulse(true);
     if(!monte){monte=true;premier()}
     dessiner();
@@ -1745,6 +1951,7 @@ def page(poll: int = POLL_S) -> str:
   <span id="pulse" title="battement du serveur"></span>
   <span class="tag" id="live"></span>
   <span class="tag err" id="pbs" hidden></span>
+  <span class="tag ask" id="asks" hidden></span>
   <span id="lgd">
     <span class="item"><span class="sw" style="background:#46a35a"></span>fait</span>
     <span class="item"><span class="sw" style="background:#d3a03a"></span>en cours</span>

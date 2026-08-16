@@ -1517,12 +1517,21 @@ def cmd_ask(args: argparse.Namespace) -> int:
     # hors perimetre) lit et ecrit lui aussi avec ces memes noms de cles (wake_reasons(),
     # _latest_question()) ; les renommer ici casserait ce contrat croise en silence.
     with store.locked() as state:
-        task, ch = _resolve_task(state, args.task)
+        # La cible est une tâche OU un chantier. Une orchestratrice escalade le plus
+        # souvent une question qui n'appartient à aucune tâche -- lancer la suite en
+        # parallèle ou en série, découper maintenant ou plus tard -- et exiger une tâche
+        # la forçait à en désigner une au hasard, ce qui rendait ensuite la question
+        # illisible pour qui la lisait attachée à cette tâche-là.
+        ch = state["chantiers"].get(args.task)
+        if ch is not None:
+            task = None
+        else:
+            task, ch = _resolve_task(state, args.task)
         qid = store.next_id(state, "question")
         q = {
             "id": qid,
             "chantier": ch["id"],
-            "tache": task["id"],
+            "tache": task["id"] if task else None,
             "question": args.text,
             "options": args.option or [],
             "pourHumain": args.for_human,
@@ -1535,7 +1544,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         _print_json(q)
         return 0
     marque = "  [for human]" if q["pourHumain"] else ""
-    print(f"{q['id']}  {q['tache']}  {q['question']}{marque}")
+    # La cible, jamais "None" : une question de chantier n'a pas de tâche, et afficher
+    # le mot None à la place d'un identifiant se lit comme un bug de la commande.
+    print(f"{q['id']}  {q['tache'] or q['chantier']}  {q['question']}{marque}")
     return 0
 
 
@@ -1573,7 +1584,7 @@ def cmd_questions(args: argparse.Namespace) -> int:
         return 0
     for q in qs:
         marque = "[for human] " if q["pourHumain"] else ""
-        print(f"{q['id']}  {q['tache']}  {marque}{q['question']}")
+        print(f"{q['id']}  {q['tache'] or q['chantier']}  {marque}{q['question']}")
     return 0
 
 

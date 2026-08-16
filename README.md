@@ -203,6 +203,19 @@ content actually changed, so scroll position, open task, folded phases and searc
 survive. The standalone file cannot do that; it refreshes wholesale and sends you back to
 the top of the page.
 
+When the orchestrator escalates a decision, it publishes it with `ordo ask <campaign|task>
+"..." --for-human` before asking you in its terminal. The column for that campaign tints,
+the wall counts it, and a **CHOIX A FAIRE** panel opens over the column with the question,
+its options and the command that closes it, `ORDO_HOME` included:
+
+```bash
+ORDO_HOME=/path/to/.ordo ordo answer q-03 "in parallel, I will watch it"
+```
+
+You answer in the orchestrator's terminal, as always; that command is what closes the
+question and takes the panel down. Dismissing the panel only hides it until the next
+question arrives, never past it.
+
 The server is read-only by construction: no POST, nothing writes. It listens on loopback
 only, refuses any `ORDO_HOME` that is not in its registry, and rejects any `Host` header
 that is not a loopback name, which is what closes DNS rebinding from a page open in your

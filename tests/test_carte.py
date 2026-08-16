@@ -937,3 +937,109 @@ class TestDefilementRestaure(CarteTestCase):
     def test_une_colonne_restaure_son_defilement_au_premier_rendu(self):
         p = carte.panneau("/tmp/ordo-home", "c-7")
         self.assertIn("window.ordoRestoreScroll()", p)
+
+
+class TestQuestionsSurLaCarte(CarteTestCase):
+    """Ce qui attend un choix de l'humain, visible sur la carte.
+
+    Une orchestratrice qui s'arrête pour poser une question le fait dans son terminal.
+    L'humain, lui, regarde la carte : la question ne l'atteint jamais, et la campagne
+    reste en attente sans que rien ne le dise à l'endroit qu'il a sous les yeux.
+    """
+
+    def _ask(self, cible, texte, pour_humain=True, options=None):
+        with store.locked() as state:
+            qid = store.next_id(state, "question")
+            tache = cible if cible.startswith("t-") else None
+            state["questions"][qid] = {
+                "id": qid,
+                "chantier": self.chantier,
+                "tache": tache,
+                "question": texte,
+                "options": options or [],
+                "pourHumain": pour_humain,
+                "answer": None,
+                "askedAt": store.now(),
+                "answeredAt": None,
+            }
+        return qid
+
+    def _repondre(self, qid, texte="oui"):
+        with store.locked() as state:
+            state["questions"][qid]["answer"] = texte
+            state["questions"][qid]["answeredAt"] = store.now()
+
+    def test_une_question_pour_l_humain_est_sur_la_carte(self):
+        a = self._add("0.1 a")
+        qid = self._ask(a["id"], "relancer sur opus ou découper ?")
+        q = carte.model(self.chantier)["questions"]
+        self.assertEqual([x["id"] for x in q], [qid])
+        self.assertEqual(q[0]["task"], a["id"])
+        self.assertIn("découper", q[0]["text"])
+
+    def test_une_question_repondue_disparait_de_la_carte(self):
+        # Sinon l'alerte resterait allumee apres coup, et une alerte qui ne s'eteint
+        # jamais cesse d'etre lue.
+        a = self._add("0.1 a")
+        qid = self._ask(a["id"], "q ?")
+        self._repondre(qid)
+        self.assertEqual(carte.model(self.chantier)["questions"], [])
+
+    def test_une_question_qui_n_est_pas_pour_l_humain_reste_hors_de_la_carte(self):
+        # Celle-la appartient a l'orchestratrice : la montrer a l'humain le ferait
+        # repondre a la place de la session, ce qui est exactement l'inverse du contrat.
+        a = self._add("0.1 a")
+        self._ask(a["id"], "q ?", pour_humain=False)
+        self.assertEqual(carte.model(self.chantier)["questions"], [])
+
+    def test_une_question_de_chantier_n_a_pas_de_tache(self):
+        self._add("0.1 a")
+        qid = self._ask("c-01", "parallèle ou série ?", options=["parallèle", "série"])
+        q = carte.model(self.chantier)["questions"]
+        self.assertEqual([x["id"] for x in q], [qid])
+        self.assertEqual(q[0]["task"], "")
+        self.assertEqual(q[0]["options"], ["parallèle", "série"])
+
+    def test_une_question_porte_le_titre_de_sa_tache(self):
+        # L'identifiant seul oblige a le traduire mentalement, et c'est precisement ce
+        # qu'un humain revenu a froid ne peut pas faire.
+        a = self._add("0.1 Recette locale")
+        self._ask(a["id"], "q ?")
+        self.assertEqual(carte.model(self.chantier)["questions"][0]["taskTitle"],
+                         "0.1 Recette locale")
+
+    def test_la_vue_porte_la_commande_qui_repond(self):
+        # Repondre exige de viser le bon ORDO_HOME : un `ordo answer` tape depuis un
+        # autre projet ne trouve pas la question et ne dit pas pourquoi.
+        self._add("0.1 a")
+        qid = self._ask("c-01", "q ?")
+        cmd = carte.vue(carte.model(self.chantier))["questions"][0]["answerCmd"]
+        self.assertIn(qid, cmd)
+        self.assertIn("ordo answer", cmd)
+        self.assertIn(self._tmp, cmd)
+
+    def test_un_home_a_espaces_ne_casse_pas_la_commande(self):
+        self._add("0.1 a")
+        self._ask("c-01", "q ?")
+        m = carte.model(self.chantier)
+        m["campaign"]["home"] = "/mon dossier/o"
+        self.assertIn("'/mon dossier/o'", carte.vue(m)["questions"][0]["answerCmd"])
+
+    def test_la_page_porte_le_calque_de_la_question(self):
+        self._add("0.1 a")
+        self._ask("c-01", "q ?")
+        self.assertIn('id="ask"', carte.html(carte.model(self.chantier)))
+
+
+class TestMurEtQuestions(CarteTestCase):
+    def test_le_mur_porte_le_compteur_de_choix_a_faire(self):
+        # Le mur ne charge aucune carte : ce compteur est le seul endroit ou il peut dire
+        # qu'une colonne, peut-etre sortie de l'ecran, attend un arbitrage.
+        self.assertIn('id="asks"', carte.page())
+
+    def test_une_colonne_distingue_le_serveur_muet_du_chantier_introuvable(self):
+        # Les deux se ressemblent a l'ecran et ne se reparent pas pareil : un chantier
+        # sorti du registre repond 403, ce qui n'est pas un serveur en panne.
+        p = carte.panneau("/tmp/ordo-home", "c-7")
+        self.assertIn("chantier introuvable", p)
+        self.assertIn("serveur muet", p)

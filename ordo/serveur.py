@@ -221,7 +221,18 @@ def _resume_home(home: str) -> tuple[list[dict], dict | None]:
                 taches = [
                     t for t in state["taches"].values() if t["chantier"] == ch["id"]
                 ]
+                # Ce qui attend un choix de l'humain. Le compte, jamais le texte : le menu
+                # doit rester leger, et la question elle-meme arrive avec la carte. Mais
+                # sans ce chiffre ici, une colonne sortie de l'ecran pourrait attendre un
+                # arbitrage sans que rien, nulle part, ne le dise.
+                attente = sum(
+                    1 for q in (state.get("questions") or {}).values()
+                    if q.get("chantier") == ch["id"]
+                    and q.get("pourHumain")
+                    and q.get("answer") is None
+                )
                 resume.append({
+                    "asking": attente,
                     "home": home,
                     "id": ch["id"],
                     "slug": ch.get("slug") or "",

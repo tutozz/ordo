@@ -7,6 +7,20 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- A question the orchestrator escalates now **reaches the wall**. `ordo ask ... --for-human`
+  raises a **CHOIX A FAIRE** overlay on that campaign's column, with the question, its
+  options, the task it belongs to, and the exact command that closes it, `ORDO_HOME`
+  included so it works from any terminal. The column tints, the wall counts, and a
+  campaign left waiting stops being invisible to the person watching the dashboard rather
+  than the terminal. The page stays read-only: it shows and it copies, it never writes.
+- `ordo ask` accepts a **campaign id** where it used to demand a task. An escalation is
+  usually about the campaign - run the next wave in parallel or in series, cut the phase
+  now or later - and forcing it onto an arbitrary task made the question unreadable to
+  whoever found it attached there.
+- SKILL.md now requires publishing an escalation before asking it, and closing it with
+  `ordo answer` in the same turn as the human's reply. An overlay that never goes off
+  stops being read.
+
 - The served page becomes a **wall**: one column per campaign, side by side, across
   projects. `+ colonne` adds one, the dropdown at the top of a column changes which
   campaign it shows, `×` closes it, and the layout is remembered, so a spare monitor in

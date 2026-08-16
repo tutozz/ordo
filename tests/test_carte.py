@@ -7,6 +7,7 @@ de la carte reste verifiable sans serveur tmux.
 
 from __future__ import annotations
 
+import colorsys
 import json
 import os
 import re
@@ -577,11 +578,13 @@ class TestHtml(CarteTestCase):
         self._add("0.2 b", depends_on=[a["id"]])
         self.assertIn('id="wires"', self._page())
 
-    def test_la_page_offre_les_deux_vues_et_les_deux_filtres(self):
+    def test_le_selecteur_de_vue_et_le_filtre_de_recherche_ont_disparu(self):
+        # t-48 : la vue liste, la recherche et le filtre reste/tout n'étaient jamais
+        # utilisés -- retirés au profit du graphe, seul mode désormais.
         self._add("0.1 a")
         page = self._page()
-        for cle in ('id="v-graphe"', 'id="v-liste"', 'id="f-reste"', 'id="f-tout"'):
-            self.assertIn(cle, page)
+        for cle in ('id="v-graphe"', 'id="v-liste"', 'id="f-reste"', 'id="f-tout"', 'id="q"'):
+            self.assertNotIn(cle, page)
 
     def test_la_page_annonce_les_phases_declarees_mais_non_decoupees(self):
         self._add("0.1 a")
@@ -595,13 +598,83 @@ class TestHtml(CarteTestCase):
         self.assertIn("sans explication", self._page())
 
     def test_un_chantier_sans_tache_rend_une_page_qui_le_dit(self):
-        self.assertIn("aucune tache", self._page().lower())
+        self.assertIn("aucune tâche", self._page().lower())
 
     def test_la_page_est_du_html_complet(self):
         self._add("0.1 a")
         page = self._page()
         self.assertTrue(page.lstrip().lower().startswith("<!doctype html>"))
         self.assertIn("</html>", page)
+
+
+class TestPastilleDAlertes(CarteTestCase):
+    """t-48 : les alertes ne s'étalent plus en bandeau -- une pastille comptée (triangle
+    SVG, nombre) ouvre leur liste complète dans le calque déjà utilisé par les questions
+    (#ask/#warn partagent leur CSS, paintTop() reprend la construction de paintAsk()),
+    jamais un second calque écrit pour la même idée. Deux états seulement comptent : aucune
+    alerte, où la pastille doit rester injoignable, et plusieurs, où le compte affiché et
+    la liste ouverte au clic doivent venir du même tableau -- ce sont eux qui feraient
+    disparaître une information sans que personne ne le voie."""
+
+    def _page(self) -> str:
+        return carte.html(carte.model(self.chantier))
+
+    def test_sans_alerte_la_pastille_reste_masquee_par_construction(self):
+        # Aucune tâche créée : aucun avertissement possible côté modèle, et côté JS la
+        # pastille ne se démasque jamais hors de la condition D.warnings.length.
+        self.assertEqual(carte.model(self.chantier)["warnings"], [])
+        page = self._page()
+        self.assertIn('id="warnchip" hidden>', page)
+        self.assertIn("wc.hidden=!D.warnings.length;", page)
+
+    def test_avec_des_alertes_le_modele_les_porte_toutes_jusqu_au_json_servi(self):
+        # Une checklist non cochée sur une tâche déclarée "done" : un avertissement réel
+        # produit par _avertissements(), pas injecté à la main -- la même source que la
+        # page servie en vrai.
+        a = self._add("0.1 a", checklist=["c un"])
+        self._set_state(a["id"], state="done")
+        m = carte.model(self.chantier)
+        self.assertGreaterEqual(len(m["warnings"]), 1)
+        # vue() est ce qui atterrit dans window.ORDO : le compte que verra la pastille et
+        # la liste qu'ouvrira le calque viennent tous deux de ce même tableau JSON.
+        self.assertEqual(len(carte.vue(m)["warnings"]), len(m["warnings"]))
+
+    def test_le_compte_de_la_pastille_et_la_liste_du_calque_viennent_du_meme_tableau(self):
+        page = self._page()
+        self.assertIn("if(nw)nw.textContent=D.warnings.length;", page)
+        self.assertIn(
+            'D.warnings.forEach(function(w){listeW.appendChild(el("div",null,w.detail))});',
+            page,
+        )
+
+    def test_le_calque_des_alertes_reutilise_celui_des_questions(self):
+        page = self._page()
+        self.assertIn("#ask,#warn{position:fixed;inset:0;", page)
+        self.assertIn('var boiteW=el("div","askbox");', page)
+        self.assertIn('var teteW=el("div","askhead");', page)
+
+    def test_le_triangle_d_alerte_est_du_svg_inline_pas_une_police_d_icones(self):
+        page = self._page()
+        i = page.index('id="warnchip"')
+        j = page.index("</span>", i)
+        chip = page[i:j]
+        self.assertIn("<svg", chip)
+        self.assertIn('id="n-warn"', chip)
+        self.assertNotIn("font-family", chip)
+
+    def test_le_display_pose_sur_warnchip_ne_court_circuite_pas_hidden(self):
+        # Régression trouvée en mesure réelle (t-48) : #warnchip{display:inline-flex}
+        # prime, par spécificité d'identifiant, sur la règle [hidden] du navigateur --
+        # sans cette règle dédiée, le triangle restait visible même à zéro alerte.
+        page = self._page()
+        self.assertIn("#warnchip[hidden]{display:none}", page)
+
+    def test_le_calque_des_alertes_ne_s_ouvre_pas_tout_seul_au_chargement(self):
+        # Régression trouvée en mesure réelle (t-48) : hérité de l'ancien bandeau,
+        # `cache` par défaut valait false, donc un calque plein écran s'ouvrait tout seul
+        # dès qu'il y avait au moins une alerte, avant même que le clic n'ait eu lieu.
+        page = self._page()
+        self.assertIn("var cache=true;", page)
 
 
 class TestDetailDeTache(CarteTestCase):
@@ -973,7 +1046,7 @@ class TestRestantEtDepassementSurLaCarte(CarteTestCase):
         # même sur une case réglée et repliée, jamais soumis à `condense`.
         page = carte.html(carte.model(self.chantier))
         bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
-        garde_checklist = bloc.index("if(!condense){")
+        garde_checklist = bloc.index("if(!condense&&!jamaisLancee){")
         self.assertLess(bloc.index('el("span","dur",durTxt)'), garde_checklist)
         self.assertLess(bloc.index("t.depassement"), garde_checklist)
 
@@ -1057,23 +1130,35 @@ class TestAttributsSurLaCarte(CarteTestCase):
             [a["cle"] for a in t["checklist"][0]["attrs"]], ["geste", "validation"]
         )
 
-    def test_le_marqueur_ecrit_la_valeur_en_clair_jamais_une_initiale(self):
-        # Retouche t-41 : sur les seize valeurs de chantier.ATTRIBUTS_VALEURS, aucune
-        # n'est partagée entre deux clés -- la valeur en toutes lettres identifie donc sa
-        # clé toute seule, contrairement à "M", l'initiale qu'elle remplace, un code que
-        # rien n'expliquait à l'écran.
+    def test_le_marqueur_ecrit_la_cle_et_la_valeur_en_clair_jamais_une_initiale(self):
+        # Retouche demandée par l'humain, même passe que t-44 : "M" puis la valeur seule
+        # (t-41) ne disaient pas de quoi il s'agissait sans déjà connaître les cinq clés
+        # par cœur -- la clé traverse maintenant à l'écran, à côté de sa valeur.
         self._add("0.1 a")
         page = carte.html(carte.model(self.chantier))
-        self.assertIn('el("span","cattr m",a.valeur)', page)
+        self.assertIn('mk.appendChild(el("span","cattrk m",a.cle))', page)
+        self.assertIn('mk.appendChild(el("span","cattrv m"," : "+a.valeur))', page)
         # charAt(0) existe ailleurs dans le fichier (classeEcart, sur le signe de l'écart) :
         # la garde porte donc sur le bloc des marqueurs, pas sur la page entière.
         bloc = page[page.index("c.attrs.forEach"):page.index("ca.appendChild(mk)")]
         self.assertNotIn("charAt(0)", bloc)
 
+    def test_seule_la_cle_peut_se_couper_jamais_la_valeur(self):
+        # Retouche de l'humain : "si une paire ne tient pas, abrège la clé et jamais la
+        # valeur". .cattrk (la clé) peut donc se réduire et se couper à l'ellipse ;
+        # .cattrv (le séparateur et la valeur) reste flex:none, jamais réduit.
+        page = carte.html(carte.model(self.chantier))
+        self.assertIn(
+            ".cattrk{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;"
+            "white-space:nowrap}",
+            page,
+        )
+        self.assertIn(".cattrv{flex:none;white-space:nowrap}", page)
+
     def test_la_cle_reste_lisible_au_survol_et_sans_bouger_la_souris(self):
         # Invariant 3 du brief : title au survol au minimum, aria-label en plus pour qui
         # navigue au clavier ou au lecteur d'écran -- jamais besoin de bouger la souris
-        # pour retrouver la clé.
+        # pour retrouver la clé, y compris si elle s'est coupée à l'écran.
         self._add("0.1 a")
         page = carte.html(carte.model(self.chantier))
         self.assertIn('var titre=a.cle+" : "+a.valeur', page)
@@ -1130,6 +1215,21 @@ class TestAttributsSurLaCarte(CarteTestCase):
         # Python, la seule limite de largeur vit en CSS (flex-wrap), pas dans la donnée.
         self.assertIn(libelle, page)
 
+    def test_la_plus_longue_paire_cle_valeur_reelle_reste_courte(self):
+        # Calculée depuis chantier.ATTRIBUTS_VALEURS, source unique (jamais une seconde
+        # liste dupliquée ici) : la paire "clé : valeur" la plus longue qu'un marqueur
+        # puisse réellement porter aujourd'hui. Le repli qui coupe la clé à l'ellipse
+        # (.cattrk, voir CSS) existe pour ce qui dépasserait un jour ce maximum réel,
+        # jamais déclenché par lui.
+        paires = [
+            f"{cle} : {valeur}"
+            for cle, valeurs in chantier.ATTRIBUTS_VALEURS.items()
+            for valeur in valeurs
+        ]
+        pire = max(paires, key=len)
+        self.assertEqual(pire, "validation : observation")
+        self.assertEqual(len(pire), 24)
+
 
 class TestExclusiviteEcartEtDepassement(CarteTestCase):
     """Retouche demandée par l'humain (brief t-38) : sur une tâche TERMINÉE en
@@ -1170,7 +1270,7 @@ class TestExclusiviteEcartEtDepassement(CarteTestCase):
         # affiché à côté de la durée écoulée dans l'en-tête (rlinks), pour que le libellé
         # récupère toute la largeur de sa ligne.
         page = carte.html(carte.model(self.chantier))
-        rprog = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        rprog = page[page.index('el("div","rprog")'):page.index('if(sel){')]
         self.assertNotIn("t.restant", rprog)
         entete = page[page.index('var links=el("span","rlinks m")'):page.index("if(t.depassement){")]
         self.assertIn("t.totalEstime", entete)
@@ -1421,10 +1521,16 @@ class TestPanneau(CarteTestCase):
         self.assertIn("/tmp/ordo-home", p)
         self.assertIn("c-7", p)
 
-    def test_une_colonne_porte_le_plateau_et_les_deux_vues(self):
+    def test_une_colonne_porte_le_plateau(self):
         p = carte.panneau("/tmp/ordo-home", "c-7")
-        for cle in ('id="board"', 'id="wires"', 'id="v-graphe"', 'id="v-liste"'):
+        for cle in ('id="board"', 'id="wires"'):
             self.assertIn(cle, p)
+
+    def test_une_colonne_ne_porte_plus_le_selecteur_de_vue(self):
+        # t-48 : le graphe est le seul mode, retiré au profit d'une barre plus courte.
+        p = carte.panneau("/tmp/ordo-home", "c-7")
+        for cle in ('id="v-graphe"', 'id="v-liste"'):
+            self.assertNotIn(cle, p)
 
     def test_une_colonne_ne_porte_pas_le_selecteur_de_chantier(self):
         # Le choix du chantier appartient au mur : deux selecteurs pour une meme colonne
@@ -1650,6 +1756,455 @@ class TestMurDistingueTroisEtats(CarteTestCase):
         self.assertIn(".col.stall", page)
 
 
+class TestOrdreDesChantiersDansLOnglet(CarteTestCase):
+    """L'onglet fusionné (t-49) groupe les chantiers avant de les proposer : ceux qui ont
+    quelque chose EN COURS -- une exécutante vivante ou une tâche lançable -- d'abord,
+    toujours dans cet ordre, même quand ce premier groupe est vide (c3). grouper() est une
+    fonction pure de _MUR_JS, dans la même plage que ouvert()/signal()/libelle() déjà
+    exécutée sous Node par TestMurDistingueTroisEtats -- même technique ici."""
+
+    def _grouper(self, campagnes: list[dict]) -> dict:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS du mur")
+        js = carte._MUR_JS
+        debut = js.index("function ouvert")
+        fin = js.index("// La disposition survit")
+        script = (
+            js[debut:fin]
+            + "\nconst cs = " + json.dumps(campagnes) + ";"
+            + "\nconst g = grouper(cs);"
+            + "\nprocess.stdout.write(JSON.stringify({"
+            + "enCours: g.enCours.map(c => c.id), autres: g.autres.map(c => c.id)}));"
+        )
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    def _campagne(self, **kwargs) -> dict:
+        base = {
+            "id": "c-01", "slug": "loko", "state": "open", "asking": 0,
+            "running": 0, "ready": 0, "total": 1, "done": 0,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_une_executante_vivante_va_dans_en_cours(self):
+        g = self._grouper([self._campagne(id="c-01", running=1)])
+        self.assertEqual(g["enCours"], ["c-01"])
+        self.assertEqual(g["autres"], [])
+
+    def test_une_tache_lancable_va_dans_en_cours(self):
+        g = self._grouper([self._campagne(id="c-01", ready=1)])
+        self.assertEqual(g["enCours"], ["c-01"])
+        self.assertEqual(g["autres"], [])
+
+    def test_rien_ne_tourne_ni_ne_se_lance_va_dans_autres(self):
+        g = self._grouper([self._campagne(id="c-01", running=0, ready=0, done=1)])
+        self.assertEqual(g["enCours"], [])
+        self.assertEqual(g["autres"], ["c-01"])
+
+    def test_un_chantier_ferme_va_dans_autres_meme_si_ready_est_pose(self):
+        # N'arrive jamais en pratique (un chantier fermé n'a plus de tâche lançable), mais
+        # la garde ouvert() dans enCours() doit tenir si ce chiffre était incohérent.
+        g = self._grouper([self._campagne(id="c-01", state="closed", ready=1)])
+        self.assertEqual(g["enCours"], [])
+        self.assertEqual(g["autres"], ["c-01"])
+
+    def test_le_groupe_en_cours_reste_premier_meme_vide(self):
+        g = self._grouper([self._campagne(id="c-01", running=0, ready=0, done=1)])
+        self.assertEqual(list(g.keys()), ["enCours", "autres"])
+        self.assertEqual(g["enCours"], [])
+
+    def test_lordre_relatif_est_preserve_a_linterieur_de_chaque_groupe(self):
+        g = self._grouper([
+            self._campagne(id="c-01", running=1),
+            self._campagne(id="c-02", done=1),
+            self._campagne(id="c-03", ready=1),
+            self._campagne(id="c-04", state="closed"),
+        ])
+        self.assertEqual(g["enCours"], ["c-01", "c-03"])
+        self.assertEqual(g["autres"], ["c-02", "c-04"])
+
+
+class TestOngletFusionne(CarteTestCase):
+    """Un seul bandeau par colonne du mur (t-49), à la place du select natif et de la
+    ligne identifiant/projet/état/session que répétait le panneau juste en dessous."""
+
+    def test_le_select_de_chantier_a_disparu_du_mur(self):
+        self.assertNotIn("<select", carte.page())
+
+    def test_longlet_est_un_bouton_qui_ouvre_une_liste_accessible(self):
+        page = carte.page()
+        self.assertIn('aria-haspopup","listbox"', page)
+        self.assertIn('role","listbox"', page)
+        self.assertIn('role","option"', page)
+
+    def test_longlet_souvre_au_clavier_et_se_deplace_dans_la_liste(self):
+        page = carte.page()
+        self.assertIn("function onTabKeydown", page)
+        for touche in ("ArrowDown", "ArrowUp", "Enter", "Escape"):
+            self.assertIn(touche, page)
+
+    def test_le_focus_du_bouton_donglet_reste_visible(self):
+        self.assertIn(".chead .tab:focus-visible{", carte.page())
+
+    def test_le_popover_porte_deux_groupes_separes_par_un_separateur_visible(self):
+        page = carte.page()
+        self.assertIn('"opt-group"', page)
+        self.assertIn('role","separator"', page)
+        self.assertIn(".tablist .opt-sep{", page)
+
+    def test_la_mention_eta_precede_lheure_sur_londlget(self):
+        self.assertIn('"ETA "', carte._MUR_JS)
+
+    def test_longlet_porte_le_pourcentage_le_restant_et_leta(self):
+        # Les trois valeurs viennent du dernier message reçu (td), jamais d'un nouveau
+        # calcul sur les données brutes du mur (voir peindreTab()).
+        debut = carte._MUR_JS.index("function peindreTab")
+        fin = carte._MUR_JS.index("function optionsListe")
+        corps = carte._MUR_JS[debut:fin]
+        self.assertIn("col.tpct.textContent=td?td.pct:", corps)
+        self.assertIn("col.trest.textContent=connu?td.restant:", corps)
+        self.assertIn('"ETA "+td.heure', corps)
+
+    def test_londlget_ne_recalcule_jamais_les_trois_valeurs_du_panneau(self):
+        # Elles voyagent par message (annoncerOnglet, dans _JS) : le mur ne doit jamais
+        # relire finChantier() ni dureeMin(), sous peine de les recalculer une seconde
+        # fois avec une autre horloge que celle du panneau.
+        self.assertNotIn("finChantier(", carte._MUR_JS)
+        self.assertNotIn("dureeMin(", carte._MUR_JS)
+        self.assertIn("ordoOnglet", carte._MUR_JS)
+
+    def test_le_panneau_masque_son_propre_bandeau_une_fois_dans_le_mur(self):
+        # t-57 : #top disparaît en entier dans le mur (h1, #segs et #bar), pas seulement
+        # son h1 -- la progression et les alertes vivent désormais dans l'onglet.
+        self.assertIn('classList.add("embarque")', carte._JS)
+        self.assertIn("html.embarque #top{display:none}", carte._CSS)
+
+    def test_le_panneau_narrete_pas_dannoncer_quand_le_restant_est_inconnu(self):
+        # paintHeure() sortait tôt sans rien dire côté mur quand restantChantierMin est
+        # None (brief t-38) : l'onglet resterait alors bloqué sur la dernière valeur
+        # connue au lieu de se vider.
+        js = carte._JS
+        debut = js.index("function paintHeure")
+        fin = js.index("function paintTop")
+        corps = js[debut:fin]
+        self.assertIn("annoncerOnglet(connu", corps)
+        self.assertNotIn("if(!connu)return", corps)
+
+
+class TestSecondeLigneDeLOnglet(CarteTestCase):
+    """t-57 : la progression par phase et les alertes qui vivaient au-dessus du graphe,
+    cernées de marges et sur deux bandeaux distincts, deviennent la seconde ligne de
+    l'onglet -- portée par la colonne du mur, jamais par le panneau qu'elle embarque."""
+
+    def _peindre(self, td: dict | None) -> dict:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS du mur")
+        js = carte._MUR_JS
+        debut = js.index("function peindreProgres")
+        fin = js.index("// Construit les options du popover")
+        script = (
+            "function makeEl(){var e={hidden:false,textContent:'',title:'',className:'',"
+            "style:{},children:[],firstChild:null};"
+            "e.appendChild=function(c){this.children.push(c);"
+            "this.firstChild=this.children[0]||null;return c};"
+            "e.removeChild=function(c){var i=this.children.indexOf(c);"
+            "if(i>=0)this.children.splice(i,1);this.firstChild=this.children[0]||null};"
+            "return e}\n"
+            "var document={createElement:function(){return makeEl()}};\n"
+            + js[debut:fin]
+            + "\nvar col={trow2:makeEl(),tsegs:makeEl(),twarn:makeEl(),tdemande:makeEl()};"
+            + "\npeindreProgres(col," + json.dumps(td) + ");"
+            + "\nprocess.stdout.write(JSON.stringify({"
+            + "trow2Hidden:col.trow2.hidden,segCount:col.tsegs.children.length,"
+            + "warnHidden:col.twarn.hidden,warnText:col.twarn.textContent,"
+            + "askHidden:col.tdemande.hidden,askText:col.tdemande.textContent}));"
+        )
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    # -- c9 : colonne sans donnée -----------------------------------------------------
+
+    def test_colonne_sans_message_encore_recu_naffiche_rien(self):
+        r = self._peindre(None)
+        self.assertTrue(r["trow2Hidden"])
+        self.assertEqual(r["segCount"], 0)
+        self.assertTrue(r["warnHidden"])
+        self.assertTrue(r["askHidden"])
+
+    def test_chantier_sans_phase_ni_alerte_naffiche_rien(self):
+        r = self._peindre({"phases": [], "warn": 0, "ask": 0})
+        self.assertTrue(r["trow2Hidden"])
+        self.assertEqual(r["segCount"], 0)
+
+    # -- c3 : progression par phase portée par l'onglet --------------------------------
+
+    def test_la_progression_par_phase_arrive_sur_londlget(self):
+        td = {"phases": [
+            {"key": "1", "nom": "Fondation", "dn": 2, "total": 5},
+            {"key": "2", "nom": "Exécution", "dn": 0, "total": 3},
+        ], "warn": 0, "ask": 0}
+        r = self._peindre(td)
+        self.assertFalse(r["trow2Hidden"])
+        self.assertEqual(r["segCount"], 2)
+
+    # -- c4 : alertes sur la même ligne que la progression ------------------------------
+
+    def test_les_alertes_partagent_le_conteneur_de_la_progression(self):
+        # trow2 est l'unique conteneur des deux : segments et pastilles y sont des
+        # enfants directs, jamais deux lignes distinctes ni deux hidden séparés.
+        td = {"phases": [{"key": "1", "dn": 1, "total": 1}], "warn": 3, "ask": 2}
+        r = self._peindre(td)
+        self.assertFalse(r["trow2Hidden"])
+        self.assertEqual(r["segCount"], 1)
+        self.assertFalse(r["warnHidden"])
+        self.assertEqual(r["warnText"], 3)
+        self.assertFalse(r["askHidden"])
+        self.assertEqual(r["askText"], "2 choix")
+
+    def test_une_pastille_sans_alerte_reste_cachee_meme_avec_de_la_progression(self):
+        td = {"phases": [{"key": "1", "dn": 1, "total": 1}], "warn": 0, "ask": 0}
+        r = self._peindre(td)
+        self.assertFalse(r["trow2Hidden"])
+        self.assertTrue(r["warnHidden"])
+        self.assertTrue(r["askHidden"])
+
+    # -- c6 : la seconde ligne vit dans l'onglet, jamais dans le panneau ----------------
+
+    def test_la_seconde_ligne_est_construite_dans_l_onglet_du_mur(self):
+        js = carte._MUR_JS
+        debut = js.index("function creer(col)")
+        fin = js.index("function envoyerAuPanneau")
+        corps = js[debut:fin]
+        self.assertIn('row2.className="trow2"', corps)
+        # DANS l'onglet, plus sous lui : le bandeau ne doit montrer qu'un seul objet
+        # portant tout l'état du chantier, pas un sélecteur puis une barre séparée.
+        # C'est aussi ce qui oblige .tab à être un div role=button -- les chips d'alerte
+        # que row2 porte sont des boutons, et un bouton dans un bouton ne reçoit
+        # jamais son clic.
+        self.assertIn("tab.appendChild(row2);", corps)
+        self.assertNotIn("h.appendChild(row2)", corps)
+        self.assertIn('tab.setAttribute("role","button")', corps)
+        # Jamais posée sur l'iframe ni renvoyée au panneau : construite et tenue par le
+        # mur, qui ne fait que RECEVOIR les valeurs du panneau (annoncerOnglet), jamais
+        # l'inverse.
+        self.assertNotIn("f.appendChild", corps)
+
+    def test_le_panneau_ne_construit_plus_sa_propre_ligne_dans_le_mur(self):
+        # Toujours vrai après t-57 : #top (identité, progression, alertes) disparaît en
+        # entier une fois embarqué -- voir TestOngletFusionne.
+        self.assertIn("html.embarque #top{display:none}", carte._CSS)
+
+    # -- c5 : les alertes restent cliquables à leur nouvelle place ---------------------
+
+    def test_les_pastilles_de_londlget_relaient_le_clic_au_panneau(self):
+        js = carte._MUR_JS
+        debut = js.index("function creer(col)")
+        fin = js.index("function envoyerAuPanneau")
+        corps = js[debut:fin]
+        self.assertIn('envoyerAuPanneau(col,"warn")', corps)
+        self.assertIn('envoyerAuPanneau(col,"ask")', corps)
+        debut2 = js.index("function envoyerAuPanneau")
+        fin2 = js.index("function dessiner")
+        self.assertIn('postMessage({ordoOuvrir:quoi}', js[debut2:fin2])
+
+    def test_le_panneau_ouvre_le_meme_calque_quand_le_mur_le_demande(self):
+        # ordoOuvrir déclenche basculerWarn()/basculerAsk(), les MÊMES fonctions que le
+        # clic local sur #warnchip/#askchip (t-48) : jamais un second mécanisme écrit
+        # pour la même idée.
+        js = carte._JS
+        self.assertIn('if(msg.ordoOuvrir==="warn")basculerWarn();', js)
+        self.assertIn('else if(msg.ordoOuvrir==="ask")basculerAsk();', js)
+        self.assertIn('if(wc)wc.addEventListener("click",basculerWarn);', js)
+        self.assertIn('if(ac)ac.addEventListener("click",basculerAsk);', js)
+
+    # -- transmission des données (préalable à c3/c4) -----------------------------------
+
+    def test_le_panneau_transmet_les_phases_et_les_compteurs_dalerte(self):
+        js = carte._JS
+        debut = js.index("function annoncerOnglet")
+        fin = js.index("function paintTop")
+        corps = js[debut:fin]
+        self.assertIn("phases: resumePhases(),", corps)
+        self.assertIn("warn: (D&&D.warnings&&D.warnings.length)||0,", corps)
+        self.assertIn("ask: (D&&D.questions&&D.questions.length)||0,", corps)
+
+    def test_segs_et_londlget_partagent_le_meme_resume_de_phases(self):
+        # #segs (page seule ou panneau visité hors mur) et l'onglet du mur lisent le même
+        # calcul : jamais deux décomptes qui pourraient diverger.
+        js = carte._JS
+        debut = js.index("function paintTop")
+        fin = js.index('document.getElementById("cid")')
+        corps = js[debut:fin]
+        self.assertIn("resumePhases().forEach(function(p){", corps)
+        self.assertNotIn("D.phases.forEach", corps)
+
+
+# ---------------------------------------------------------------------------
+# Options du popover au style de l'onglet (t-56, retouche indépendante)
+# ---------------------------------------------------------------------------
+
+
+class TestOptionsDuPopoverAuStyleDeLOnglet(CarteTestCase):
+    """t-49 affichait un simple libelle() en texte brut par option -- un autre genre que
+    l'onglet soigné qu'elle produit une fois choisie (nom, pourcentage, restant, ETA,
+    seconde ligne de progression depuis t-57). Chaque option reprend désormais
+    exactement cette structure, avec les mêmes classes CSS (donc les mêmes teintes),
+    sauf ce qu'aucune iframe fermée ne peut connaître -- restant et ETA d'un chantier
+    qu'aucune colonne de CE mur n'a déjà ouvert."""
+
+    def _fonctions(self) -> str:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS du mur")
+        js = carte._MUR_JS
+        debut = js.index("var cols=[], seq=0, campagnes=[], monte=false, timer=null;")
+        fin = js.index("function optionsListe(col){")
+        return js[debut:fin]
+
+    def _peindre(self, c: dict, cols_ouvertes: list[dict]) -> dict:
+        script = (
+            "function makeEl(){var e={hidden:false,textContent:'',title:'',className:'',"
+            "style:{},children:[],firstChild:null};"
+            "e.appendChild=function(ch){this.children.push(ch);"
+            "this.firstChild=this.children[0]||null;return ch};"
+            "e.removeChild=function(ch){var i=this.children.indexOf(ch);"
+            "if(i>=0)this.children.splice(i,1);this.firstChild=this.children[0]||null};"
+            "return e}\n"
+            "var document={createElement:function(){return makeEl()},"
+            "createTextNode:function(t){var e=makeEl();e.textContent=t;return e}};\n"
+            + self._fonctions()
+            + "\ncols=" + json.dumps(cols_ouvertes) + ";"
+            + "\nvar li=makeEl();"
+            + "\npeindreOption(li," + json.dumps(c) + ");"
+            + "\nvar row1=li.children[0], row2=li.children[1];"
+            + "\nvar dot=row1.children[0], nom=row1.children[1], fin=row1.children[2];"
+            + "\nvar trest=fin.children[0], teta=fin.children[1], tpct=fin.children[2];"
+            + "\nprocess.stdout.write(JSON.stringify({"
+            + "row1Classe:row1.className,row2Classe:row2.className,"
+            + "dotClasse:dot.className,nomTexte:nom.textContent,"
+            + "trestCache:trest.hidden,tetaCache:teta.hidden,tpctTexte:tpct.textContent,"
+            + "trestTexte:trest.textContent,"
+            + "tsegsEnfants:row2.children[0].children.length,"
+            + "twarnCache:row2.children[1].hidden,tdemandeCache:row2.children[2].hidden}));"
+        )
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    def _campagne(self, **kw) -> dict:
+        base = {
+            "home": "/tmp/ordo-home", "id": "c-1", "slug": "demo", "state": "open",
+            "asking": 0, "running": 0, "ready": 0, "done": 3, "total": 10,
+        }
+        base.update(kw)
+        return base
+
+    # -- structure : mêmes classes que l'onglet, donc mêmes teintes et espacements -----
+
+    def test_loption_reprend_les_deux_rangees_de_londlget(self):
+        c = self._campagne()
+        r = self._peindre(c, [])
+        self.assertEqual(r["row1Classe"], "orow1")
+        self.assertEqual(r["row2Classe"], "trow2")
+
+    def test_loption_porte_les_memes_classes_terminales_que_londlget(self):
+        js = carte._MUR_JS
+        debut = js.index("function peindreOption(li,c){")
+        fin = js.index("function optionsListe(col){")
+        corps = js[debut:fin]
+        for classe in (
+            'dot.className="tdot ', 'nom.className="tnom"', 'fin.className="tfin"',
+            'trest.className="trest"', 'teta.className="teta"', 'tpct.className="tpct"',
+            'tsegs.className="tsegs"', 'twarn.className="tchip"', 'tdemande.className="tchip"',
+        ):
+            self.assertIn(classe, corps)
+
+    def test_le_nom_de_loption_est_le_slug_ou_lid(self):
+        c = self._campagne(slug="mon-chantier")
+        r = self._peindre(c, [])
+        self.assertEqual(r["nomTexte"], "mon-chantier")
+
+    # -- rien d'estimé : ni restant, ni ETA, exactement comme l'onglet (DEUX LIMITES) --
+
+    def test_un_chantier_ouvert_nulle_part_sur_ce_mur_na_rien_destime(self):
+        c = self._campagne()
+        r = self._peindre(c, [])
+        self.assertEqual(r["tpctTexte"], "")
+        self.assertTrue(r["trestCache"])
+        self.assertTrue(r["tetaCache"])
+        self.assertEqual(r["tsegsEnfants"], 0)
+        self.assertTrue(r["twarnCache"])
+        self.assertTrue(r["tdemandeCache"])
+
+    def test_une_option_najoute_jamais_de_restant_que_londlget_ne_connait_pas(self):
+        # c9 de t-57, DEUX LIMITES du brief : td connu=false -> pct porté, restant/ETA
+        # masqués, exactement le contrat de peindreTab().
+        c = self._campagne()
+        col_ouverte = {
+            "home": "/tmp/ordo-home", "campaign": "c-1",
+            "tabData": {"pct": "30%", "connu": False, "phases": [], "warn": 0, "ask": 0},
+        }
+        r = self._peindre(c, [col_ouverte])
+        self.assertEqual(r["tpctTexte"], "30%")
+        self.assertTrue(r["trestCache"])
+        self.assertTrue(r["tetaCache"])
+
+    # -- un chantier déjà ouvert ailleurs sur ce mur porte son tabData réel ------------
+
+    def test_un_chantier_deja_ouvert_ailleurs_porte_son_tabdata_reel(self):
+        c = self._campagne()
+        col_ouverte = {
+            "home": "/tmp/ordo-home", "campaign": "c-1",
+            "tabData": {
+                "pct": "42%", "connu": True, "restant": "1h20", "heure": "17h05", "jours": 0,
+                "phases": [{"key": "1", "nom": "Fondation", "dn": 2, "total": 5}],
+                "warn": 1, "ask": 0,
+            },
+        }
+        r = self._peindre(c, [col_ouverte])
+        self.assertEqual(r["tpctTexte"], "42%")
+        self.assertFalse(r["trestCache"])
+        self.assertEqual(r["trestTexte"], "1h20")
+        self.assertFalse(r["tetaCache"])
+        self.assertEqual(r["tsegsEnfants"], 1)
+        self.assertFalse(r["twarnCache"])
+        self.assertTrue(r["tdemandeCache"])
+
+    # -- point du brief : jamais interactive au-delà du clic global sur l'option -------
+
+    def test_les_pastilles_dune_option_ne_sont_jamais_des_boutons(self):
+        js = carte._MUR_JS
+        debut = js.index("function peindreOption(li,c){")
+        fin = js.index("function optionsListe(col){")
+        corps = js[debut:fin]
+        self.assertNotIn('document.createElement("button")', corps)
+        self.assertNotIn("addEventListener", corps)
+
+    def test_peindreoption_reutilise_peindreprogres_sans_le_dupliquer(self):
+        js = carte._MUR_JS
+        debut = js.index("function peindreOption(li,c){")
+        fin = js.index("function optionsListe(col){")
+        corps = js[debut:fin]
+        self.assertIn(
+            "peindreProgres({trow2:trow2,tsegs:tsegs,twarn:twarn,tdemande:tdemande},td);",
+            corps,
+        )
+        self.assertNotIn("p.total||1", corps)  # la boucle de segments n'est pas recopiée
+
+    # -- limites du brief : le groupement en cours/autres ne bouge pas -----------------
+
+    def test_le_groupement_en_cours_autres_ne_bouge_pas(self):
+        js = carte._MUR_JS
+        self.assertIn('bloc("en cours",g.enCours);', js)
+        self.assertIn('bloc("autres",g.autres);', js)
+        self.assertIn('sep.className="opt-sep";', js)
+
+
 class TestSessionSurLaCase(CarteTestCase):
     """Le contexte du dernier tour d'une session en cours, lisible sans ouvrir la case.
 
@@ -1811,13 +2366,13 @@ class TestProgressionSurLaCase(CarteTestCase):
         page = carte.html(carte.model(self.chantier))
         self.assertIn('el("div","rprog")', page)
         avant_meta = page.index('el("div","rprog")')
-        garde_meta = page.index('if(S.view!=="graphe"||sel){')
+        garde_meta = page.index('if(sel){')
         self.assertLess(avant_meta, garde_meta)
 
     def test_le_libelle_du_critere_est_a_cote_du_compteur_dans_la_meme_ligne(self):
         self._add("0.1 a", checklist=["c un"])
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        bloc = page[page.index('el("div","rprog")'):page.index('if(sel){')]
         self.assertIn('el("span","cnt",t.checkDone+"/"+t.checkTotal)', bloc)
         self.assertIn('el("span","doing",t.doing)', bloc)
 
@@ -1863,7 +2418,7 @@ class TestEcritureDuRapportEnCours(CarteTestCase):
         # champ vide.
         self._add("0.1 a", checklist=["c un"])
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        bloc = page[page.index('el("div","rprog")'):page.index('if(sel){')]
         self.assertIn('if(k==="finishing"){', bloc)
         self.assertIn(
             'el("span","doing rapport","Écriture du rapport en cours")', bloc,
@@ -1885,7 +2440,7 @@ class TestEcritureDuRapportEnCours(CarteTestCase):
         # seule et même condition -- jamais deux blocs indépendants qui pourraient un jour
         # diverger ou s'afficher ensemble.
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        bloc = page[page.index('el("div","rprog")'):page.index('if(sel){')]
         self.assertIn(
             'if(k==="finishing"){\n'
             '        prog.appendChild(el("span","doing rapport",'
@@ -1902,7 +2457,7 @@ class TestEcritureDuRapportEnCours(CarteTestCase):
         # périmé après la fin de la tâche (voir chantier.check, qui ne le vide que si
         # l'item déclaré est celui qu'on coche).
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index('el("div","rprog")'):page.index('if(S.view!=="graphe"||sel){')]
+        bloc = page[page.index('el("div","rprog")'):page.index('if(sel){')]
         garde = bloc.index('if(t.status==="running"){')
         rapport = bloc.index("doing rapport")
         libelle = bloc.index('el("span","doing",t.doing)')
@@ -1917,12 +2472,119 @@ class TestEcritureDuRapportEnCours(CarteTestCase):
         # garde-fou if(t.checkTotal) enveloppe la construction entière de rprog, y compris
         # la mention de fin de rapport.
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index("function rowNode(t){"):page.index('if(S.view!=="graphe"||sel){')]
+        bloc = page[page.index("function rowNode(t){"):page.index('if(sel){')]
         garde = bloc.index("if(t.checkTotal){")
         prog = bloc.index('el("div","rprog")')
         rapport = bloc.index("doing rapport")
         self.assertLess(garde, prog)
         self.assertLess(garde, rapport)
+
+
+# ---------------------------------------------------------------------------
+# Tâche jamais commencée : une ligne, rien de plus (brief t-58, points 4 et 5)
+# ---------------------------------------------------------------------------
+
+
+class TestTacheJamaisCommencee(CarteTestCase):
+    """Une tâche jamais commencée n'a rien à dire qu'un titre : sa checklist vaut 0/N, ses
+    jetons et son temps écoulé n'existent pas -- un "0/9" n'apprend rien que le titre ne
+    dise déjà. Attention, "jamais commencée" n'est pas "sans critère coché" : une tâche
+    relancée après un échec a pu tourner sans rien cocher, elle garde son affichage
+    complet, son temps écoulé est une information (voir jamaisCommencee())."""
+
+    def _page(self) -> str:
+        self._add("0.1 a", checklist=["c un", "c deux"])
+        return carte.html(carte.model(self.chantier))
+
+    def _bloc_rownode(self, page: str) -> str:
+        return page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+
+    def test_jamais_commencee_exige_aucun_critere_coche_et_aucun_depart(self):
+        # c10 : les deux conditions ensemble, jamais l'une sans l'autre -- c'est ce qui
+        # distingue une tâche vierge d'une tâche relancée après un échec (checkDone à 0
+        # mais elapsedS déjà posé par le premier passage).
+        page = self._page()
+        self.assertIn(
+            "function jamaisCommencee(t){return t.checkDone===0&&t.elapsedS==null}", page,
+        )
+
+    def test_une_tache_jamais_lancee_perd_sa_ligne_de_progression(self):
+        # c10 : jamaisLancee vient s'ajouter au garde-fou existant de rprog (!condense),
+        # sans toucher à sa condition interne ni à celle des tests qui la découpent au
+        # caractère près (TestEcritureDuRapportEnCours).
+        page = self._page()
+        bloc = self._bloc_rownode(page)
+        self.assertIn("if(!condense&&!jamaisLancee){", bloc)
+
+    def test_lidentifiant_et_le_titre_rejoignent_la_meme_ligne_si_jamais_lancee(self):
+        # c10 : le titre rejoint l'en-tête (même ligne que l'identifiant) au lieu
+        # d'ouvrir sa propre ligne, seulement pour une tâche vierge et fermée.
+        page = self._page()
+        bloc = self._bloc_rownode(page)
+        self.assertIn('head.appendChild(el("span","rtitle",t.title));', bloc)
+        self.assertIn('row.appendChild(el("div","rtitle",t.title));', bloc)
+
+    def test_la_case_vierge_repasse_len_tete_en_flux_normal(self):
+        # c10 : .rhead reste flex pour toute case active (id + liens), mais redevient un
+        # flux de texte normal pour une case vierge -- c'est ce flux, pas un calcul de
+        # largeur, qui fait passer le titre à la ligne suivante seulement s'il ne tient
+        # pas.
+        page = self._page()
+        self.assertIn(".row.vierge:not(.sel) .rhead{display:block}", page)
+
+    def test_un_espace_franc_separe_lidentifiant_et_le_titre(self):
+        # c10, constaté par l'humain sur le premier rendu : le flux normal ne pose AUCUN
+        # espace entre deux éléments en ligne -- sans marge explicite, le titre collerait
+        # à l'identifiant. Même valeur que le gap habituel de .rhead en mode flex (7px),
+        # jamais une valeur inventée. Vérifié en pixels réels (pas à l'oeil) par le
+        # script Playwright dédié à la mesure de hauteur (voir le rapport de la tâche).
+        page = self._page()
+        self.assertIn(".row.vierge:not(.sel) .rtitle{margin-left:7px}", page)
+
+    def test_une_tache_relancee_apres_echec_garde_son_affichage_complet(self):
+        # Le point de prudence du brief : checkDone à 0 mais un premier passage déjà
+        # daté (startedAt posé) -- jamaisCommencee() doit rendre faux, prouvé au niveau
+        # des données que rowNode() consomme (voir la garde ci-dessus, qui lit ces deux
+        # mêmes champs).
+        a = self._add("0.1 a", checklist=["c un"])
+        self._set_state(a["id"], state="failed", startedAt="2020-01-01T00:00:00Z")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["checkDone"], 0)
+        self.assertIsNotNone(t["elapsedS"])
+
+    def test_jetons_et_temps_absents_dune_tache_jamais_lancee(self):
+        # c11 : durée et jetons sont des chaînes vides dès que la tâche n'a jamais
+        # tourné (elapsedS/usage tous deux absents) -- rowNode ne les affiche que si la
+        # chaîne est non vide (voir "if(durTxt)" et "if(t.tokens&&!condense)").
+        a = self._add("0.1 a")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertEqual(t["duree"], "")
+        self.assertEqual(t["tokens"], "")
+        page = carte.html(carte.model(self.chantier))
+        bloc = self._bloc_rownode(page)
+        self.assertIn("if(durTxt)links.appendChild(", bloc)
+        self.assertIn('if(t.tokens&&!condense){', bloc)
+
+    def test_jetons_et_temps_presents_sur_une_tache_qui_tourne(self):
+        # c11, l'autre sens : dès que la tâche tourne, sa durée redevient non vide -- la
+        # garde plus haut n'est jamais un silence permanent, seulement conditionnel.
+        a = self._add("0.1 a")
+        self._set_state(a["id"], state="running", startedAt="2020-01-01T00:00:00Z")
+        t = carte.vue(carte.model(self.chantier))["tasks"][0]
+        self.assertNotEqual(t["duree"], "")
+
+    def test_une_tache_annulee_avant_tout_depart_nest_pas_vierge(self):
+        # Régression : une tâche ANNULÉE sans jamais avoir tourné est à la fois
+        # jamaisCommencee() (checkDone à 0, elapsedS nul) ET settled() -- sans cette
+        # exclusion, elle recevrait à la fois la mise en page du repli de tâche (t-44,
+        # brief t-58 point 2 : "vérifie que les trois cohabitent") et celle de la case
+        # vierge, deux mises en page incompatibles sur la même case. jamaisLancee doit
+        # rester faux dans ce cas -- le repli de tâche la prend déjà en charge.
+        page = carte.html(carte.model(self.chantier))
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertIn(
+            "var jamaisLancee=jamaisCommencee(t)&&!sel&&!settled(t);", bloc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1940,47 +2602,47 @@ class TestPliageDesPhases(CarteTestCase):
         self._add("0.1 a")
         return carte.html(carte.model(self.chantier))
 
-    def test_le_defaut_d_ouverture_vient_des_taches_en_cours_pas_du_filtre(self):
-        # Avant : une phase s'ouvrait par défaut sauf si le filtre "reste" et qu'elle était
-        # finie -- une phase jamais commencée restait ouverte, ce que le brief interdit.
+    def test_le_defaut_d_ouverture_est_linverse_de_fini(self):
+        # c12/c13 (brief t-58, point 6) : au premier rendu, avant tout choix de l'humain,
+        # seule une phase FINIE (toutes ses tâches réglées) part fermée -- toute autre,
+        # y compris celle dont aucune tâche n'a encore démarré, part OUVERTE. Fini le
+        # filet à une seule phase (t-18) : chaque phase décide pour elle-même, sans
+        # dépendre de ce qui tourne ailleurs dans la campagne.
         page = self._page()
-        self.assertIn('running=all.some(function(t){return t.status==="running"})', page)
+        self.assertIn("var defautOuvert=!fini;", page)
         self.assertIn("forced===undefined?defautOuvert:!forced", page)
-        self.assertNotIn('S.filter==="reste"&&fini', page)
 
     def test_le_forcage_manuel_decide_seul_quand_il_est_pose(self):
         # La même expression que ci-dessus le prouve structurellement : quand `forced` est
-        # défini, seul `!forced` compte dans la branche -- jamais `defautOuvert`, donc jamais
-        # `running`. Un changement d'état qui rouvrirait ou refermerait une phase forcée
-        # casserait cette chaîne.
+        # défini, seul `!forced` compte dans la branche -- jamais `defautOuvert`. Un
+        # changement d'état qui rouvrirait ou refermerait une phase forcée casserait
+        # cette chaîne.
         page = carte.panneau("/tmp/ordo-home", "c-7")
         self.assertIn("forced===undefined?defautOuvert:!forced", page)
 
-    def test_rien_ne_tourne_la_première_phase_à_finir_reste_ouverte(self):
-        # t-18 : entre deux tâches, plus aucune phase ne porte de tâche en cours -- avant
-        # ce filet, `running` valait faux partout et l'écran se repliait en entier, l'inverse
-        # du but recherché. `defautOuvert` retombe alors sur la première phase de l'ordre du
-        # graphe qui porte encore une tâche ni finie ni annulée.
+    def test_une_phase_entierement_finie_reste_fermee(self):
+        # c13 : `fini` (déjà calculé pour la condensation) vaut aussi de défaut
+        # d'ouverture -- une phase où tout est fait ou annulé n'a plus rien à montrer en
+        # tête de mur.
         page = self._page()
         self.assertIn(
-            'var anyRunning=D.phases.some(function(p){\n'
-            '    return p.order.map(function(i){return byId[i]}).filter(Boolean)\n'
-            '      .some(function(t){return t.status==="running"});\n'
-            '  });',
-            page,
+            "var fini=all.length>0&&all.every(settled);", page,
         )
-        self.assertIn(
-            'if(all.some(function(t){return !settled(t)})){defaultKey=p.key;return true}',
-            page,
-        )
-        self.assertIn("var defautOuvert=anyRunning?running:(p.key===defaultKey);", page)
+        avant_fini = page.index("var fini=all.length>0&&all.every(settled);")
+        avant_defaut = page.index("var defautOuvert=!fini;")
+        self.assertLess(avant_fini, avant_defaut)
 
-    def test_une_tâche_qui_démarre_rend_la_main_au_repli_normal(self):
-        # Dès qu'une tâche tourne quelque part, `anyRunning` est vrai et `defautOuvert`
-        # retombe exactement sur `running` -- le comportement de t-13, phase par phase, sans
-        # plus aucune trace du filet de repli.
+    def test_une_phase_jamais_commencee_souvre(self):
+        # c12 : aucune tâche démarrée ne rend pas `fini` vrai (aucune n'est réglée), donc
+        # `defautOuvert` reste vrai -- exactement le cas que camcast montrait fermé à
+        # tort avant cette retouche.
         page = self._page()
-        self.assertIn("var defautOuvert=anyRunning?running:(p.key===defaultKey);", page)
+        self.assertIn("var defautOuvert=!fini;", page)
+        # Régression : l'ancien filet à une seule phase (anyRunning/defaultKey) a disparu,
+        # pas seulement contourné -- sinon une phase jamais commencée resterait fermée
+        # dès qu'une autre phase de la campagne tourne.
+        self.assertNotIn("anyRunning", page)
+        self.assertNotIn("defaultKey", page)
 
     def test_les_phases_finies_repliees_se_regroupent_en_bande_condensee(self):
         page = self._page()
@@ -2026,8 +2688,104 @@ class TestPliageDesPhases(CarteTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Condensation des tâches réglées : t-13 un cran plus bas (t-24)
+# Rang sans voisin : la case reprend la largeur libre (brief t-58, point 7)
 # ---------------------------------------------------------------------------
+
+
+class TestRangSansVoisinReprendLaLargeur(CarteTestCase):
+    """Le placement par rang (une colonne par niveau de dépendance, de gauche à droite,
+    retour à la ligne quand ça ne tient plus) ne change pas : lui seul décide QUELS
+    rangs partagent une ligne. Seule la LARGEUR d'un rang qui n'a personne à sa droite
+    sur sa ligne change -- mesurée sur le DOM réel, puisque le flex-wrap ne dit lui-même
+    jamais où une ligne casse (voir elargirRangsSansVoisin())."""
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_la_fonction_de_mesure_existe_et_est_appelee_au_rendu(self):
+        # c14 : appelée pour chaque phase OUVERTE une fois ses rangs attachés au DOM --
+        # jamais sur une phase fermée (display:none), où la mesure ne voudrait rien dire.
+        page = self._page()
+        self.assertIn("function elargirRangsSansVoisin(rangsEl){", page)
+        self.assertIn("if(open)elargirRangsSansVoisin(rangs);", page)
+
+    def test_le_placement_par_rang_et_niveau_nest_pas_touche(self):
+        # Précaution 1 du brief : le calcul des rangs (parNiveau, le tri par niveau, le
+        # flex-wrap qui revient à la ligne) reste exactement celui d'avant -- seule la
+        # largeur d'un rang change, jamais son contenu ni son ordre.
+        page = self._page()
+        self.assertIn(
+            "reste.forEach(function(t){(parNiveau[t.level]=parNiveau[t.level]||[]).push(t)});",
+            page,
+        )
+
+    def test_un_rang_sans_voisin_a_sa_droite_recoit_la_classe_etire(self):
+        # c14 : le dernier rang d'une ligne qui ne se remplit pas -- seul ou non --
+        # reçoit la classe qui lève son plafond de largeur ; flex-grow (déjà posé sur
+        # .rang) fait le reste, aucun calcul de pixel n'est écrit à la main ici.
+        page = self._page()
+        bloc = page[
+            page.index("function elargirRangsSansVoisin(rangsEl){"):
+            page.index("function render(){")
+        ]
+        self.assertIn('rangs[j].classList.add("etire")', bloc)
+        self.assertIn(".view-graphe .rang.etire{max-width:none}", page)
+
+    def test_un_rang_plein_ne_recoit_jamais_la_classe_etire(self):
+        # c15 : la classe n'est posée QUE quand il reste de la place après le dernier
+        # rang d'une ligne (un seuil de tolérance couvre l'arrondi des sous-pixels) --
+        # jamais inconditionnellement.
+        page = self._page()
+        bloc = page[
+            page.index("function elargirRangsSansVoisin(rangsEl){"):
+            page.index("function render(){")
+        ]
+        self.assertIn("if(cadre.right-droite>2)", bloc)
+        avant_condition = bloc.index("if(cadre.right-droite>2)")
+        avant_classe = bloc.index('rangs[j].classList.add("etire")')
+        self.assertLess(avant_condition, avant_classe)
+
+
+# ---------------------------------------------------------------------------
+# Compteurs de liens : partis de la case fermée, gardés au détail (brief t-58)
+# ---------------------------------------------------------------------------
+
+
+class TestCompteursDeLiensSurLaCase(CarteTestCase):
+    """Le nombre de dépendances et de dépendantes (les flèches ↑/↓) n'a de lecteur
+    qu'une fois la tâche ouverte : personne ne les lit sans ouvrir la case, et ils
+    occupaient le coin haut droit au moment où la place manque le plus (point 1)."""
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_la_case_fermee_ne_construit_plus_les_compteurs_de_liens(self):
+        # c2 : ni la classe "nup"/"ndown"/"nnone", ni le chiffre "↑"/"↓" ne sont plus
+        # construits par rowNode -- recherché sur le seul corps de la fonction, pour ne
+        # pas confondre avec le chip .col de detailNode plus bas (qui, lui, doit rester).
+        page = self._page()
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertNotIn('t.deps.length?"nup"', bloc)
+        self.assertNotIn('t.dependants.length?"ndown"', bloc)
+        self.assertNotIn('"nnone"', bloc)
+
+    def test_les_teintes_nup_ndown_nnone_ont_quitte_la_feuille_de_style(self):
+        # c2, pas de couleur morte : une classe qui ne se pose plus nulle part n'a plus
+        # sa règle dans _CSS.
+        page = self._page()
+        self.assertNotIn(".nup{", page)
+        self.assertNotIn(".ndown{", page)
+        self.assertNotIn(".nnone{", page)
+
+    def test_le_detail_garde_le_compte_des_dependances_et_des_dependantes(self):
+        # c3 : la chaîne attend/débloque du panneau de détail (déjà existante) porte
+        # toujours ces deux chiffres -- rien à construire, seulement vérifier qu'ils n'ont
+        # pas disparu avec le retrait ci-dessus.
+        page = self._page()
+        self.assertIn('el("div","k up","attend ("+t.deps.length+")")', page)
+        self.assertIn('el("div","k down","débloque ("+t.dependants.length+")")', page)
 
 
 class TestCondensationDesTachesReglees(CarteTestCase):
@@ -2055,24 +2813,23 @@ class TestCondensationDesTachesReglees(CarteTestCase):
         # les tests de TestEcritureDuRapportEnCours, qui découpent ce bloc au caractère
         # près, doivent rester valables tels quels.
         page = carte.html(carte.model(self.chantier))
-        bloc = page[page.index("function rowNode(t){"):page.index('if(S.view!=="graphe"||sel){')]
-        garde = bloc.index("if(!condense){")
+        bloc = page[page.index("function rowNode(t){"):page.index('if(sel){')]
+        garde = bloc.index("if(!condense&&!jamaisLancee){")
         interne = bloc.index("if(t.checkTotal){")
         self.assertLess(garde, interne)
 
-    def test_la_duree_le_modele_et_les_compteurs_de_dependances_restent_inconditionnels(self):
-        # c4 : ce que la case garde n'est jamais soumis à `condense`. Preuve structurelle --
-        # les trois constructions sont posées avant le seul garde-fou qui enveloppe un bloc
-        # entier (la checklist) ; le badge du modèle est même construit avant que `condense`
-        # soit déclaré.
+    def test_la_duree_et_le_modele_restent_inconditionnels(self):
+        # c4 (brief t-24) : ce que la case garde n'est jamais soumis à `condense`. Preuve
+        # structurelle -- les deux constructions sont posées avant le seul garde-fou qui
+        # enveloppe un bloc entier (la checklist) ; l'identifiant est même construit avant
+        # que `condense` soit déclaré. Les compteurs de dépendances ont quitté la case
+        # fermée (brief t-58, point 1) : ils ne figurent plus ici, voir
+        # TestCompteursDeLiensSurLaCase.
         page = carte.html(carte.model(self.chantier))
         bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
-        garde_checklist = bloc.index("if(!condense){")
+        garde_checklist = bloc.index("if(!condense&&!jamaisLancee){")
         self.assertLess(bloc.index('el("span","dur",durTxt)'), garde_checklist)
-        self.assertLess(bloc.index('head.appendChild(md)'), garde_checklist)
-        self.assertLess(
-            bloc.index('el("span",t.deps.length?"nup":"nnone"'), garde_checklist,
-        )
+        self.assertLess(bloc.index('head.appendChild(rid)'), garde_checklist)
 
     def test_une_case_condensee_reste_cliquable_et_repliee_seulement_fermee(self):
         # c6 : `condense` vaut faux dès que sel est vrai -- la case ouverte reconstruit tout
@@ -2091,3 +2848,504 @@ class TestCondensationDesTachesReglees(CarteTestCase):
         self.assertIn(
             'function settled(t){var k=kind(t);return k==="done"||k==="cancelled"}', page,
         )
+
+
+# ---------------------------------------------------------------------------
+# Repli des tâches réglées : t-13 et t-24 un cran plus bas encore (t-44)
+# ---------------------------------------------------------------------------
+
+
+class TestRepliDesTachesSousNode(CarteTestCase):
+    """La règle de repli dépend de données (l'état des dépendantes directes), pas d'un
+    seul contrat de chaîne : aucune assertion de chaîne ne peut la prouver, seule son
+    exécution le peut -- même principe que TestFinDeChantierSousNode et
+    TestMurDistingueTroisEtats pour leurs propres calculs.
+
+    Les quatre cas tranchés par l'orchestratrice : finie sans dépendante (se replie),
+    finie avec toutes ses dépendantes réglées (se replie), finie avec une dépendante
+    encore vivante (NE se replie PAS -- c'est le repère de progression, celui qui montre
+    d'où vient ce qui tourne), et non finie (ne se replie jamais, quel que soit l'état de
+    ses dépendantes)."""
+
+    def _fonctions(self) -> str:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS de la carte")
+        js = carte._JS
+        debut = js.index("function finReport(t){")
+        fin = js.index("function focusId(){return S.hover||S.sel}")
+        return js[debut:fin]
+
+    def _tache(self, id_, status, dependants=None, ready=False):
+        return {
+            "id": id_, "status": status, "dependants": dependants or [],
+            "ready": ready, "checkTotal": 0, "checkDone": 0,
+        }
+
+    def _repliable(self, byid: dict, id_: str) -> bool:
+        script = (
+            "var byId=" + json.dumps(byid) + ";\n"
+            + self._fonctions()
+            + f'\nprocess.stdout.write(JSON.stringify(repliable(byId["{id_}"])));'
+        )
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    def test_finie_sans_dependante_se_replie(self):
+        byid = {"a": self._tache("a", "done")}
+        self.assertTrue(self._repliable(byid, "a"))
+
+    def test_annulee_sans_dependante_se_replie(self):
+        byid = {"a": self._tache("a", "cancelled")}
+        self.assertTrue(self._repliable(byid, "a"))
+
+    def test_finie_avec_toutes_dependantes_reglees_se_replie(self):
+        byid = {
+            "a": self._tache("a", "done", dependants=["b", "c"]),
+            "b": self._tache("b", "done"),
+            "c": self._tache("c", "cancelled"),
+        }
+        self.assertTrue(self._repliable(byid, "a"))
+
+    def test_finie_avec_une_dependante_encore_vivante_ne_se_replie_pas(self):
+        # Le cas qui protège le repère (c7) : une seule dépendante encore vivante suffit
+        # à garder la case, peu importe l'état exact de cette dépendante.
+        for etat_vivant in ("running", "queued", "blocked"):
+            with self.subTest(etat_vivant=etat_vivant):
+                byid = {
+                    "a": self._tache("a", "done", dependants=["b"]),
+                    "b": self._tache("b", etat_vivant),
+                }
+                self.assertFalse(self._repliable(byid, "a"))
+
+    def test_une_seule_dependante_vivante_parmi_plusieurs_suffit_a_bloquer_le_repli(self):
+        byid = {
+            "a": self._tache("a", "done", dependants=["b", "c"]),
+            "b": self._tache("b", "done"),
+            "c": self._tache("c", "running"),
+        }
+        self.assertFalse(self._repliable(byid, "a"))
+
+    def test_non_finie_ne_se_replie_jamais(self):
+        for status in ("running", "queued", "blocked"):
+            with self.subTest(status=status):
+                byid = {"a": self._tache("a", status)}
+                self.assertFalse(self._repliable(byid, "a"))
+
+    def test_non_finie_avec_toutes_dependantes_reglees_ne_se_replie_pas_non_plus(self):
+        # L'état de la tâche elle-même prime toujours : ses dépendantes réglées n'avancent
+        # rien tant qu'elle ne l'est pas elle-même.
+        byid = {
+            "a": self._tache("a", "running", dependants=["b"]),
+            "b": self._tache("b", "done"),
+        }
+        self.assertFalse(self._repliable(byid, "a"))
+
+    def test_une_dependante_disparue_du_graphe_ne_bloque_pas_le_repli(self):
+        # Référence pendante (tâche supprimée à la main de state.json) : défensif, comme
+        # related() ailleurs dans ce même fichier -- absente vaut réglée, jamais vivante.
+        byid = {"a": self._tache("a", "done", dependants=["fantome"])}
+        self.assertTrue(self._repliable(byid, "a"))
+
+
+class TestRepliDesTachesEnTeteDePhase(CarteTestCase):
+    """Le câblage du repli dans render() : regroupe les tâches repliables en tête de
+    phase sans toucher ni au repli de phase (t-13) ni à la condensation de case (t-24).
+    Depuis t-48, le graphe est le seul mode : le repli s'applique sans condition de vue."""
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_le_repli_s_applique_sans_condition_de_vue(self):
+        page = self._page()
+        self.assertIn("var repliees=shown.filter(repliable);", page)
+        self.assertIn(
+            "var reste=shown.filter(function(t){return !repliable(t)});", page,
+        )
+
+    def test_les_taches_repliables_se_groupent_en_une_liste_en_tete_de_phase(self):
+        page = self._page()
+        self.assertIn('el("div","rlist repli")', page)
+        # La liste repliée se construit et s'ajoute à la section AVANT la grille de cases
+        # (`rangs`) : c'est ce qui la met en tête de phase, pas seulement dans son style.
+        i_repli = page.index('el("div","rlist repli")')
+        i_rangs = page.index('var rangs=el("div","rangs");')
+        self.assertLess(i_repli, i_rangs)
+
+    def test_les_taches_repliables_gardent_l_ordre_numerique_du_groupe(self):
+        # c5 : aucun tri propre au repli -- `shown` vient de `p.order`, déjà trié par
+        # _num_id() côté Python (voir model()), et `filter` préserve cet ordre tel quel.
+        page = self._page()
+        self.assertIn("var repliees=shown.filter(repliable);", page)
+        self.assertNotIn("repliees.sort(", page)
+
+    def test_une_case_repliee_garde_rowNode_intact_data_row_et_clic_compris(self):
+        # c6 : aucun paramètre ajouté à rowNode, aucune branche conditionnelle sur son
+        # data-row ou son écouteur de clic -- la case repliée reste cliquable et
+        # sélectionnable exactement comme une case de la grille.
+        page = self._page()
+        self.assertIn("repliees.forEach(function(t){listeRepli.appendChild(rowNode(t))});", page)
+
+    def test_une_case_selectionnee_n_est_plus_stylee_par_repli(self):
+        # c6 : `.repli` ne s'applique qu'à `.row:not(.sel)` -- une case repliée puis
+        # sélectionnée retrouve sa présentation entière au lieu de rester tassée sur une
+        # ligne trop étroite pour son détail ouvert.
+        page = self._page()
+        self.assertIn(".repli .row:not(.sel){display:flex;", page)
+
+    def test_une_ligne_repliee_ne_revient_jamais_a_la_ligne(self):
+        # c4 : le titre est le seul champ de longueur imprévisible sur cette ligne : c'est
+        # lui qui se coupe à l'ellipse, jamais le conteneur qui l'entoure.
+        page = self._page()
+        self.assertIn(
+            ".repli .row:not(.sel) .rtitle{flex:1 1 auto;min-width:0;margin:0;"
+            "font-size:10.5px;\noverflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+            page,
+        )
+
+    def test_le_repli_de_phase_de_t_13_reste_intact(self):
+        page = self._page()
+        self.assertIn('el("div","condensed")', page)
+        self.assertIn('el("div","pchip"', page)
+
+    def test_la_condensation_de_case_de_t_24_reste_intacte(self):
+        page = self._page()
+        self.assertIn("var condense=settled(t)&&!sel;", page)
+        self.assertIn('if(t.tokens&&!condense){', page)
+
+
+# ---------------------------------------------------------------------------
+# Condensation de la liste repliée : t-44 un cran plus loin (t-56)
+# ---------------------------------------------------------------------------
+
+
+class TestCondensationDeLaListeRepliee(CarteTestCase):
+    """Une phase ancienne pouvait replier vingt tâches (t-44), une ligne chacune, qui
+    mangeaient la moitié de l'écran et repoussaient hors de vue la tâche en cours plus
+    bas -- sur un mur de colonnes, il fallait défiler dans chaque colonne pour trouver
+    ce qui travaille. Au-delà de cinq, cette liste se condense à son tour en une seule
+    ligne portant leur nombre, dépliable et repliable au clic, sans jamais toucher aux
+    tâches non repliables (point 4 du brief)."""
+
+    def _fonctions(self) -> str:
+        if shutil.which("node") is None:
+            self.skipTest("node absent, impossible d'exécuter le JS de la carte")
+        js = carte._JS
+        debut = js.index("function el(tag,cls,txt){")
+        fin = js.index("function focusId(){return S.hover||S.sel}")
+        return js[debut:fin]
+
+    def _construire(self, n: int, ouvert) -> dict:
+        script = (
+            "function makeEl(){var e={hidden:false,textContent:'',title:'',className:'',"
+            "type:'',style:{},children:[],firstChild:null,_h:{}};"
+            "e.appendChild=function(c){this.children.push(c);"
+            "this.firstChild=this.children[0]||null;return c};"
+            "e.addEventListener=function(ev,fn){this._h[ev]=fn};"
+            "e.click=function(){if(this._h.click)this._h.click()};"
+            "return e}\n"
+            "var document={createElement:function(){return makeEl()}};\n"
+            + self._fonctions()
+            + "\nvar repliees=[];for(var i=0;i<" + str(n) + ";i++)repliees.push({id:'t'+i});"
+            + "\nvar bascules=[];"
+            + "\nfunction rowNodeFaux(t){var e=makeEl();e.textContent=t.id;return e}"
+            + "\nvar liste=construireListeRepli(repliees," + json.dumps(ouvert)
+            + ",rowNodeFaux,function(v){bascules.push(v)});"
+            + "\nvar bouton=(liste.children[0]&&"
+            + "liste.children[0].className.indexOf('rrepli')===0)?liste.children[0]:null;"
+            + "\nif(bouton)bouton.click();"
+            + "\nprocess.stdout.write(JSON.stringify({"
+            + "enfants:liste.children.length,"
+            + "boutonPresent:!!bouton,"
+            + "boutonOuvert:bouton?bouton.className.indexOf('open')>=0:null,"
+            + "boutonTexte:bouton?bouton.children[1].textContent:null,"
+            + "bascules:bascules}));"
+        )
+        sortie = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, timeout=10, check=True,
+        )
+        return json.loads(sortie.stdout)
+
+    # -- c6 : cinq ou moins, rien ne change ---------------------------------------------
+
+    def test_cinq_taches_repliees_ne_condensent_jamais(self):
+        r = self._construire(5, None)
+        self.assertFalse(r["boutonPresent"])
+        self.assertEqual(r["enfants"], 5)
+
+    def test_cinq_taches_repliees_ne_condensent_pas_meme_forcees_fermees(self):
+        # Le seuil prime : en dessous, il n'y a même pas de bouton à ouvrir ou fermer.
+        r = self._construire(5, False)
+        self.assertFalse(r["boutonPresent"])
+        self.assertEqual(r["enfants"], 5)
+
+    # -- c9 : le seuil testé dans les deux sens -----------------------------------------
+
+    def test_six_taches_repliees_condensent(self):
+        r = self._construire(6, None)
+        self.assertTrue(r["boutonPresent"])
+        self.assertEqual(r["enfants"], 1)
+
+    # -- c3 : la ligne condensée porte le nombre, lisible comme cliquable --------------
+
+    def test_la_ligne_condensee_porte_le_nombre(self):
+        r = self._construire(12, None)
+        self.assertTrue(r["boutonPresent"])
+        self.assertEqual(r["boutonTexte"], "12 tâches réglées")
+        self.assertEqual(r["enfants"], 1)
+
+    # -- c4 : dépliage et repliage au clic, même élément dans les deux sens ------------
+
+    def test_le_clic_sur_la_ligne_fermee_la_deplie(self):
+        r = self._construire(9, False)
+        self.assertFalse(r["boutonOuvert"])
+        self.assertEqual(r["bascules"], [True])
+
+    def test_le_clic_sur_la_ligne_ouverte_la_replie(self):
+        r = self._construire(9, True)
+        self.assertTrue(r["boutonOuvert"])
+        self.assertEqual(r["bascules"], [False])
+        self.assertEqual(r["enfants"], 10)  # le bouton (ouvert) + les 9 cases
+
+    # -- point 4 du brief : jamais de tâche non repliable dans ce compte --------------
+
+    def test_ne_recoit_et_ne_construit_jamais_que_les_repliees(self):
+        js = carte._JS
+        self.assertIn(
+            "var listeRepli=construireListeRepli(repliees,S.repliOuvert[p.key],rowNode,",
+            js,
+        )
+        self.assertNotIn("construireListeRepli(reste", js)
+        self.assertNotIn("construireListeRepli(shown", js)
+
+    # -- c5 : le choix manuel se garde dans S, jamais réinitialisé ---------------------
+
+    def test_le_choix_repose_sur_S_et_ne_se_reinitialise_jamais(self):
+        # Même mécanisme que S.closed pour le repli de phase (t-13) : une clé par phase
+        # dans un objet initialisé une seule fois, mutée seulement par le clic qui la
+        # bascule -- jamais recréée ni vidée par ordoSetData ou ailleurs dans render().
+        js = carte._JS
+        self.assertIn("repliOuvert:{}", js)
+        self.assertEqual(js.count("S.repliOuvert[p.key]=v;render()"), 1)
+        self.assertNotIn("S.repliOuvert={}", js)
+        debut = js.index("window.ordoSetData=function(data){")
+        fin = js.index("};", debut)
+        self.assertNotIn("repliOuvert", js[debut:fin])
+
+
+class TestPastilleDeModeleSurLaCase(CarteTestCase):
+    """Le modèle teintait le TEXTE de l'identifiant (brief t-46). Retouche demandée par
+    l'humain (brief t-58, point 2) : ça abîmait la lisibilité de l'identifiant, ce qu'on
+    cherche en premier, pour porter une information secondaire. À la place, une pastille
+    ronde de la couleur du modèle, et l'identifiant rendu en blanc comme n'importe quel
+    texte -- exactement le rendu déjà en place au détail (voir .mdot dans
+    TestPastilleDeModeleDansLeDetail), réutilisé tel quel sur la case compacte.
+    """
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_le_javascript_ne_construit_plus_de_badge_texte_sur_la_case(self):
+        # Avant cette retouche, rowNode() écrivait le nom du modèle en toutes lettres à
+        # côté de l'identifiant (ancien badge .mdl). Il a disparu de la case compacte.
+        page = self._page()
+        self.assertNotIn('el("span","mdl m"+connu', page)
+
+    def test_lidentifiant_ne_porte_plus_aucune_classe_de_teinte(self):
+        # c5 : le texte de l'identifiant redevient un texte comme un autre -- rowNode ne
+        # lui pose plus la classe de modèle, c'est la pastille qui la porte désormais.
+        page = self._page()
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertIn('var rid=el("span","rid",t.id);', bloc)
+
+    def test_lidentifiant_est_blanc_comme_nimporte_quel_texte(self):
+        # c5 : même variable que .rtitle/.cid, jamais la grise --dim2 qui servait de
+        # fond neutre avant que le modèle ne s'y pose (brief t-46).
+        page = self._page()
+        self.assertIn(
+            ".rid{font-size:10.5px;font-weight:600;color:var(--txt);flex:none}", page)
+
+    def test_aucune_teinte_de_modele_sur_lidentifiant_dans_la_feuille_de_style(self):
+        # Régression : .rid.haiku/.sonnet/.opus (brief t-46) ne doivent plus exister --
+        # la teinte vit uniquement sur .mdot désormais, jamais recalculée deux fois.
+        page = self._page()
+        for modele in ("haiku", "sonnet", "opus"):
+            self.assertNotIn(f".rid.{modele}{{color:var(--m-{modele})}}", page)
+
+    def test_une_pastille_ronde_reprend_les_teintes_du_modele_sur_la_case(self):
+        # c4 : rowNode construit désormais un .mdot -- même classe, mêmes couleurs que
+        # celles déjà posées au détail (partagées, jamais recopiées, voir .mdot.haiku
+        # etc. dans TestPastilleDeModeleDansLeDetail) -- avant l'identifiant.
+        page = self._page()
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertIn('var mdot=el("span","mdot"+mconnu);', bloc)
+        # Ordre d'ATTACHEMENT au DOM, pas d'écriture du code : la pastille doit se voir
+        # avant l'identifiant sur la case, même si sa construction est lue plus bas dans
+        # la source (elle dépend de t.model, connu seulement après `rid`).
+        self.assertLess(bloc.index('head.appendChild(mdot)'), bloc.index('head.appendChild(rid)'))
+
+    def test_le_survol_porte_le_modele_en_clair_sur_la_pastille_connue(self):
+        # c4 : title HTML, atteignable au doigt comme à la souris (minimum demandé par le
+        # brief) -- posé sur la pastille, qui porte désormais la teinte du modèle.
+        page = self._page()
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertIn('mdot.title=titreModele;', bloc)
+
+    def test_aucune_pastille_pour_un_modele_herite_ou_absent(self):
+        # c9, point de prudence du brief : {haiku:1,sonnet:1,opus:1}[t.model] est
+        # undefined pour "herite", "defaut" et l'absence de modèle -- AUCUNE pastille ne
+        # se construit alors, pas une pastille grise. La construction du .mdot est sous
+        # la garde `if(mconnu)`, jamais posée inconditionnellement.
+        page = self._page()
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertIn('var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";', bloc)
+        garde = bloc.index("if(mconnu){")
+        construction = bloc.index('var mdot=el("span","mdot"+mconnu);')
+        self.assertLess(garde, construction)
+
+    def test_un_modele_non_reconnu_garde_son_infobulle_sur_lidentifiant(self):
+        # Un modèle tapé à la main hors table (donc sans pastille, voir ci-dessus) ne
+        # perd pas pour autant son infobulle -- elle retombe sur l'identifiant, seul
+        # porteur restant de l'information pour ce cas.
+        page = self._page()
+        bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
+        self.assertIn("rid.title=titreModele", bloc)
+
+    def test_aucune_classe_de_teinte_pour_un_modele_herite_ou_absent(self):
+        # c9 : {haiku:1,sonnet:1,opus:1}[t.model] est undefined pour "herite", "defaut" et
+        # l'absence de modèle -- mconnu reste vide dans ces trois cas, jamais une sixième
+        # teinte inventée pour "on ne sait pas".
+        page = self._page()
+        self.assertIn(
+            'var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";', page)
+
+
+class TestPastilleDeModeleDansLeDetail(CarteTestCase):
+    """Une fois la case dépliée (sélection ou panneau de détail), il y a la place : le
+    nom du modèle s'écrit en entier à côté de sa pastille de couleur (retouche demandée
+    par l'humain en cours de tâche, brief t-46).
+    """
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_le_detail_ecrit_le_nom_du_modele_a_cote_de_sa_pastille(self):
+        page = self._page()
+        self.assertIn('md.appendChild(el("span","mdot"+connu));', page)
+        self.assertIn('md.appendChild(document.createTextNode(t.model));', page)
+
+    def test_la_pastille_du_detail_partage_les_memes_teintes_que_lidentifiant(self):
+        page = self._page()
+        for modele in ("haiku", "sonnet", "opus"):
+            self.assertIn(f".mdot.{modele}{{background:var(--m-{modele})}}", page)
+
+
+class TestLegendeDesEtatsEtDesModeles(CarteTestCase):
+    """La légende (bloc #legend) enseigne le code couleur au lieu de le laisser
+    deviner au survol -- retouche demandée par l'humain en cours de tâche, brief t-46.
+    """
+
+    def _page(self) -> str:
+        self._add("0.1 a")
+        return carte.html(carte.model(self.chantier))
+
+    def test_la_pastille_de_redaction_du_rapport_rejoint_les_trois_deja_en_legende(self):
+        # --finishing existe depuis t-23 et n'avait jamais rejoint la légende.
+        page = self._page()
+        self.assertIn(
+            '<span class="item"><span class="sw" style="background:var(--finishing)">'
+            '</span>rédaction du rapport</span>',
+            page,
+        )
+
+    def test_les_pastilles_de_la_legende_viennent_des_variables_css_pas_dun_hex_recopie(self):
+        # Deux tables recopiées à la main finiraient par diverger : la légende doit lire
+        # la même source que .sb (états) et .rid/.mdot (modèles), jamais un hex à part.
+        page = self._page()
+        bloc = re.search(r'<div id="legend">.*?</div>', page, re.S).group(0)
+        self.assertNotIn("#", bloc.split("legend")[-1].replace('id="legend"', ""))
+        for var in ("--done", "--running", "--finishing", "--ready", "--queued",
+                    "--m-haiku", "--m-sonnet", "--m-opus"):
+            self.assertIn(f"var({var})", bloc)
+
+    def test_la_legende_des_modeles_suit_celle_des_etats_avec_un_separateur(self):
+        page = self._page()
+        bloc = re.search(r'<div id="legend">.*?</div>', page, re.S).group(0)
+        self.assertIn('<span class="lsep"></span>', bloc)
+        self.assertLess(bloc.index('background:var(--queued)'), bloc.index('class="lsep"'))
+        self.assertLess(bloc.index('class="lsep"'), bloc.index('background:var(--m-haiku)'))
+
+    def test_les_pastilles_de_modele_sont_rondes_pour_ne_pas_se_confondre_avec_les_etats(self):
+        page = self._page()
+        for modele in ("haiku", "sonnet", "opus"):
+            self.assertIn(f'<span class="sw rond" style="background:var(--m-{modele})">'
+                          f'</span>{modele}</span>', page)
+
+
+class TestTeintesDeModeleNeCollisionnentPasAvecLEtat(CarteTestCase):
+    """Le cœur du risque nommé par le brief t-46 : ajouter une seconde grille de couleur
+    (le modèle) sur une case qui utilise déjà la couleur pour l'état peut rendre les deux
+    illisibles. Ce test compare les VALEURS, il ne se fie jamais à l'oeil.
+    """
+
+    _SEUIL_DEGRES = 25  # en dessous, deux teintes se lisent comme une seule couleur
+
+    @staticmethod
+    def _hex_vers_hsl(hexcode: str) -> tuple[float, float, float]:
+        h = hexcode.lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        teinte, luminosite, saturation = colorsys.rgb_to_hls(r, g, b)
+        return teinte * 360, saturation, luminosite
+
+    @staticmethod
+    def _distance_de_teinte(a: float, b: float) -> float:
+        d = abs(a - b) % 360
+        return min(d, 360 - d)
+
+    def _etats(self) -> dict[str, str]:
+        motif = r"--(done|running|finishing|ready|blocked|queued|cancelled):(#[0-9a-fA-F]{6})"
+        return dict(re.findall(motif, carte._CSS))
+
+    def _modeles(self) -> dict[str, str]:
+        motif = r"--m-(haiku|sonnet|opus):(#[0-9a-fA-F]{6})"
+        return dict(re.findall(motif, carte._CSS))
+
+    def test_les_trois_teintes_de_modele_sont_definies(self):
+        self.assertEqual(set(self._modeles()), {"haiku", "sonnet", "opus"})
+
+    def test_aucune_teinte_de_modele_ne_collisionne_avec_une_couleur_detat(self):
+        etats = self._etats()
+        modeles = self._modeles()
+        for nom_etat, hex_etat in etats.items():
+            teinte_etat, sat_etat, _ = self._hex_vers_hsl(hex_etat)
+            if sat_etat < 0.2:
+                continue  # gris (queued/cancelled) : aucune teinte ne s'y confond
+            for nom_modele, hex_modele in modeles.items():
+                teinte_modele, _, _ = self._hex_vers_hsl(hex_modele)
+                distance = self._distance_de_teinte(teinte_etat, teinte_modele)
+                self.assertGreaterEqual(
+                    distance, self._SEUIL_DEGRES,
+                    f"{nom_modele} ({hex_modele}) à {distance:.0f}° de {nom_etat} "
+                    f"({hex_etat}) : trop proche pour rester distinguable une fois le nom "
+                    "du modèle retiré de la case compacte.",
+                )
+
+    def test_les_teintes_de_modele_ne_se_confondent_pas_entre_elles(self):
+        modeles = self._modeles()
+        noms = list(modeles)
+        for i, a in enumerate(noms):
+            for b in noms[i + 1:]:
+                ta, _, _ = self._hex_vers_hsl(modeles[a])
+                tb, _, _ = self._hex_vers_hsl(modeles[b])
+                self.assertGreaterEqual(self._distance_de_teinte(ta, tb), self._SEUIL_DEGRES)
+
+    def test_les_anciennes_teintes_de_badge_ne_sont_plus_dans_la_feuille_de_style(self):
+        # Régression : #7fb08a/#6fa8dc/#b892e0 étaient les couleurs du badge avant t-46,
+        # presque identiques à done/ready/finishing -- exactement le risque nommé par le
+        # brief. Si elles réapparaissent un jour sur .rid ou .mdot, la collision revient.
+        for ancienne in ("#7fb08a", "#6fa8dc", "#b892e0"):
+            self.assertNotIn(ancienne, carte._CSS)

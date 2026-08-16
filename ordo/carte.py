@@ -26,7 +26,7 @@ l'invente pas : ce qui n'a pas ete explique est signale comme tel, jamais comble
 La PAGE est une transposition d'un design fait dans Claude Design. L'original tourne sur
 React et le runtime du designer ; une carte Ordo est un fichier unique, sans reseau et sans
 dependance, donc rien de tout cela ne peut etre embarque. Ce qui est porte est le
-comportement, pas le code : phases repliables, recherche, filtres, deux vues, chaine
+comportement, pas le code : phases repliables, alertes et questions en calque, chaine
 attend/debloque, arcs orientes. Deux ecarts assumes par rapport a l'original : les polices
 distantes sont remplacees par les piles systeme (une carte doit se lire sans reseau, et ne
 rien dire a personne de ce qu'on regarde), et le rendu est en JS nu.
@@ -242,9 +242,9 @@ def _modele(task: dict) -> tuple[str, str, bool]:
     """
     impose = task.get("model")
     if impose:
-        return impose, "modele impose a son lancement", False
+        return impose, "modèle imposé à son lancement", False
     if task.get("startedAt"):
-        return "defaut", "lancee sans modele impose : celui de claude a servi", False
+        return "defaut", "lancée sans modèle imposé : celui de claude a servi", False
     modele, motif = routage.pour_lancement(None, task)
     return modele or "defaut", motif, True
 
@@ -987,7 +987,9 @@ _CSS = """
 --line2:#20252c;--txt:#dfe4ea;--txt2:#c9d1da;--dim:#858e9b;--dim2:#6d7683;--dim3:#5b6470;
 --done:#46a35a;--done2:#3c7a4a;--running:#d3a03a;--finishing:#8b5cf6;--ready:#5aa2f0;
 --queued:#4a5361;--blocked:#e05252;--cancelled:#333941;--up:#5fa96f;--down:#5aa2f0;
---accent:#8cc0f7;--lien:#2f6ba8;--relu:#3f5d80;--badge:#171b21}
+--accent:#8cc0f7;--lien:#2f6ba8;--relu:#3f5d80;--badge:#171b21;
+--m-haiku:#addb76;--m-haiku-bd:#4a6529;--m-sonnet:#76dbcd;--m-sonnet-bd:#29655d;
+--m-opus:#db76cc;--m-opus-bd:#65295c}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;
 font:12.5px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -1000,6 +1002,15 @@ font:12.5px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
 padding:12px 14px 10px}
 #top h1{margin:0;font-size:12.5px;font-weight:400;color:var(--dim);
 display:flex;align-items:baseline;gap:8px}
+/* Colonne du mur (t-49, complété t-57) : l'onglet, hors de cette iframe, porte déjà
+   l'identifiant, le pourcentage, le restant, l'heure de fin, et maintenant la progression
+   par phase et les alertes -- les répéter ici referait le doublon que la fusion devait
+   effacer. #top disparaît donc en entier, pas seulement son h1 : #segs et #bar vivent
+   désormais dans la seconde ligne de l'onglet (voir annoncerOnglet() plus bas et _MUR_JS).
+   La classe est posée par _JS au chargement (window.parent!==window, voir plus bas) : en
+   page de fichier ou en panneau visité seul, elle ne l'est jamais et #top reste la seule
+   source, pleinement visible. */
+html.embarque #top{display:none}
 .cid{font-size:12px;font-weight:600;letter-spacing:.04em;color:var(--txt);
 border:1px solid #2b3038;border-radius:5px;padding:1px 6px}
 /* ctx (slug/état/session) est le seul élément de l'en-tête à longueur variable : sans ce
@@ -1022,23 +1033,19 @@ border:1px solid #2b3038;border-radius:5px;padding:1px 6px}
 #segs .fill{display:block;height:100%;border-radius:2px}
 #segs .lab{font-size:9.5px;color:var(--dim2);margin-top:3px;text-align:center}
 #bar{display:flex;gap:6px;margin-top:10px;align-items:center;flex-wrap:wrap}
-#q{flex:1 1 150px;min-width:110px;background:var(--panel);border:1px solid var(--line);
-border-radius:6px;color:var(--txt);font:inherit;font-size:12px;padding:5px 9px;outline:none}
-#q:focus{border-color:#2f6ba8}
 .pill{border:1px solid var(--line);background:var(--panel);color:#9aa4b1;border-radius:20px;
 font:inherit;font-size:11px;padding:4px 9px;cursor:pointer;flex:none}
-.pill.on{border-color:#2f6ba8;background:#132539;color:var(--accent)}
-.pill b{opacity:.55;margin-left:5px;font-weight:400}
-#views{display:flex;border:1px solid var(--line);border-radius:20px;overflow:hidden;
-flex:none;margin-left:auto}
-#views button{background:transparent;color:#7d8794;border:none;font:inherit;font-size:11px;
-padding:4px 10px;cursor:pointer}
-#views button.on{background:#132539;color:var(--accent)}
 
-#warn{border-bottom:1px solid #5a3a1a;background:#241a0c;padding:7px 14px;
-max-height:20vh;overflow:auto;color:#e3b341;font-size:11.5px}
-#warn div+div{margin-top:3px}
-#warn[hidden]{display:none}
+/* Pastille d'alertes (t-48) : un triangle et un compte, plus jamais le détail étalé sur
+   la barre -- il vit dans le calque #warn, ouvert au clic (voir paintTop() et #ask, dont
+   ce calque reprend le mécanisme plutôt que d'en écrire un second). Zéro alerte : la
+   pastille reste hidden, jamais un compte à zéro affiché pour rien. */
+#warnchip{display:inline-flex;align-items:center;gap:4px;border-color:#63541f;color:#e3b341}
+/* display:inline-flex ci-dessus prime sur la feuille de style du navigateur pour [hidden]
+   (spécificité d'un identifiant contre celle d'un attribut) : sans cette règle, l'attribut
+   hidden posé par paintTop() ne masquerait plus rien -- vu en mesure réelle, zéro alerte
+   affichait quand même le triangle. Même piège déjà évité ailleurs pour #ask et #warn. */
+#warnchip[hidden]{display:none}
 
 /* Le bas est laissé vide exprès : sans cette réserve, la dernière phase ne peut jamais
    monter en haut de l'écran, même en repliant tout ce qui la précède. Aucun script ne s'y
@@ -1077,12 +1084,50 @@ line-height:1.45;margin:0 0 8px;padding:0 0 4px 1px;text-wrap:pretty}
 .phase.closed .pwhy,.phase.closed .rangs{display:none}
 .rangs{display:flex;gap:9px}
 .view-graphe .rangs{flex-direction:row;flex-wrap:wrap;gap:18px 26px;align-items:flex-start}
-.view-liste .rangs{flex-direction:column;gap:9px}
 .rang{min-width:0}
 .view-graphe .rang{flex:1 1 190px;max-width:240px}
 .view-graphe .rang.wide{flex:1 1 100%;max-width:none}
+/* Un rang sans voisin à sa droite sur sa ligne (brief t-58, point 7) : posé par
+   elargirRangsSansVoisin() une fois les rangs mesurés dans le DOM réel -- le placement
+   par niveau et le retour à la ligne ne changent pas, seul le plafond de largeur saute.
+   flex-grow (déjà sur .rang) fait le reste : un rang qui partage sa ligne à plein
+   n'obtient jamais cette classe, donc ne bouge pas (voir la précaution 2 du brief). */
+.view-graphe .rang.etire{max-width:none}
 .rlist{display:flex;flex-direction:column;gap:7px}
-.view-liste .rlist{gap:5px}
+
+/* Repli de tâche (t-44) : en mode graphe, une case réglée qu'aucune dépendante directe
+   n'attend plus rejoint cette liste en tête de phase au lieu de la grille de cases. Elle
+   garde exactement le rendu de rowNode() (mêmes champs, mêmes classes, rien de plus créé
+   ni retiré côté JS) -- seule cette mise en page change, en tassant les deux blocs que le
+   mode graphe construit déjà pour une case réglée fermée (en-tête, titre ; .rmeta ne se
+   construit jamais ici, condition inchangée de t-24) sur une seule ligne au lieu de deux.
+   Le titre, seul champ de longueur imprévisible, se coupe à l'ellipse plutôt que de
+   revenir à la ligne. Rouverte (.sel), plus aucune règle ici ne s'applique : elle
+   retrouve la case entière, empilée, telle qu'elle serait dans la grille.
+   Le but du repli est de rendre de la place verticale : toute la ligne réduit donc son
+   texte, pas seulement l'identifiant, et le gap entre lignes se resserre en conséquence
+   -- une tâche réglée n'a plus besoin de se lire d'aussi loin qu'une tâche active. */
+.repli.rlist{gap:2px}
+.repli{margin-bottom:7px}
+.repli .row:not(.sel){display:flex;align-items:baseline;gap:7px;font-size:10px;
+padding:3px 10px 3px 13px;overflow:hidden}
+.repli .row:not(.sel) .sb{top:50%;transform:translateY(-50%);height:12px}
+.repli .row:not(.sel) .rhead{flex:none;flex-wrap:nowrap;margin:0;gap:6px}
+.repli .row:not(.sel) .rid{font-size:9px}
+.repli .row:not(.sel) .rlinks{font-size:9px;gap:5px}
+.repli .row:not(.sel) .rtitle{flex:1 1 auto;min-width:0;margin:0;font-size:10.5px;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Condensation de la liste repliée (t-56) : au-delà du seuil, un bouton pleine largeur
+   remplace les cases une à une, même chevron pivotant que l'accordéon de pièce jointe
+   (.doc .chev2) pour rester dans le même vocabulaire visuel plutôt que d'en inventer un
+   second. Le texte porte le nombre en premier, jamais un titre inerte : la couleur
+   s'éclaircit au survol pour se lire comme cliquable. */
+.rrepli{display:flex;align-items:center;gap:6px;width:100%;background:transparent;
+border:none;text-align:left;cursor:pointer;padding:3px 10px 3px 13px;font-size:10px;
+color:var(--dim2);font-family:inherit}
+.rrepli:hover{color:var(--txt2)}
+.rrepli .chev2{display:inline-block;flex:none;transition:transform .12s;color:var(--dim3)}
+.rrepli.open .chev2{transform:rotate(90deg)}
 
 .row{position:relative;cursor:pointer;background:var(--row);border:1px solid var(--line2);
 border-radius:7px;padding:7px 10px 8px 13px;width:100%;min-width:0;z-index:1;
@@ -1099,19 +1144,55 @@ transition:opacity .12s,border-color .12s}
 /* flex-wrap, parce qu'une colonne de mur fait quelques centaines de pixels : sans lui,
    la derniere pastille sortait de la case au lieu de passer a la ligne. */
 .rhead{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}
-.rid{font-size:10.5px;font-weight:600;color:#9aa4b1;flex:none}
-/* Le modele de l'executante, sur la case. Trait plein quand il a reellement tourne,
-   pointille quand ce n'est encore qu'une prevision du routage : la difference entre un
-   fait et un pronostic doit se voir sans lire le mot. */
+/* Le modèle teintait le TEXTE de l'identifiant (brief t-46) : ça abîmait la lisibilité
+   de l'identifiant, ce qu'on cherche en premier, pour porter une information secondaire.
+   Retouche demandée par l'humain (brief t-58, point 2) : l'identifiant redevient un
+   texte comme un autre -- même variable que .rtitle/.cid -- et c'est une pastille .mdot
+   (partagée avec le détail, voir plus bas) qui porte la teinte à sa place. */
+.rid{font-size:10.5px;font-weight:600;color:var(--txt);flex:none}
+/* Badge générique à petite étiquette texte : sert au "niveau N" du détail (profondeur
+   dans le graphe) et, avec une pastille .mdot en plus, au modèle du détail ci-dessous. */
 .mdl{font-size:9.5px;font-weight:600;letter-spacing:.03em;border:1px solid var(--line);
 border-radius:4px;padding:0 4px;color:var(--dim2);flex:none}
-.mdl.haiku{color:#7fb08a;border-color:#2c4d35}
-.mdl.sonnet{color:#6fa8dc;border-color:#274a68}
-.mdl.opus{color:#b892e0;border-color:#453060}
+/* Pastille du modèle : ronde, posée avant l'identifiant sur la case compacte (brief
+   t-58, point 2) et devant le nom en toutes lettres une fois la case dépliée (détail,
+   brief t-46) -- les DEUX endroits partagent cette même classe et ces mêmes teintes,
+   jamais recopiées. Choisies loin de toute couleur d'état (voir le test de collision qui
+   les vérifie), jamais reprises des anciennes couleurs de badge (haiku/sonnet/opus), qui
+   partageaient presque le même ton que done/ready/finishing. Hérité, défaut ou l'absence
+   de modèle ne posent aucune classe connue : rowNode() ne construit alors AUCUNE
+   pastille, jamais une pastille grise par défaut (voir le garde `if(mconnu)`). */
+.mdot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none;
+vertical-align:middle;margin-right:4px;background:var(--dim3)}
+.mdot.haiku{background:var(--m-haiku)}
+.mdot.sonnet{background:var(--m-sonnet)}
+.mdot.opus{background:var(--m-opus)}
+/* Trait plein quand le modèle a réellement tourné, pointillé quand ce n'est encore
+   qu'une prévision du routage : la différence entre un fait et un pronostic doit se voir
+   sans lire le mot (même geste que l'ancien badge, avant qu'il ne se scinde en identifiant
+   teinté + pastille du détail). */
 .mdl.predit{border-style:dashed;opacity:.75}
 .rlinks{margin-left:auto;flex:none;display:flex;gap:7px;font-size:10px}
-.row.focus .rlinks{font-size:12px;font-weight:600}
-.nup{color:var(--up)}.ndown{color:var(--down)}.nnone{color:#3a4049}
+/* Le focus (survol ou sélection) se signale déjà par la bordure et l'ombre de .row.focus
+   ci-dessus : grossir la police en plus faisait bouger la taille des stats au simple
+   passage de la souris sur une case du graphe, un second signal qui n'ajoutait rien --
+   corrigé en même temps que le repli de tâche (t-44), même passe. */
+.row.focus .rlinks{font-weight:600}
+/* Une tâche jamais commencée (brief t-58, point 4) : ni checklist (0/N n'apprend rien
+   que le titre ne dise déjà), ni jetons, ni temps écoulé -- voir jamaisCommencee() et le
+   garde !jamaisLancee sur rprog plus bas, qui ne construisent alors plus rien à cet
+   endroit. Le titre rejoint l'identifiant sur la même ligne au lieu d'ouvrir la sienne :
+   .rhead redevient un flux de texte normal (le flex habituel n'a plus de sens sans les
+   liens, eux-mêmes non construits pour cette case), et c'est ce flux, pas un calcul de
+   largeur, qui fait passer le titre à la ligne suivante seulement s'il ne tient pas.
+   Rouverte (.sel), la case retrouve sa présentation entière, comme n'importe quelle
+   autre -- ce garde ne s'applique qu'aux cases fermées. Le flux normal ne pose AUCUN
+   espace entre deux éléments en ligne (contrairement au gap de 7px de .rhead en mode
+   flex) : sans marge explicite, le titre collerait à l'identifiant. margin-left reprend
+   ce même 7px, cohérent avec le reste de la case (constaté par l'humain, mesuré via
+   getBoundingClientRect dans le script de mesure dédié). */
+.row.vierge:not(.sel) .rhead{display:block}
+.row.vierge:not(.sel) .rtitle{margin-left:7px}
 .dur{color:var(--dim2)}
 /* Dépassement : passé au-delà du total estimé (brief t-27). --blocked, déjà la teinte
    d'alarme du reste de la carte (voir COL/kind()), jamais une nouvelle variable pour ce
@@ -1269,8 +1350,17 @@ white-space:nowrap}
    de .box + gap de .ctop), pas sous la coche. Ton discret (var(--dim3), même famille que
    .cdur ci-dessus) pour ne pas rivaliser avec le critère en cours. */
 .cattrs{display:flex;flex-wrap:wrap;gap:3px;padding-left:20px}
-.cattr{font-size:10px;font-weight:600;line-height:13px;color:var(--dim3);
-border:1px solid var(--line2);border-radius:3px;padding:0 4px}
+/* Retouche demandée par l'humain, même passe que t-44 : le marqueur écrit sa clé ET sa
+   valeur ("dependance : aucune"), plus seulement la valeur -- lisible sans déjà connaître
+   les cinq clés par cœur. Les chips passent désormais sur deux lignes sous le libellé
+   (voir .cattrs ci-dessus), la place existe pour les deux ; s'il en manque quand même,
+   c'est la clé qui cède : .cattrk peut se réduire et se couper à l'ellipse, .cattrv (le
+   séparateur et la valeur) reste toujours entier, jamais tronqué. */
+.cattr{display:flex;min-width:0;max-width:100%;font-size:10px;font-weight:600;
+line-height:13px;color:var(--dim3);border:1px solid var(--line2);border-radius:3px;
+padding:0 4px}
+.cattrk{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cattrv{flex:none;white-space:nowrap}
 .doc{margin-top:10px}
 .doc button{width:100%;text-align:left;background:#191d23;border:1px solid #262c34;
 border-radius:6px;color:#9aa4b1;font:inherit;font-size:11px;padding:5px 9px;cursor:pointer;
@@ -1283,17 +1373,20 @@ border:1px solid var(--line);border-top:none;border-radius:0 0 6px 6px;padding:9
 margin:-2px 0 0;font-size:11px;line-height:1.55;color:#b8c1cb;max-height:340px;overflow:auto}
 .doc:not(.open) pre{display:none}
 
-/* Le calque des questions. Une orchestratrice qui s'arrête pour demander un arbitrage le
-   fait dans son terminal ; l'humain, lui, regarde cette page. Sans ce calque la campagne
-   attend sans que rien ne le dise à l'endroit qu'il a sous les yeux. Reprend la teinte des
+/* Le calque des questions, et depuis t-48 celui des alertes (#warn) : même mécanisme,
+   jamais deux. Une orchestratrice qui s'arrête pour demander un arbitrage le fait dans
+   son terminal ; l'humain, lui, regarde cette page. Sans ce calque la campagne attend
+   sans que rien ne le dise à l'endroit qu'il a sous les yeux. Reprend la teinte des
    avertissements, la seule de cette palette qui serve déjà à appeler le regard. */
 #askchip{border-color:#63541f;color:#e3b341;cursor:pointer;
 animation:ordopulse 2.2s ease-in-out infinite}
-#ask{position:fixed;inset:0;z-index:40;background:rgba(6,8,11,.62);display:flex;
+#ask,#warn{position:fixed;inset:0;z-index:40;background:rgba(6,8,11,.62);display:flex;
 align-items:center;justify-content:center;padding:18px}
-#ask[hidden]{display:none}
+#ask[hidden],#warn[hidden]{display:none}
 .askbox{width:100%;max-width:430px;background:#191408;border:1px solid #63541f;
 border-radius:9px;padding:13px 14px;box-shadow:0 14px 40px rgba(0,0,0,.55)}
+.warnlist{margin-top:8px;max-height:50vh;overflow:auto;color:#e3b341;font-size:11.5px}
+.warnlist div+div{margin-top:6px}
 .askhead{display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:.11em;
 text-transform:uppercase;color:#e3b341;font-weight:600}
 .askmore{margin-left:auto;font-size:10px;color:var(--dim2);letter-spacing:0;
@@ -1321,6 +1414,10 @@ border-top:1px solid var(--line);padding:6px 14px;display:flex;gap:12px;align-it
 font-size:10.5px;color:var(--dim2);flex-wrap:wrap}
 #legend .sw{width:7px;height:7px;border-radius:2px;display:inline-block}
 #legend span.item{display:flex;align-items:center;gap:5px}
+/* Sépare la famille des états de celle des modèles (brief t-46) : une simple ligne
+   verticale, assez pour que l'œil ne les lise pas comme une seule série de sept teintes. */
+#legend .lsep{width:1px;align-self:stretch;background:var(--line);flex:none}
+#legend .sw.rond{border-radius:50%}
 #empty{padding:40px;color:var(--dim2)}
 """.strip()
 
@@ -1334,9 +1431,33 @@ font-size:10.5px;color:var(--dim2);flex-wrap:wrap}
 # Le contenu du chantier n'entre JAMAIS dans le DOM par du balisage : il arrive en JSON et
 # repart en textContent. C'est ce qui rend inoffensif un titre de tache qui contiendrait du
 # HTML, et un modele en ecrit tot ou tard.
+# Une seule légende pour les DEUX rendus, html() et panneau(). Elle vivait en dur dans
+# html() seulement : le mur, servi par panneau(), affichait un pied vide, si bien que le
+# violet de rédaction et les trois teintes de modèle n'ont jamais atteint l'écran que
+# l'humain regarde vraiment. C'est le défaut que t-46 venait de corriger DANS la légende
+# (deux tables de couleurs qui divergent) reparu un cran plus haut, entre deux rendus.
+# Les couleurs restent prises dans les variables de thème, jamais recopiées en hexadécimal.
+_LEGENDE = """<div id="legend">
+  <span class="item"><span class="sw" style="background:var(--done)"></span>fait</span>
+  <span class="item"><span class="sw" style="background:var(--running)"></span>en cours</span>
+  <span class="item"><span class="sw" style="background:var(--finishing)"></span>rédaction du rapport</span>
+  <span class="item"><span class="sw" style="background:var(--ready)"></span>lançable</span>
+  <span class="item"><span class="sw" style="background:var(--queued)"></span>en attente</span>
+  <span class="lsep"></span>
+  <span class="item"><span class="sw rond" style="background:var(--m-haiku)"></span>haiku</span>
+  <span class="item"><span class="sw rond" style="background:var(--m-sonnet)"></span>sonnet</span>
+  <span class="item"><span class="sw rond" style="background:var(--m-opus)"></span>opus</span>
+  <span style="margin-left:auto" id="foot"></span>
+</div>"""
+
 _JS = r"""
 (function(){
-var D=null, S={sel:null,hover:null,q:"",filter:"reste",closed:{},docs:{},view:"graphe"};
+// Détection d'un chargement en colonne du mur (t-49) : posée tout de suite, avant la
+// première donnée, pour qu'aucun flash du doublon h1 ne précède son masquage (voir la
+// règle html.embarque dans _CSS). En page de fichier ou en panneau visité seul, parent
+// vaut window et cette classe n'est jamais posée.
+if(window.parent!==window)document.documentElement.classList.add("embarque");
+var D=null, S={sel:null,hover:null,closed:{},docs:{},repliOuvert:{}};
 var byId={};
 // Les repères du chantier pour les jauges du détail (médiane, plafond) : calculés une
 // seule fois par jeu de données, pas à chaque case ouverte. Voir ordoContexte().
@@ -1391,12 +1512,59 @@ var COL={done:"#46a35a",running:"#d3a03a",finishing:"#8b5cf6",ready:"#5aa2f0",
 var LAB={done:"fait",running:"en cours",finishing:"termine",ready:"lançable",
          queued:"en attente",blocked:"bloquée",cancelled:"annulée"};
 function settled(t){var k=kind(t);return k==="done"||k==="cancelled"}
-function focusId(){return S.hover||S.sel}
-function matches(t){
-  var q=S.q.trim().toLowerCase();
-  if(!q)return true;
-  return (t.id+" "+t.title+" "+(t.facts.zones||"")).toLowerCase().indexOf(q)>=0;
+// Une tâche jamais commencée (brief t-58, point 4) : aucun critère coché ET jamais
+// démarrée -- les deux ensemble, jamais l'un sans l'autre. "jamais commencée" n'est PAS
+// "sans critère coché" : une tâche relancée après un échec a pu tourner sans rien
+// cocher (checkDone à 0) mais garde l'elapsedS posé par son premier passage -- elle
+// n'est pas vierge, son temps écoulé reste une information et sa case garde son
+// affichage complet (voir jamaisLancee dans rowNode()).
+function jamaisCommencee(t){return t.checkDone===0&&t.elapsedS==null}
+// Repli de tâche (t-44), un cran plus bas que le repli de phase (voir `fini` dans
+// render()) : une tâche réglée (finie ou annulée) que plus personne n'attend. DIRECTE,
+// pas transitive -- dès qu'une dépendante immédiate est elle-même réglée, le lien qui
+// rendait cette tâche visible est consommé, ce qui se passe deux crans plus loin ne la
+// concerne plus. Une tâche réglée sans aucune dépendante se replie aussi : personne ne
+// l'attendait par définition. Mais une SEULE dépendante directe encore vivante (queued,
+// ready, blocked ou running) suffit à garder la case : c'est le repère qui montre d'où
+// vient ce qui tourne en ce moment, il ne doit jamais disparaître derrière une ligne.
+function repliable(t){
+  return settled(t)&&t.dependants.every(function(id){
+    var d=byId[id];return !d||settled(d);
+  });
 }
+// Condensation de la liste repliée (t-56) : une phase ancienne pouvait replier vingt
+// tâches (t-44), une ligne chacune, qui mangeaient la moitié de l'écran et repoussaient
+// hors de vue la tâche en cours plus bas dans la phase suivante. Au-delà de ce seuil,
+// la liste elle-même se condense en une seule ligne portant leur nombre -- cinq ou
+// moins, rien ne change, le seuil n'existe que pour les phases lourdes.
+var SEUIL_REPLI_TACHES=5;
+// rowNode et surBascule reçus en paramètres plutôt que lus sur S ou p : cette fonction
+// ne construit qu'un DOM à partir de ce qu'on lui donne, sans connaître ni la clé de
+// phase ni l'état global, ce qui la rend exécutable seule sous Node (voir
+// TestCondensationDeLaListeRepliee) exactement comme peindreProgres() pour le mur.
+// Le même bouton ouvre et referme (même écouteur, condition inversée) : il n'existe
+// qu'au-delà du seuil, cinq ou moins ne le construit jamais et la liste retrouve
+// exactement le rendu d'avant t-56. Point 4 du brief : ne reçoit jamais que `repliees`,
+// jamais les tâches non repliables -- leur case reste dans `rangs`, hors de ce compte.
+function construireListeRepli(repliees,ouvert,rowNode,surBascule){
+  var listeRepli=el("div","rlist repli");
+  var condenseRepli=repliees.length>SEUIL_REPLI_TACHES;
+  var ouvertRepli=!condenseRepli||!!ouvert;
+  if(condenseRepli){
+    var btRepli=document.createElement("button");
+    btRepli.type="button";
+    btRepli.className="rrepli"+(ouvertRepli?" open":"");
+    btRepli.appendChild(el("span","chev2","▸"));
+    btRepli.appendChild(el("span",null,repliees.length+" tâches réglées"));
+    btRepli.addEventListener("click",function(){surBascule(!ouvertRepli)});
+    listeRepli.appendChild(btRepli);
+  }
+  if(ouvertRepli){
+    repliees.forEach(function(t){listeRepli.appendChild(rowNode(t))});
+  }
+  return listeRepli;
+}
+function focusId(){return S.hover||S.sel}
 // Chaine TRANSITIVE, pas seulement les voisins directs : ce qu'on veut savoir en survolant
 // une tache, c'est tout ce qui la precede et tout ce qui tombe si elle tombe.
 function related(id){
@@ -1436,9 +1604,18 @@ function rowNode(t){
   // titre, comme une phase repliée (voir .condensed) un cran plus haut. Ouverte (sel),
   // rien ne change : c'est la même règle qu'à la condensation des phases dans render().
   var condense=settled(t)&&!sel;
+  // Une tâche jamais commencée (brief t-58, point 4), fermée : elle n'a rien à dire
+  // qu'un titre -- voir jamaisCommencee() et son emploi plus bas, pour la ligne de
+  // progression comme pour la mise en page de l'en-tête. !settled(t) exclut une tâche
+  // ANNULÉE avant même d'avoir démarré (jamaisCommencee peut valoir vrai pour elle aussi)
+  // : le repli de tâche (t-44, `repliable()`) et sa mise en page à part la prennent déjà
+  // en charge -- jamaisLancee et condense restent ainsi mutuellement exclusifs, jamais
+  // les deux mises en page en concurrence sur la même case.
+  var jamaisLancee=jamaisCommencee(t)&&!sel&&!settled(t);
   var cls="row "+k;
   if(sel)cls+=" sel";
-  if(S.filter==="reste"&&settled(t))cls+=" settled";
+  if(settled(t))cls+=" settled";
+  if(jamaisLancee)cls+=" vierge";
   var row=el("div",cls);
   row.setAttribute("data-row",t.id);
   // La barre de couleur PORTE l'etat : la repeter en toutes lettres sur la case coutait
@@ -1447,18 +1624,31 @@ function rowNode(t){
   var sb=el("span","sb");sb.style.background=COL[k];sb.title=LAB[k];row.appendChild(sb);
 
   var head=el("div","rhead");
-  head.appendChild(el("span","rid m",t.id));
+  // Le nom du modèle ne s'écrit plus sur la case compacte (brief t-46), et depuis ne
+  // teint plus non plus le TEXTE de l'identifiant (brief t-58, point 2, retouche de
+  // l'humain) : ça abîmait la lisibilité de l'identifiant, ce qu'on cherche en premier,
+  // pour porter une information secondaire. À la place, une pastille ronde (.mdot,
+  // partagée avec le détail plus bas) posée AVANT l'identifiant, qui reste un texte
+  // comme un autre (voir .rid). La classe ne se prend QUE dans cette table de modèles
+  // connus : la poser telle quelle laisserait écrire n'importe quel nom de classe de la
+  // feuille de style depuis un --model tapé à la main. Hérité, défaut ou l'absence de
+  // modèle ne matchent rien : AUCUNE pastille ne se construit alors, jamais une pastille
+  // grise par défaut -- le point de prudence du brief. L'infobulle qui donnait le modèle
+  // en clair suit la teinte : sur la pastille quand elle existe, retombe sur
+  // l'identifiant sinon, pour ne jamais perdre l'information d'un modèle non reconnu.
+  var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
+  var rid=el("span","rid",t.id);
   if(t.model){
-    // La teinte ne se prend QUE dans cette table. t.model vient de l'etat, donc d'un
-    // --model tape a la main : le poser tel quel en classe laisserait ecrire n'importe
-    // quel nom de classe de la feuille de style depuis un lancement.
-    var connu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
-    var md=el("span","mdl m"+connu+(t.modelPredit?" predit":""),t.model);
-    // title est une propriete, jamais du balisage : un motif de routage y passe sans
-    // risque, et c'est la que se conteste le choix du modele.
-    md.title=(t.modelPredit?"prévu : ":"")+(t.modelWhy||"");
-    head.appendChild(md);
+    var titreModele=t.model+" — "+(t.modelPredit?"prévu : ":"")+(t.modelWhy||"");
+    if(mconnu){
+      var mdot=el("span","mdot"+mconnu);
+      mdot.title=titreModele;
+      head.appendChild(mdot);
+    }else{
+      rid.title=titreModele;
+    }
   }
+  head.appendChild(rid);
   var links=el("span","rlinks m");
   // Durée et contexte AVANT les liens, et toujours visibles : ce sont les deux chiffres
   // qu'on lit pendant qu'une tâche tourne, c'est-à-dire au seul moment où on la regarde.
@@ -1506,11 +1696,23 @@ function rowNode(t){
       : "contexte du dernier tour";
     links.appendChild(tk);
   }
-  links.appendChild(el("span",t.deps.length?"nup":"nnone","↑"+t.deps.length));
-  links.appendChild(el("span",t.dependants.length?"ndown":"nnone","↓"+t.dependants.length));
-  head.appendChild(links);
+  // Le nombre de dépendances et de dépendantes (brief t-58, point 1) : personne ne les
+  // lit sans ouvrir la tâche, et ils occupaient le coin haut droit au moment où la place
+  // manque le plus. Retirés de la case fermée -- ils restent lisibles au détail, dans la
+  // chaîne attend/débloque (voir detailNode() plus bas, jamais touchée par ce retrait).
+  //
+  // jamaisLancee (point 4) : ces quatre champs sont TOUJOURS vides pour une tâche jamais
+  // commencée (elapsedS/status l'excluent), donc `links` resterait un span sans aucun
+  // enfant -- jamais attaché, pour ne pas casser en flux normal le flux du titre qui
+  // rejoint l'identifiant juste en dessous (voir .row.vierge .rhead, display:flex sur
+  // .rlinks romprait la ligne même vide).
+  if(!jamaisLancee)head.appendChild(links);
   row.appendChild(head);
-  row.appendChild(el("div","rtitle",t.title));
+  if(jamaisLancee){
+    head.appendChild(el("span","rtitle",t.title));
+  }else{
+    row.appendChild(el("div","rtitle",t.title));
+  }
 
   // La progression de checklist et le critère en cours, visibles SANS ouvrir la tâche et
   // dans les deux vues : sur une case fermée en vue graphe, rmeta (ci-dessous) ne s'affiche
@@ -1522,7 +1724,9 @@ function rowNode(t){
   // ni à son indentation d'origine : la case rouverte (sel) doit retrouver l'exacte même
   // construction qu'avant cette tâche, jamais une variante, et les tests qui découpent ce
   // bloc au caractère près (voir TestEcritureDuRapportEnCours) restent valables tels quels.
-  if(!condense){
+  // jamaisLancee (brief t-58, point 4) rejoint ce même garde-fou : un "0/9" sur une tâche
+  // jamais commencée n'apprend rien que le titre ne dise déjà.
+  if(!condense&&!jamaisLancee){
   if(t.checkTotal){
     var prog=el("div","rprog");
     prog.appendChild(el("span","cnt",t.checkDone+"/"+t.checkTotal));
@@ -1548,7 +1752,7 @@ function rowNode(t){
   }
   }
 
-  if(S.view!=="graphe"||sel){
+  if(sel){
     var meta=el("div","rmeta");
     meta.appendChild(el("span","m",t.meta||""));
     meta.appendChild(el("span","zones",t.facts.zones||""));
@@ -1704,8 +1908,18 @@ function detailNode(t){
   if(t.model||(pane&&pane!=="-")||essais||comp!=null||niveau!=null){
     var strip=el("div","strip");
     if(t.model){
+      // La case compacte ne montre que la teinte sur l'identifiant (voir .rid ci-dessus) :
+      // chaque pixel y compte. Ici, la tâche est dépliée -- il y a la place, et c'est le
+      // moment où on cherche justement le détail -- donc le nom s'écrit en entier, à côté
+      // de sa pastille (retouche de l'humain). Même garde-fou de classe qu'au .rid : la
+      // table est la seule source de la teinte, jamais un nom de classe pris tel quel
+      // depuis un --model tapé à la main.
       var connu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
-      strip.appendChild(el("span","mdl m"+connu+(t.modelPredit?" predit":""),t.model));
+      var md=el("span","mdl m"+(t.modelPredit?" predit":""));
+      md.appendChild(el("span","mdot"+connu));
+      md.appendChild(document.createTextNode(t.model));
+      md.title=t.model+" — "+(t.modelPredit?"prévu : ":"")+(t.modelWhy||"");
+      strip.appendChild(md);
     }
     if(pane&&pane!=="-"){
       var vivant=/vivant/i.test(pane), mort=/MORT/.test(pane);
@@ -1890,28 +2104,30 @@ function detailNode(t){
       // d'estimation : ce cas est le cas MAJORITAIRE aujourd'hui, pas le cas limite.
       if(c.duree)top.appendChild(el("span","cdur",c.duree));
       line.appendChild(top);
-      // Attributs de nature (brief t-39), en clair et non plus en initiale (retouche
-      // t-41) : sur les seize valeurs d'ATTRIBUTS_VALEURS (côté Python), aucune n'est
-      // partagée entre deux clés, donc la valeur écrite en toutes lettres identifie sa
-      // clé toute seule, sans table de correspondance à apprendre par cœur -- ce que
-      // "M", l'initiale qui précédait cette retouche, n'offrait qu'au survol.
+      // Attributs de nature (brief t-39), en clair (retouche t-41) puis clé ET valeur
+      // (retouche demandée par l'humain, même passe que t-44) : "M" puis la valeur seule
+      // n'identifiaient leur clé qu'au survol -- faux repos pour qui connaît déjà les
+      // cinq clés par cœur, mais c'est qui les découvre qui compte. La clé traverse
+      // maintenant à l'écran, jamais seulement dans title/aria-label ci-dessous.
       //
       // SOUS le libellé, jamais à côté de lui (ligne .ctop ci-dessus) : mesuré sur les
-      // 201 critères qualifiés de camcast (tous porteurs de leurs cinq attributs), les
-      // valeurs d'un même critère concaténées font jusqu'à 47 caractères, et son libellé
-      // jusqu'à 41 -- la colonne de mur la plus étroite (340px) ne tient jamais les deux
-      // côte à côte sans tronquer ou repousser le libellé, ce que l'invariant du brief
-      // interdit. flex-wrap : une valeur qui ne tient pas passe à la ligne suivante,
-      // jamais tronquée, jamais aux dépens du libellé.
+      // 201 critères qualifiés de camcast, un libellé fait jusqu'à 41 caractères, ce
+      // qu'aucune colonne de mur (340px, sa plus étroite) ne tient à côté de rien
+      // d'autre -- l'invariant du brief interdit d'y toucher. Les marqueurs se replient
+      // donc sur deux lignes sous lui plutôt qu'à côté (flex-wrap sur .cattrs) ; à
+      // l'intérieur d'un même marqueur, c'est la clé qui cède si la paire ne tient
+      // toujours pas (.cattrk se coupe à l'ellipse), jamais la valeur (.cattrv, entière).
       //
       // title reste le minimum demandé par le brief ; aria-label en plus, pour qui
       // navigue au clavier ou au lecteur d'écran, jamais forcé à bouger une souris pour
-      // retrouver la clé.
+      // retrouver la clé -- y compris quand elle s'est coupée à l'écran.
       if(c.attrs&&c.attrs.length){
         var ca=el("span","cattrs");
         c.attrs.forEach(function(a){
-          var mk=el("span","cattr m",a.valeur);
+          var mk=el("span","cattr");
           var titre=a.cle+" : "+a.valeur;
+          mk.appendChild(el("span","cattrk m",a.cle));
+          mk.appendChild(el("span","cattrv m"," : "+a.valeur));
           mk.title=titre;
           mk.setAttribute("aria-label",titre);
           ca.appendChild(mk);
@@ -1942,51 +2158,62 @@ function detailNode(t){
   return d;
 }
 
+// Une case sans rien à sa droite reprend la largeur libre (brief t-58, point 7) : le
+// placement par rang et niveau ne change pas (voir render() ci-dessous, qui construit
+// `rangs` avant d'appeler cette fonction) -- seule la LARGEUR d'un rang qui n'a
+// personne à côté de lui sur sa ligne change. Le flex-wrap qui pose ces rangs côte à
+// côte ne dit lui-même jamais où une ligne casse : il faut lire les positions RÉELLES
+// une fois posées dans le DOM pour le savoir, d'où une mesure plutôt qu'un calcul a
+// priori. Le dernier rang de chaque ligne (seul ou non) qui laisse de la place à sa
+// droite reçoit la classe .etire, qui lève son plafond de largeur -- flex-grow, déjà
+// posé sur .rang, fait alors tout le travail de redistribution ; un rang qui partage sa
+// ligne à plein (aucune place restante) ne reçoit jamais cette classe, donc ne bouge
+// pas (précaution 2 du brief).
+function elargirRangsSansVoisin(rangsEl){
+  var rangs=rangsEl.children;
+  if(!rangs.length)return;
+  var cadre=rangsEl.getBoundingClientRect();
+  var i=0;
+  while(i<rangs.length){
+    var r=rangs[i].getBoundingClientRect(), top=r.top, j=i, droite=r.right;
+    while(j+1<rangs.length){
+      var rj=rangs[j+1].getBoundingClientRect();
+      if(Math.round(rj.top)!==Math.round(top))break;
+      j++;droite=rj.right;
+    }
+    // Seuil de 2px : couvre l'arrondi des sous-pixels d'un rang déjà pile à son plafond,
+    // jamais une vraie place libre.
+    if(cadre.right-droite>2)rangs[j].classList.add("etire");
+    i=j+1;
+  }
+}
+
 function render(){
   var board=document.getElementById("board");
-  board.className="view-"+S.view;
+  board.className="view-graphe";
   var wires=document.getElementById("wires");
   board.innerHTML="";
   if(wires)board.appendChild(wires);
 
-  // Rien ne tourne nulle part dans la campagne : entre deux tâches, plus aucune phase ne
-  // porterait de tâche en cours et l'écran se replierait en entier, l'inverse du but
-  // recherché. Repli de repli : la première phase de l'ordre du graphe qui porte encore
-  // du travail (une tâche ni finie ni annulée) reste ouverte à la place. Dès qu'une tâche
-  // démarre quelque part, `anyRunning` redevient vrai et ce filet ne joue plus.
-  var anyRunning=D.phases.some(function(p){
-    return p.order.map(function(i){return byId[i]}).filter(Boolean)
-      .some(function(t){return t.status==="running"});
-  });
-  var defaultKey=null;
-  if(!anyRunning){
-    D.phases.some(function(p){
-      var all=p.order.map(function(i){return byId[i]}).filter(Boolean);
-      if(all.some(function(t){return !settled(t)})){defaultKey=p.key;return true}
-      return false;
-    });
-  }
-
   var vues=0, condense=null;
   D.phases.forEach(function(p){
     var all=p.order.map(function(i){return byId[i]}).filter(Boolean);
-    var shown=all.filter(matches);
+    var shown=all;
     // Compté ici, avant le repli condensé ci-dessous : une phase compacte ne construit
-    // plus ses lignes, mais ses tâches ont bien été matchées et ne doivent pas faire
-    // croire à un plateau vide.
+    // plus ses lignes, et ses tâches ne doivent pas faire croire à un plateau vide.
     vues+=shown.length;
     var faits=all.filter(function(t){return kind(t)==="done"}).length;
     var fini=all.length>0&&all.every(settled);
     var forced=S.closed[p.key];
-    var running=all.some(function(t){return t.status==="running"});
-    // Le défaut suit ce qui bouge : seule une phase qui porte une tâche en cours reste
-    // ouverte, les autres se replient — finies ou pas encore commencées. C'est recalculé à
-    // chaque rendu, donc une phase se replie quand elle finit et s'ouvre quand une tâche y
-    // démarre, sans rien de plus à écrire. S.closed[p.key] reste le seul forçage manuel :
-    // quand il est défini, il décide SEUL (jamais `running`), dans les deux sens — une
-    // phase ouverte à la main ne se referme pas parce qu'elle finit, une phase fermée à la
+    // Nouvelle règle par défaut, au PREMIER rendu, avant tout choix de l'humain (brief
+    // t-58, point 6) : une phase ENTIÈREMENT finie ou annulée part fermée, toute autre
+    // part OUVERTE -- y compris celle dont aucune tâche n'a encore démarré, qui dit
+    // justement ce qui vient. `fini` sert déjà à la condensation ci-dessous, jamais
+    // recalculé deux fois. S.closed[p.key] reste le seul forçage manuel : quand il est
+    // défini, il décide SEUL (jamais `defautOuvert`), dans les deux sens — une phase
+    // ouverte à la main ne se referme pas parce qu'elle finit, une phase fermée à la
     // main ne se rouvre pas parce qu'une tâche y démarre.
-    var defautOuvert=anyRunning?running:(p.key===defaultKey);
+    var defautOuvert=!fini;
     var open=shown.length>0&&(forced===undefined?defautOuvert:!forced);
 
     // Une phase finie ET repliée n'a plus rien à dire qu'un numéro, un libellé et un
@@ -2025,9 +2252,32 @@ function render(){
     sec.appendChild(el("div","pwhy"+(p.why?"":" absent"),
       p.why||'sans explication : ordo group '+D.campaign.id+' '+(p.key||"")+' "'+p.name+'" --why "..."'));
 
+    // Repli de tâche (t-44) : une phase encore ouverte (donc pas déjà condensée ci-dessus
+    // par `fini&&!open`) sort ses tâches repliables de la grille de cases pour une liste
+    // compacte en tête de phase -- le reste garde ses cases et ses liens (les arcs se
+    // dessinent par data-row, où qu'il soit dans le DOM, voir draw()).
+    var repliees=shown.filter(repliable);
+    var reste=shown.filter(function(t){return !repliable(t)});
+    if(repliees.length){
+      // rowNode(t) telle quelle, sans paramètre ni branche ajoutés : une case réglée et
+      // fermée y construit déjà en-tête et titre sans rien de plus (condition de t-24
+      // inchangée). .repli (CSS) tasse ces deux blocs sur une seule ligne au lieu de deux
+      // ; le titre, seul champ de longueur imprévisible, se coupe à l'ellipse plutôt que
+      // de revenir à la ligne. Une case sélectionnée n'y reste que par sa position :
+      // .repli ne stylant que .row:not(.sel), elle retrouve alors sa présentation entière.
+      // Au-delà de cinq (t-56), construireListeRepli condense cette liste en une seule
+      // ligne : le choix de l'humain se garde dans S -- même mécanisme que S.closed
+      // pour le repli de phase (t-13), un objet qui survit aux rendus tant que la page
+      // ne recharge pas, jamais réinitialisé par un changement d'état de tâche ni par
+      // un battement du serveur.
+      var listeRepli=construireListeRepli(repliees,S.repliOuvert[p.key],rowNode,
+        function(v){S.repliOuvert[p.key]=v;render()});
+      sec.appendChild(listeRepli);
+    }
+
     var rangs=el("div","rangs");
     var parNiveau={};
-    shown.forEach(function(t){(parNiveau[t.level]=parNiveau[t.level]||[]).push(t)});
+    reste.forEach(function(t){(parNiveau[t.level]=parNiveau[t.level]||[]).push(t)});
     Object.keys(parNiveau).map(Number).sort(function(a,b){return a-b}).forEach(function(lv){
       var ts=parNiveau[lv];
       var tient=ts.some(function(t){return t.id===S.sel});
@@ -2038,8 +2288,13 @@ function render(){
     });
     sec.appendChild(rangs);
     board.appendChild(sec);
+    // Une case sans rien à sa droite reprend la largeur libre (brief t-58, point 7) :
+    // mesuré seulement une fois `sec` attachée au document (rangs a sa géométrie réelle),
+    // et seulement si la phase est ouverte -- une phase fermée (display:none) n'a pas de
+    // géométrie exploitable, et rien n'y est visible de toute façon.
+    if(open)elargirRangsSansVoisin(rangs);
   });
-  if(!vues)board.appendChild(el("div","empty","aucune tache ne correspond au filtre."));
+  if(!vues)board.appendChild(el("div","empty","aucune tâche dans ce chantier."));
   paintTop();
   paintFocus();
 }
@@ -2113,12 +2368,50 @@ function paintHeure(){
   var min=D&&D.restantChantierMin;
   var connu=min!=null;
   rEl.hidden=!connu;fEl.hidden=!connu;
-  if(!connu)return;
-  rEl.textContent=dureeMin(min);
-  var r=finChantier(new Date(),min);
-  fEl.textContent="";
-  fEl.appendChild(document.createTextNode(r.heure));
-  if(r.jours>0)fEl.appendChild(el("sup",null,"+"+r.jours));
+  var r=null;
+  if(connu){
+    rEl.textContent=dureeMin(min);
+    r=finChantier(new Date(),min);
+    fEl.textContent="";
+    fEl.appendChild(document.createTextNode(r.heure));
+    if(r.jours>0)fEl.appendChild(el("sup",null,"+"+r.jours));
+  }
+  annoncerOnglet(connu,connu?rEl.textContent:null,r);
+}
+
+// Résumé de la progression par phase (t-57) : même décompte que la boucle qui peint #segs
+// plus bas, mis en fonction pour être transmis à l'onglet du mur sans dupliquer le calcul.
+// Pure : ne lit que D/byId/kind, jamais le DOM.
+function resumePhases(){
+  return (D.phases||[]).map(function(p){
+    var ts=p.order.map(function(i){return byId[i]}).filter(Boolean);
+    var dn=ts.filter(function(t){return kind(t)==="done"}).length;
+    return {key:p.key||"-", nom:p.name, dn:dn, total:ts.length};
+  });
+}
+
+// Fait remonter à l'onglet du mur (t-49, complété t-57 de la progression et des alertes)
+// les valeurs déjà peintes ci-dessus et par paintTop() : jamais recalculées côté mur,
+// seulement transmises telles quelles. N'agit que depuis une colonne du mur (window.parent
+// différent de window, voir le classList posé en tête de ce fichier) ; en page de fichier
+// ou en panneau visité seul, l'appel ne fait rien.
+function annoncerOnglet(connu,restant,r){
+  if(window.parent===window)return;
+  var pct=document.getElementById("pct");
+  try{
+    window.parent.postMessage({
+      ordoOnglet: true,
+      id: D&&D.campaign&&D.campaign.id,
+      pct: pct?pct.textContent:"",
+      connu: connu,
+      restant: connu?restant:null,
+      heure: connu&&r?r.heure:null,
+      jours: connu&&r?r.jours:null,
+      phases: resumePhases(),
+      warn: (D&&D.warnings&&D.warnings.length)||0,
+      ask: (D&&D.questions&&D.questions.length)||0,
+    }, window.location.origin);
+  }catch(e){}
 }
 
 function paintTop(){
@@ -2128,45 +2421,64 @@ function paintTop(){
     (vivantes?Math.round(faits/vivantes*100):0)+"%";
   paintHeure();
   var segs=document.getElementById("segs");segs.innerHTML="";
-  D.phases.forEach(function(p){
-    var ts=p.order.map(function(i){return byId[i]}).filter(Boolean);
-    var dn=ts.filter(function(t){return kind(t)==="done"}).length;
+  resumePhases().forEach(function(p){
     var s=el("div","seg");
-    s.style.flex=(ts.length||1)+" 1 0";
-    s.title=(p.key||"-")+" "+p.name+" — "+dn+"/"+ts.length;
+    s.style.flex=(p.total||1)+" 1 0";
+    s.title=p.key+" "+p.nom+" — "+p.dn+"/"+p.total;
     var tr=el("div","track"),f=el("span","fill");
-    f.style.width=(ts.length?dn/ts.length*100:0)+"%";
-    f.style.background=(ts.length&&dn===ts.length)?"#46a35a":"#3c7a4a";
+    f.style.width=(p.total?p.dn/p.total*100:0)+"%";
+    f.style.background=(p.total&&p.dn===p.total)?"#46a35a":"#3c7a4a";
     tr.appendChild(f);s.appendChild(tr);
-    s.appendChild(el("div","lab m",p.key||"-"));
+    s.appendChild(el("div","lab m",p.key));
     segs.appendChild(s);
   });
-  var reste=D.tasks.filter(function(t){return !settled(t)}).length;
-  document.getElementById("n-reste").textContent=reste;
-  document.getElementById("n-tout").textContent=D.tasks.length;
-  ["reste","tout"].forEach(function(k){
-    document.getElementById("f-"+k).classList.toggle("on",S.filter===k)});
-  ["graphe","liste"].forEach(function(v){
-    document.getElementById("v-"+v).classList.toggle("on",S.view===v)});
-
   var c=D.campaign;
   document.getElementById("cid").textContent=c.id;
   document.getElementById("ctx").textContent=
     [c.slug,c.state,c.tmuxSession].filter(Boolean).join(" · ");
-  var wb=document.getElementById("warn"), wc=document.getElementById("warnchip");
+  var wb=document.getElementById("warn"), wc=document.getElementById("warnchip"),
+      nw=document.getElementById("n-warn");
   if(wb&&wc){
-    wb.innerHTML="";
-    D.warnings.forEach(function(w){wb.appendChild(el("div",null,w.detail))});
     wc.hidden=!D.warnings.length;
-    wc.textContent=D.warnings.length+" alerte"+(D.warnings.length>1?"s":"");
-    if(D.warnings.length){wc.style.cursor="pointer";wc.style.borderColor="#63541f";
-      wc.style.color="#e3b341"}
-    var cache=false;
-    try{cache=sessionStorage.getItem(K("warn"))==="1"}catch(e){}
+    if(D.warnings.length){
+      if(nw)nw.textContent=D.warnings.length;
+      wc.title=D.warnings.length+" alerte"+(D.warnings.length>1?"s":"")+", cliquer pour la liste";
+      // Boîte identique à celle du calque des questions (askbox/askhead/askx) : même
+      // mécanisme réutilisé, jamais un second calque écrit pour la même idée.
+      wb.innerHTML="";
+      var boiteW=el("div","askbox");
+      var teteW=el("div","askhead");
+      teteW.appendChild(el("span",null,"alertes"));
+      teteW.appendChild(el("span","askmore",""+D.warnings.length));
+      var xw=el("button","askx","×");
+      xw.title="fermer";
+      xw.addEventListener("click",function(){
+        wb.hidden=true;try{sessionStorage.setItem(K("warn"),"1")}catch(e){}
+      });
+      teteW.appendChild(xw);
+      boiteW.appendChild(teteW);
+      var listeW=el("div","warnlist");
+      D.warnings.forEach(function(w){listeW.appendChild(el("div",null,w.detail))});
+      boiteW.appendChild(listeW);
+      wb.appendChild(boiteW);
+    }
+    // Fermé par défaut, contrairement à l'ancien bandeau : un calque plein écran qui
+    // s'ouvrirait tout seul au chargement couvrirait la page avant même qu'on ait pu la
+    // lire. Il ne s'ouvre qu'au clic sur la pastille (voir plus bas) -- seule une
+    // fermeture déjà faite par ce clic est mémorisée, jamais une ouverture.
+    var cache=true;
+    try{
+      var m=sessionStorage.getItem(K("warn"));
+      if(m!==null)cache=m==="1";
+    }catch(e){}
     wb.hidden=!D.warnings.length||cache;
   }
   paintAsk();
-  var bouts=["survol = liens · clic = détail · échap = fermer"];
+  // Les trois raccourcis ne sont plus rappelés : ils se répétaient au bas de CHAQUE colonne
+  // du mur, soit jusqu'à six fois à l'écran, pour une phrase qu'on lit une fois et qu'on
+  // n'oublie plus. Le pied ne garde que ce qui varie d'un chantier à l'autre, et reste vide
+  // quand il n'y a rien à signaler.
+  var bouts=[];
   if(D.missingWhy.length)bouts.unshift(D.missingWhy.length+" sans explication");
   var annoncees=D.phases.filter(function(p){return p.planned&&p.key})
     .map(function(p){return p.key});
@@ -2254,8 +2566,7 @@ function selectionner(noeud){
 function draw(){
   var svg=document.getElementById("wires"), board=document.getElementById("board");
   if(!svg||!board)return;
-  var id=focusId(), graphe=S.view==="graphe";
-  if(!graphe&&!id){svg.innerHTML="";svg.setAttribute("height",0);return}
+  var id=focusId();
   var base=board.getBoundingClientRect();
   // Une ligne dans une phase repliee existe toujours dans le DOM, mais son conteneur est
   // en display:none et son rectangle vaut zero partout. Sans ce controle, chaque arc qui
@@ -2295,38 +2606,76 @@ function draw(){
       return '<marker id="ah-'+p[0]+'" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5"'+
         ' markerHeight="5" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="'+p[1]+'"/></marker>';
     }).join("")+'</defs>';
-  if(graphe)D.tasks.forEach(function(t){t.deps.forEach(function(p){
-    if(id&&(p===id||t.id===id))return;
-    out+=arc(p,t.id,"#55606f","ah-d",1.2,id?0.12:0.8);
-  })});
+  // Une tâche repliée (t-44) n'a plus de case : un arc qui la vise partirait vers une
+  // ligne de la liste compacte en tête de phase, jamais vers le même repère visuel que
+  // les autres cases -- ce trait ne dit plus rien, il brouille juste le dessin. Aucun
+  // arc ne se trace vers elle ni depuis elle, qu'il vienne du maillage ambiant ou du
+  // focus d'une tâche voisine.
+  function enCase(t){return !repliable(t)}
+  D.tasks.forEach(function(t){
+    if(!enCase(t))return;
+    t.deps.forEach(function(p){
+      if(id&&(p===id||t.id===id))return;
+      var dp=byId[p];
+      if(dp&&!enCase(dp))return;
+      out+=arc(p,t.id,"#55606f","ah-d",1.2,id?0.12:0.8);
+    });
+  });
   var t=id?byId[id]:null;
-  if(t){
-    t.deps.forEach(function(p){out+=arc(p,id,"#5fa96f","ah-g",1.8,1)});
-    t.dependants.forEach(function(c){out+=arc(id,c,"#5aa2f0","ah-b",1.8,1)});
+  if(t&&enCase(t)){
+    t.deps.forEach(function(p){
+      var dp=byId[p];
+      if(!dp||enCase(dp))out+=arc(p,id,"#5fa96f","ah-g",1.8,1);
+    });
+    t.dependants.forEach(function(c){
+      var dc=byId[c];
+      if(!dc||enCase(dc))out+=arc(id,c,"#5aa2f0","ah-b",1.8,1);
+    });
   }
   svg.innerHTML=out;
   svg.setAttribute("height",board.scrollHeight);
 }
 
-document.getElementById("q").addEventListener("input",function(e){S.q=e.target.value;render()});
-["reste","tout"].forEach(function(k){
-  document.getElementById("f-"+k).addEventListener("click",function(){S.filter=k;render()})});
-["graphe","liste"].forEach(function(v){
-  document.getElementById("v-"+v).addEventListener("click",function(){S.view=v;render()})});
+// Bascule des calques #warn/#ask, factorisée (t-57) pour être appelée aussi bien par un
+// clic local (page seule ou panneau visité hors mur) que par le message envoyé depuis
+// l'onglet du mur, qui porte maintenant la pastille (voir plus bas et _MUR_JS) -- même
+// calque, ouvert par le même geste, où qu'il soit déclenché.
 var wb=document.getElementById("warn"),wc=document.getElementById("warnchip");
-if(wb&&wc){wc.addEventListener("click",function(){
-  wb.hidden=!wb.hidden;try{sessionStorage.setItem(K("warn"),wb.hidden?"1":"0")}catch(e){}});
-  try{if(sessionStorage.getItem(K("warn"))==="1")wb.hidden=true}catch(e){}}
+function basculerWarn(){
+  if(!wb)return;
+  wb.hidden=!wb.hidden;
+  // Les deux calques occupent le même plein écran (voir #ask,#warn en CSS) : n'en montrer
+  // qu'un à la fois, sinon celui posé en dernier dans le DOM (#ask) cacherait l'autre sans
+  // que rien ne le dise.
+  if(!wb.hidden){var askEl=document.getElementById("ask");if(askEl)askEl.hidden=true}
+  try{sessionStorage.setItem(K("warn"),wb.hidden?"1":"0")}catch(e){}
+}
+if(wc)wc.addEventListener("click",basculerWarn);
+if(wb){try{if(sessionStorage.getItem(K("warn"))==="1")wb.hidden=true}catch(e){}}
+
 var ac=document.getElementById("askchip");
-if(ac)ac.addEventListener("click",function(){
+function basculerAsk(){
   var box=document.getElementById("ask");
   if(!box)return;
   box.hidden=!box.hidden;
+  if(!box.hidden&&wb)wb.hidden=true;
   // Rouvrir efface le masquage, sinon le prochain battement le refermerait aussitot.
   try{
     if(box.hidden)sessionStorage.setItem(K("ask"),box.getAttribute("data-q")||"");
     else sessionStorage.removeItem(K("ask"));
   }catch(e){}
+}
+if(ac)ac.addEventListener("click",basculerAsk);
+
+// Reçoit le clic porté par l'onglet du mur (t-57) sur sa pastille d'alerte : le calque vit
+// dans CETTE fenêtre (le panneau), jamais dans le mur, qui ne peut donc que demander de
+// l'ouvrir -- jamais le construire lui-même ni le dupliquer.
+window.addEventListener("message",function(e){
+  if(e.origin!==window.location.origin)return;
+  var msg=e.data;
+  if(!msg)return;
+  if(msg.ordoOuvrir==="warn")basculerWarn();
+  else if(msg.ordoOuvrir==="ask")basculerAsk();
 });
 window.addEventListener("keydown",function(e){if(e.key==="Escape"&&S.sel){S.sel=null;render()}});
 window.addEventListener("resize",draw);
@@ -2388,24 +2737,14 @@ def html(m: dict, interval: int = 0) -> str:
       <span id="hend"><span class="m" id="hrest" hidden></span><span class="m" id="hfin" hidden></span><span class="pct m" id="pct"></span></span></h1>
   <div id="segs"></div>
   <div id="bar">
-    <input id="q" placeholder="filtrer : id, titre, zone…" autocomplete="off">
-    <button class="pill" id="f-reste">reste<b class="m" id="n-reste"></b></button>
-    <button class="pill" id="f-tout">tout<b class="m" id="n-tout"></b></button>
-    <span class="pill" id="warnchip" hidden></span>
+    <span class="pill" id="warnchip" hidden><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><b class="m" id="n-warn"></b></span>
     <span class="pill" id="askchip" hidden></span>
-    <div id="views"><button id="v-graphe">graphe</button><button id="v-liste">liste</button></div>
   </div>
 </div>
 <div id="warn" hidden></div>
 <div id="ask" hidden></div>
 <div id="board"><svg id="wires"></svg></div>
-<div id="legend">
-  <span class="item"><span class="sw" style="background:#46a35a"></span>fait</span>
-  <span class="item"><span class="sw" style="background:#d3a03a"></span>en cours</span>
-  <span class="item"><span class="sw" style="background:#5aa2f0"></span>lançable</span>
-  <span class="item"><span class="sw" style="background:#4a5361"></span>en attente</span>
-  <span style="margin-left:auto" id="foot"></span>
-</div>
+{_LEGENDE}
 <script>window.ORDO={_json(vue(m))};</script>
 <script>{_JS}</script>
 </body></html>
@@ -2532,13 +2871,9 @@ def panneau(home: str, campaign: str, poll: int = POLL_S) -> str:
       <span id="hend"><span class="m" id="hrest" hidden></span><span class="m" id="hfin" hidden></span><span class="pct m" id="pct"></span></span></h1>
   <div id="segs"></div>
   <div id="bar">
-    <input id="q" placeholder="filtrer : id, titre, zone..." autocomplete="off">
-    <button class="pill" id="f-reste">reste<b class="m" id="n-reste"></b></button>
-    <button class="pill" id="f-tout">tout<b class="m" id="n-tout"></b></button>
-    <span class="pill" id="warnchip" hidden></span>
+    <span class="pill" id="warnchip" hidden><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><b class="m" id="n-warn"></b></span>
     <span class="pill" id="askchip" hidden></span>
     <span class="pill" id="dead" hidden></span>
-    <div id="views"><button id="v-graphe">graphe</button><button id="v-liste">liste</button></div>
   </div>
 </div>
 <div id="warn" hidden></div>
@@ -2563,7 +2898,6 @@ transition:opacity .3s}
 #pulse.stale{background:var(--blocked)}
 #wtop .tag{font-size:10.5px;color:var(--dim2);border:1px solid var(--line);
 border-radius:20px;padding:2px 8px;white-space:nowrap}
-#wtop .tag.live{border-color:#63541f;color:#d3a03a}
 #wtop .tag.err{border-color:#5a2f2f;color:#e05252}
 #wtop .tag.ask{border-color:#63541f;color:#e3b341;
 animation:ordopulse 2.2s ease-in-out infinite}
@@ -2587,21 +2921,147 @@ animation:ordopulse 2.2s ease-in-out infinite}
 #lgd{display:flex;gap:10px;margin-left:auto;font-size:10px;color:var(--dim2)}
 #lgd span.item{display:flex;align-items:center;gap:4px;white-space:nowrap}
 #lgd .sw{width:7px;height:7px;border-radius:2px;display:inline-block}
+/* Rond pour un modele, carre pour un etat : deux familles dans la meme legende, et
+   la forme les separe sans ajouter un mot. Meme convention que la legende de la page
+   autonome (#legend .sw.rond), pour qu'un aller-retour entre les deux ne surprenne pas. */
+#lgd .sw.rond{border-radius:50%}
+#lgd .lsep{width:1px;align-self:stretch;background:var(--line);flex:none}
 #wtop button{flex:none}
 #wtop button:disabled{opacity:.35;cursor:default}
+/* Boutons d'action sans libellé (t-48) : le texte tenait large sur une barre qui doit
+   rester sur une seule ligne à largeur d'écran normale. Le title porte le sens pour la
+   souris et les lecteurs d'écran ; aria-label le répète, une icône seule n'étant pas un
+   texte accessible par défaut. */
+.icon-btn{border:1px solid var(--line);background:var(--panel);color:#9aa4b1;
+border-radius:7px;display:inline-flex;align-items:center;justify-content:center;
+padding:6px;cursor:pointer}
+.icon-btn:hover{color:var(--txt);border-color:#3f4753}
 
 #cols{flex:1 1 auto;min-height:0;display:flex;align-items:stretch;overflow-x:auto}
 .col{display:flex;flex-direction:column;flex:1 1 0;min-width:340px;
 border-right:1px solid var(--line)}
-.chead{flex:none;display:flex;align-items:center;gap:5px;padding:5px 6px;
+.chead{flex:none;display:flex;flex-direction:column;
 background:var(--panel);border-bottom:1px solid var(--line2)}
-.chead select{flex:1 1 auto;min-width:0;background:var(--row);border:1px solid var(--line);
-border-radius:6px;color:var(--txt);font:inherit;font-size:11.5px;padding:3px 6px;
-outline:none}
-.chead select:focus{border-color:#2f6ba8}
+/* align-self:stretch, même raison que .trow2 juste dessous : .chead est un flex
+   column, où un enfant prend la largeur de son CONTENU. Mesuré : .trow occupait
+   251px d'une colonne de 533, et l'onglet 211 de ces 251 -- il remplissait
+   correctement un parent qui, lui, ne remplissait rien. */
+.trow{display:flex;align-items:center;gap:5px;padding:5px 6px 1px;
+align-self:stretch;width:100%}
 .chead button{flex:none;background:transparent;border:1px solid var(--line);border-radius:6px;
 color:var(--dim2);font:inherit;font-size:12px;line-height:1;padding:4px 7px;cursor:pointer}
 .chead button:hover{color:var(--txt);border-color:#3f4753}
+/* L'onglet (t-49) fusionne le select et la ligne identifiant/projet/état/session que
+   portait le panneau juste en dessous : deux classes, donc plus spécifique que
+   ".chead button" ci-dessus, qui l'emporterait sinon sur flex/background/padding sans
+   égard à l'ordre des règles. */
+.chead .tab{flex:1 1 auto;min-width:0;width:100%;display:flex;flex-direction:column;
+align-items:stretch;gap:3px;cursor:pointer;
+background:var(--row);border:1px solid var(--line);border-radius:6px;color:var(--txt);
+font:inherit;font-size:11.5px;padding:3px 8px;cursor:pointer;text-align:left}
+.chead .tab:hover{border-color:#3f4753}
+.chead .tab:focus-visible{outline:2px solid #3f7fc4;outline-offset:1px;border-color:#3f7fc4}
+.chead .tab[aria-expanded="true"]{border-color:#3f7fc4}
+.tdot{width:7px;height:7px;border-radius:50%;flex:none}
+/* Trois mots courts, jamais que la teinte (t-49, c3) : le mot voyage dans le title du
+   bouton, lu au survol comme au clavier. Couleurs reprises à la palette existante, aucune
+   inventée : done (vivant) pour ouvert, queued (déjà "en attente" dans la légende) pour en
+   sommeil, cancelled pour fermé. */
+.tdot.ouvert{background:var(--done)}
+.tdot.sommeil{background:var(--queued)}
+.tdot.ferme{background:var(--cancelled)}
+.tnom{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+min-width:0;flex:1 1 auto}
+/* Même partition qu'en tête de panneau (#hend, brief t-38, "en-tête étroit") : le nom cède
+   la place en premier, le bloc pourcentage/restant/fin ne raccourcit jamais -- un chiffre
+   tronqué dirait autre chose que ce qu'il mesure. C'est ce qui tient l'onglet sur une
+   seule ligne même à 260px (c8). */
+.tfin{margin-left:auto;flex:none;display:flex;align-items:baseline;gap:6px;min-width:0}
+.trest{font-size:10.5px;color:var(--dim2)}
+.teta{font-size:10.5px;font-weight:600;color:var(--txt2)}
+.teta sup{font-size:8.5px;font-weight:600;color:var(--dim2);margin-left:1px}
+.tpct{font-size:11.5px;font-weight:600;color:var(--txt)}
+
+/* Seconde ligne de l'onglet (t-49, complétée t-57) : la progression par phase et les
+   alertes qui vivaient dans #top du panneau, cerné de marges et sur sa propre ligne
+   (voir annoncerOnglet() dans _JS). Reprend les teintes et les bords du panneau -- même
+   vert de #segs .fill, même ambre que #warnchip/#askchip -- avec des tailles resserrées :
+   une ligne fine, pas la maquette du panneau où la place ne manque pas. hidden porte sur
+   la ligne entière : une colonne sans donnée (pas encore de message, ou chantier sans la
+   moindre phase ni alerte) ne réserve aucune hauteur (voir peindreProgres()). */
+/* align-self:stretch : .chead est un flex column, et un enfant y prend la largeur de
+   son CONTENU, pas celle offerte. Mesuré sur une colonne de 533px : .trow2 n'en
+   occupait que 102, la barre de progression 58, soit un cinquième de la place
+   disponible pour la seule chose que cette ligne a à montrer. */
+/* .tline porte l'ancienne disposition horizontale de l'onglet (pastille, nom, chiffres),
+   qui vivait sur .tab avant que celui-ci ne devienne une colonne de deux lignes. */
+.tline{display:flex;align-items:center;gap:6px;min-width:0;width:100%}
+.trow2{display:flex;align-items:center;gap:6px;padding:0;min-width:0;
+align-self:stretch;width:100%}
+.trow2[hidden]{display:none}
+.tsegs{display:flex;gap:4px;flex:1 1 auto;min-width:0;align-items:center}
+/* gap 2px et min-width 3px, mesurés : un chantier à 12 phases saturait la barre
+   (12 x 8px + 11 x 3px = 129px = toute la largeur), si bien qu'aucun segment ne
+   pouvait grandir et que le flex-grow proportionnel au nombre de tâches ne servait
+   à rien. Le minimum garde une phase d'une tâche visible, il ne doit pas décider de
+   la largeur de toutes les autres. */
+.tsegs .seg{min-width:3px;flex:1 1 0}
+/* display:block sur .track, et .seg qui n'est plus un simple flex-item : les deux sont des
+   <span>, donc inline par défaut, et un élément inline IGNORE height -- la barre existait,
+   large de 129px, haute de 0. Elle se voyait dans le DOM et les tests, jamais à l'écran.
+   #segs (le même dessin dans le panneau, avant t-57) n'avait pas le problème parce que son
+   parent lui donnait sa hauteur ; la structure a été reprise dans l'onglet sans cette
+   condition-là. Mesuré au navigateur : 0px avant, 4px après. */
+.tsegs .seg{display:block}
+/* Le numéro DANS la barre, pas dessous : sous la barre il coûtait une ligne de hauteur
+   pour une information qui tient dans un creux qu'on épaissit. La barre passe donc de 4 à
+   13px et devient le support du numéro, la couleur restant portée par le remplissage.
+   #07090c au lieu de var(--bg) #0b0d10 : sur le fond de bandeau (--panel #12151a) un creux
+   à --bg se lisait encore comme un relief, pas comme un vide. */
+.tsegs .track{position:relative;display:block;height:13px;border-radius:4px;
+background:#07090c;overflow:hidden;box-shadow:inset 0 0 0 1px #191e25}
+/* --txt2 et non --dim2 : le numéro se lit par-dessus DEUX fonds, le creux sombre et le
+   remplissage vert, et un gris moyen disparaissait sur le vert. L'ombre portée le décolle
+   des deux sans l'alourdir. */
+.tsegs .lab{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+font-size:9px;font-weight:600;line-height:1;color:var(--txt2);white-space:nowrap;
+pointer-events:none;text-shadow:0 1px 2px rgba(0,0,0,.75)}
+.tsegs .fill{display:block;height:100%;border-radius:4px}
+/* .chead .tchip (deux classes) l'emporte sur ".chead button" (classe+élément) ci-dessus --
+   même mécanique de spécificité que .chead .tab plus haut, sans !important. */
+.chead .tchip{display:inline-flex;align-items:center;border:1px solid #63541f;
+background:var(--panel);color:#e3b341;border-radius:20px;font:inherit;font-size:9.5px;
+line-height:1.3;padding:1px 6px;cursor:pointer;flex:none}
+.chead .tchip:hover{border-color:#7a6526}
+.chead .tchip[hidden]{display:none}
+
+/* Popover du sélecteur : posé dans <body> (voir creer()), jamais dans .col, pour échapper
+   au clip vertical que #cols impose à tout ce qu'il contient. */
+.tablist{position:fixed;z-index:50;background:var(--panel);border:1px solid var(--line);
+border-radius:8px;box-shadow:0 14px 40px rgba(0,0,0,.55);padding:4px;margin:0;
+list-style:none;max-height:60vh;overflow:auto}
+.tablist .opt-group{padding:6px 8px 3px;font-size:9.5px;letter-spacing:.08em;
+text-transform:uppercase;color:var(--dim3)}
+/* Option du popover (t-56) : même structure que l'onglet fermé qu'elle produira une
+   fois choisie -- dot, nom, pourcentage, restant, ETA et la seconde ligne de
+   progression (voir peindreOption() dans _MUR_JS). Colonne, jamais plus une seule
+   ligne de texte tronquée : deux rangées empilées, une par ligne de l'onglet. */
+.tablist .opt{padding:5px 8px;border-radius:5px;font-size:11.5px;color:var(--txt2);
+cursor:pointer;display:flex;flex-direction:column;gap:2px;min-width:0}
+.tablist .opt .orow1{display:flex;align-items:center;gap:6px;min-width:0}
+.tablist .opt .trow2{padding:0;min-width:0}
+/* .tchip n'a de règle visible que scopée à .chead (voir plus haut) : reprise ici sans
+   le curseur -- cliquer une option choisit le chantier entier, jamais sa seule alerte
+   -- avec son propre [hidden], le même piège déjà évité pour #warnchip et .chead
+   .tchip : un attribut hidden posé par peindreProgres() ne masquerait rien sans lui,
+   la règle plus spécifique (deux classes) l'emportant sur celle du navigateur. */
+.tablist .opt .tchip{display:inline-flex;align-items:center;border:1px solid #63541f;
+background:var(--panel);color:#e3b341;border-radius:20px;font:inherit;font-size:9.5px;
+line-height:1.3;padding:1px 6px;flex:none}
+.tablist .opt .tchip[hidden]{display:none}
+.tablist .opt[aria-selected="true"]{color:var(--txt);font-weight:600}
+.tablist .opt.hl{background:var(--rowsel)}
+.tablist .opt-sep{height:1px;background:var(--line);margin:4px 2px}
 .col iframe{flex:1 1 auto;width:100%;border:0;background:var(--bg);display:block}
 #vide{margin:auto;padding:40px;color:var(--dim2);font-size:12px;text-align:center;
 text-wrap:pretty}
@@ -2651,8 +3111,20 @@ function libelle(c){
     (sig==="stall"?" · TERMINEE OU BLOQUEE":"")+
     (c.state==="open"?"":" · "+c.state);
 }
-// La disposition survit au rechargement : un mur qu'il faut remonter a chaque ouverture
-// n'est pas un ecran dedie, c'est un formulaire.
+// Deux groupes pour le sélecteur de l'onglet (t-49, c3), jamais mélangés : ce qui a
+// quelque chose EN COURS (une exécutante vivante ou une tâche lançable) d'abord, le reste
+// -- terminé, en sommeil ou fermé -- ensuite. Une campagne fermée n'a jamais running ni
+// ready non nuls (ses tâches ne tournent ni ne se lancent plus), donc ouvert(c) est une
+// garde et non une redondance.
+function enCours(c){return ouvert(c)&&!!((c.running||0)+(c.ready||0))}
+function grouper(liste){
+  return {
+    enCours: liste.filter(enCours),
+    autres: liste.filter(function(c){return !enCours(c)}),
+  };
+}
+// La disposition survit au rechargement : un mur qu'il faut remonter à chaque ouverture
+// n'est pas un écran dédié, c'est un formulaire.
 function lire(){
   try{
     var d=JSON.parse(localStorage.getItem(CLE));
@@ -2666,29 +3138,260 @@ function ecrire(){
     return {home:c.home,campaign:c.campaign}})}))}catch(e){}
 }
 
-function options(col){
-  var sel=col.sel;
-  // Deux raisons de ne PAS reconstruire. Un menu deroule a le focus : le refaire sous les
-  // doigts le referme, et le battement tombe toutes les trois secondes, donc ca arrive.
-  // Et une liste identique n'a rien a gagner a etre refaite.
-  if(document.activeElement===sel)return;
-  var sig=campagnes.map(function(c){return cleDe(c)+"="+libelle(c)}).join("|")+"#"+cle(col);
-  if(col.sig===sig)return;
-  col.sig=sig;
-  sel.innerHTML="";
-  campagnes.forEach(function(c){
-    var o=document.createElement("option");
-    o.value=cleDe(c);o.textContent=libelle(c);
-    sel.appendChild(o);
+// L'onglet fusionne (t-49) ce que deux bandeaux répétaient : le sélecteur de session et la
+// ligne identifiant/projet/état/session du panneau. Il ne porte plus que le nom du projet
+// (une fois), une pastille d'état et les trois valeurs du panneau (pourcentage, restant,
+// heure de fin) reçues par message -- jamais recalculées ici. Un seul col a son popover
+// ouvert à la fois (listeActive).
+var listeActive=null;
+
+// Repeint l'étiquette : nom, pastille d'état, et le dernier message reçu du panneau (voir
+// annoncerOnglet() dans _JS). Toujours sûr d'être appelé, y compris popover ouvert : ces
+// nœuds sont hors du <ul>, les reconstruire ne touche jamais le clavier qui y navigue.
+function peindreTab(col){
+  var etat=trouver(cle(col));
+  col.nom.textContent=etat?(etat.slug||etat.id):(col.campaign+" — introuvable");
+  var mot="ouvert",cls="ouvert";
+  if(etat){
+    if(!ouvert(etat)){mot="fermé";cls="ferme"}
+    else if(signal(etat)==="stall"){mot="en sommeil";cls="sommeil"}
+  }else{
+    mot="introuvable";cls="ferme";
+  }
+  col.dot.className="tdot "+cls;
+  col.tab.title=etat?mot+(etat.tmuxSession?" · "+etat.tmuxSession:""):"chantier introuvable";
+  var td=col.tabData;
+  col.tpct.textContent=td?td.pct:"";
+  var connu=!!(td&&td.connu);
+  col.trest.hidden=!connu;col.teta.hidden=!connu;
+  col.trest.textContent=connu?td.restant:"";
+  col.teta.textContent="";
+  if(connu){
+    col.teta.appendChild(document.createTextNode("ETA "+td.heure));
+    if(td.jours>0){
+      var sup=document.createElement("sup");sup.textContent="+"+td.jours;
+      col.teta.appendChild(sup);
+    }
+  }
+  peindreProgres(col,td);
+}
+
+// Seconde ligne de l'onglet (t-57) : progression par phase + alertes, reçues du panneau
+// (annoncerOnglet() dans _JS), jamais recalculées ici -- même principe que pct/restant/eta
+// ci-dessus. Une colonne sans donnée (pas encore de message, ou chantier sans la moindre
+// phase ni alerte) ne réserve aucune hauteur pour cette ligne : le hidden porte sur
+// trow2 lui-même, jamais un contenu vide affiché pour rien.
+function peindreProgres(col,td){
+  var phases=(td&&td.phases)||[];
+  var warn=(td&&td.warn)||0, ask=(td&&td.ask)||0;
+  col.trow2.hidden=!(phases.length||warn||ask);
+  while(col.tsegs.firstChild)col.tsegs.removeChild(col.tsegs.firstChild);
+  phases.forEach(function(p){
+    var s=document.createElement("span");s.className="seg";
+    s.style.flex=(p.total||1)+" 1 0";
+    s.title=p.key+" "+(p.nom||"")+" — "+p.dn+"/"+p.total;
+    var tr=document.createElement("span");tr.className="track";
+    var f=document.createElement("span");f.className="fill";
+    f.style.width=(p.total?p.dn/p.total*100:0)+"%";
+    f.style.background=(p.total&&p.dn===p.total)?"#46a35a":"#3c7a4a";
+    // Le numéro DANS le creux, superposé au remplissage : sans lui, douze barres se
+    // ressemblent toutes et le survol reste le seul moyen de savoir laquelle avance.
+    var lb=document.createElement("span");lb.className="lab";lb.textContent=p.key;
+    tr.appendChild(f);tr.appendChild(lb);s.appendChild(tr);
+    col.tsegs.appendChild(s);
   });
-  sel.value=cle(col);
-  // Un chantier sorti du registre ne peut pas etre choisi dans le menu : sans cette
-  // ligne, le select retomberait en silence sur son premier element et la colonne
-  // afficherait un autre projet que celui qu'on croit lire.
-  if(sel.value!==cle(col)){
-    var o=document.createElement("option");
-    o.value=cle(col);o.textContent=col.campaign+" — introuvable";
-    sel.appendChild(o);sel.value=cle(col);
+  col.twarn.hidden=!warn;
+  if(warn){
+    col.twarn.textContent=warn;
+    col.twarn.title=warn+" alerte"+(warn>1?"s":"")+", cliquer pour la liste";
+  }
+  col.tdemande.hidden=!ask;
+  if(ask){
+    col.tdemande.textContent=ask>1?ask+" choix":"choix à faire";
+    col.tdemande.title=ask>1?ask+" choix à faire":"choix à faire";
+  }
+}
+
+// Le tabData d'une campagne du popover (t-56) : jamais recalculé ici, seulement
+// retrouvé si une colonne DÉJÀ OUVERTE sur ce mur affiche justement ce chantier -- sa
+// propre iframe l'a alors déjà transmis par annoncerOnglet() (voir peindreProgres()).
+// Un chantier que ce mur n'a ouvert nulle part n'a "rien d'estimé" (DEUX LIMITES du
+// brief) : ni pct, ni restant, ni ETA, ni phases -- peindreOption() ci-dessous ne
+// promet jamais plus que ce que trouve cette recherche.
+function tabDataDe(c){
+  for(var i=0;i<cols.length;i++)if(cle(cols[i])===cleDe(c))return cols[i].tabData||null;
+  return null;
+}
+
+// Peint une option du popover avec la structure de l'onglet fermé qu'elle produira une
+// fois choisie (t-56) -- dot, nom, pourcentage, restant, ETA, et la seconde ligne de
+// progression par phase + alertes (t-57). Les classes terminales (tdot, tnom, tfin,
+// trest, teta, tpct, tsegs) ne sont PAS scopées à .chead : les reprendre ici donne
+// exactement les mêmes teintes et les mêmes espacements sans dupliquer une seule règle
+// CSS (voir .tablist .opt dans _CSS). Le bloc pct/restant/ETA reprend telle quelle la
+// condition de peindreTab() -- td absent ou non connu masque restant/ETA, jamais un
+// nouveau calcul qui pourrait diverger de ce que l'onglet montrera une fois ouvert. La
+// seconde ligne réutilise peindreProgres() sans y toucher : mêmes segments, mêmes
+// pastilles, sur un sac de nœuds indépendant de toute colonne réelle. Jamais
+// interactive au-delà du clic global posé sur <li> par bloc() ci-dessous : les
+// pastilles y sont des <span>, pas des <button> -- choisir une option choisit le
+// chantier entier, jamais la seule alerte d'un autre chantier que celui-ci.
+function peindreOption(li,c){
+  var row1=document.createElement("div");row1.className="orow1";
+  var dot=document.createElement("span");
+  dot.className="tdot "+(!ouvert(c)?"ferme":(signal(c)==="stall"?"sommeil":"ouvert"));
+  var nom=document.createElement("span");nom.className="tnom";nom.textContent=c.slug||c.id;
+  var fin=document.createElement("span");fin.className="tfin";
+  var trest=document.createElement("span");trest.className="trest";trest.hidden=true;
+  var teta=document.createElement("span");teta.className="teta";teta.hidden=true;
+  var tpct=document.createElement("span");tpct.className="tpct";
+  fin.appendChild(trest);fin.appendChild(teta);fin.appendChild(tpct);
+  row1.appendChild(dot);row1.appendChild(nom);row1.appendChild(fin);
+  li.appendChild(row1);
+
+  var td=tabDataDe(c);
+  tpct.textContent=td?td.pct:"";
+  var connu=!!(td&&td.connu);
+  trest.hidden=!connu;teta.hidden=!connu;
+  trest.textContent=connu?td.restant:"";
+  if(connu){
+    teta.appendChild(document.createTextNode("ETA "+td.heure));
+    // el() n'existe pas dans ce script (_MUR_JS) : jamais importé ici, c'est un
+    // helper du panneau (_JS). Même construction manuelle que peindreTab() juste
+    // au-dessus pour ce même sup, sans quoi cette ligne lève une ReferenceError dès
+    // qu'un chantier estimé dépasse minuit -- trouvé en écrivant le test Node de
+    // TestOptionsDuPopoverAuStyleDeLOnglet, jamais exécuté avant lui.
+    // jours > 0, comme partout ailleurs (peindreTab et le panneau) : sans cette garde
+    // l'option affichait "+0" sur tout chantier qui finit dans la journée, c'est-à-dire
+    // le cas courant, pour une mention qui n'existe que quand l'ETA franchit minuit.
+    if(td.jours>0){
+      var sup=document.createElement("sup");sup.textContent="+"+td.jours;
+      teta.appendChild(sup);
+    }
+  }
+
+  var trow2=document.createElement("div");trow2.className="trow2";
+  var tsegs=document.createElement("span");tsegs.className="tsegs";
+  var twarn=document.createElement("span");twarn.className="tchip";twarn.hidden=true;
+  var tdemande=document.createElement("span");tdemande.className="tchip";tdemande.hidden=true;
+  trow2.appendChild(tsegs);trow2.appendChild(twarn);trow2.appendChild(tdemande);
+  li.appendChild(trow2);
+  peindreProgres({trow2:trow2,tsegs:tsegs,twarn:twarn,tdemande:tdemande},td);
+}
+
+// Construit les options du popover : deux groupes (voir grouper()), toujours dans cet
+// ordre, séparés par une ligne. Ne reconstruit jamais pendant que le clavier y navigue
+// (col.listeOuverte) -- même piège que l'ancien select reconstruit sous le focus. La
+// signature (t-56) porte aussi le tabData des colonnes ouvertes : sans lui, une option
+// qui reprend le pct/restant/ETA d'une autre colonne resterait figée à leur valeur du
+// jour de l'ouverture du popover, jusqu'au prochain changement de libellé -- jamais
+// jusqu'au prochain battement qui fait pourtant progresser ce même chiffre à l'onglet.
+function optionsListe(col){
+  if(col.listeOuverte)return;
+  var sig=campagnes.map(function(c){return cleDe(c)+"="+libelle(c)}).join("|")+"#"+cle(col)
+    +"~"+cols.map(function(c){return cle(c)+":"+(c.tabData?JSON.stringify(c.tabData):"")})
+      .join(",");
+  if(col.optSig===sig)return;
+  col.optSig=sig;
+  var ul=col.liste;
+  while(ul.firstChild)ul.removeChild(ul.firstChild);
+  col.optionsId=[];col.optionsMap={};
+  function bloc(titre,liste){
+    var lbl=document.createElement("li");
+    lbl.className="opt-group";lbl.setAttribute("role","presentation");
+    lbl.setAttribute("aria-hidden","true");lbl.textContent=titre;
+    ul.appendChild(lbl);
+    liste.forEach(function(c){
+      var li=document.createElement("li");
+      li.id="opt-"+col.uid+"-"+col.optionsId.length;
+      li.setAttribute("role","option");li.className="opt";
+      li.setAttribute("aria-label",libelle(c));
+      li.setAttribute("aria-selected",cle(col)===cleDe(c)?"true":"false");
+      peindreOption(li,c);
+      li.addEventListener("click",function(){choisir(col,c)});
+      li.addEventListener("mouseenter",function(){surligner(col,li.id)});
+      ul.appendChild(li);
+      col.optionsId.push(li.id);col.optionsMap[li.id]=c;
+    });
+  }
+  var g=grouper(campagnes);
+  bloc("en cours",g.enCours);
+  var sep=document.createElement("li");
+  sep.setAttribute("role","separator");sep.setAttribute("aria-hidden","true");
+  sep.className="opt-sep";
+  ul.appendChild(sep);
+  bloc("autres",g.autres);
+}
+
+function surligner(col,id){
+  var prev=col.liste.querySelector(".opt.hl");
+  if(prev)prev.classList.remove("hl");
+  var next=document.getElementById(id);
+  if(!next)return;
+  next.classList.add("hl");
+  col.tab.setAttribute("aria-activedescendant",id);
+  next.scrollIntoView({block:"nearest"});
+}
+
+function deplacer(col,delta){
+  var ids=col.optionsId;
+  if(!ids||!ids.length)return;
+  var i=ids.indexOf(col.tab.getAttribute("aria-activedescendant"));
+  i=i<0?0:Math.max(0,Math.min(ids.length-1,i+delta));
+  surligner(col,ids[i]);
+}
+
+function fermerListe(col){
+  if(!col.listeOuverte)return;
+  col.listeOuverte=false;col.liste.hidden=true;
+  col.tab.setAttribute("aria-expanded","false");
+  col.tab.removeAttribute("aria-activedescendant");
+  if(listeActive===col)listeActive=null;
+}
+
+function ouvrirListe(col){
+  if(listeActive&&listeActive!==col)fermerListe(listeActive);
+  optionsListe(col);
+  if(!col.optionsId.length)return;
+  col.listeOuverte=true;listeActive=col;
+  var r=col.tab.getBoundingClientRect();
+  col.liste.style.left=r.left+"px";
+  col.liste.style.top=(r.bottom+4)+"px";
+  col.liste.style.minWidth=r.width+"px";
+  col.liste.hidden=false;
+  col.tab.setAttribute("aria-expanded","true");
+  // Reprend la navigation sur l'option déjà choisie, jamais en la renvoyant tout en haut.
+  var courant=col.liste.querySelector('[aria-selected="true"]')||col.liste.querySelector(".opt");
+  if(courant)surligner(col,courant.id);
+}
+
+function choisir(col,c){
+  col.home=c.home;col.campaign=c.id;
+  ecrire();
+  fermerListe(col);
+  dessiner();
+  col.tab.focus();
+}
+
+// Ouverture au clavier ET au doigt (t-49, c7) : Entrée/Espace/flèches ouvrent, les flèches
+// déplacent l'option surlignée, Entrée/Espace choisit, Échap referme -- le focus ne quitte
+// jamais le bouton, aria-activedescendant porte seul le déplacement dans la liste.
+function onTabKeydown(e,col){
+  var k=e.key;
+  if(!col.listeOuverte){
+    if(k==="ArrowDown"||k==="ArrowUp"||k==="Enter"||k===" "){
+      e.preventDefault();ouvrirListe(col);
+    }
+    return;
+  }
+  if(k==="ArrowDown"){e.preventDefault();deplacer(col,1)}
+  else if(k==="ArrowUp"){e.preventDefault();deplacer(col,-1)}
+  else if(k==="Escape"){e.preventDefault();fermerListe(col)}
+  else if(k==="Enter"||k===" "){
+    e.preventDefault();
+    var id=col.tab.getAttribute("aria-activedescendant");
+    var c=id&&col.optionsMap[id];
+    if(c)choisir(col,c);
   }
 }
 
@@ -2696,23 +3399,98 @@ function creer(col){
   var d=document.createElement("div");
   d.className="col";d.setAttribute("data-uid",col.uid);
   var h=document.createElement("div");h.className="chead";
-  var sel=document.createElement("select");
-  sel.setAttribute("aria-label","chantier de la colonne");
-  sel.addEventListener("change",function(){
-    var p=sel.value.split(" ");
-    col.home=p[0];col.campaign=p[1];ecrire();dessiner();
+  var row1=document.createElement("div");row1.className="trow";
+
+  // role=button plutôt que <button> : cet onglet porte désormais les chips d'alerte, qui
+  // sont eux-mêmes des boutons, et le HTML interdit un bouton dans un bouton -- le clic sur
+  // l'enfant ne partirait jamais. Le clavier est rendu à la main (Enter/Espace ci-dessous),
+  // ce qu'un <button> offrait gratuitement : c'est le prix de l'imbrication.
+  var tab=document.createElement("div");
+  tab.className="tab";tab.tabIndex=0;
+  tab.setAttribute("role","button");
+  tab.setAttribute("aria-haspopup","listbox");
+  tab.setAttribute("aria-expanded","false");
+  tab.setAttribute("aria-controls","tablist-"+col.uid);
+  var dot=document.createElement("span");dot.className="tdot";
+  var nom=document.createElement("span");nom.className="tnom";
+  var fin=document.createElement("span");fin.className="tfin";
+  var trest=document.createElement("span");trest.className="trest";trest.hidden=true;
+  var teta=document.createElement("span");teta.className="teta";teta.hidden=true;
+  var tpct=document.createElement("span");tpct.className="tpct";
+  fin.appendChild(trest);fin.appendChild(teta);fin.appendChild(tpct);
+  // Ligne 1 dans un porteur propre : l'onglet devient une colonne de deux lignes, et sans
+  // ce porteur dot/nom/fin s'empileraient verticalement avec la progression.
+  var tline=document.createElement("span");tline.className="tline";
+  tline.appendChild(dot);tline.appendChild(nom);tline.appendChild(fin);
+  tab.appendChild(tline);
+  tab.addEventListener("click",function(e){
+    // Un clic parti d'un chip d'alerte ouvre son calque, jamais la liste des chantiers.
+    if(e.target.closest(".tchip"))return;
+    if(col.listeOuverte)fermerListe(col);else ouvrirListe(col);
   });
+  tab.addEventListener("keydown",function(e){
+    if(e.key===" "||e.key==="Enter"){
+      if(e.target.closest(".tchip"))return;
+      e.preventDefault();
+      if(col.listeOuverte)fermerListe(col);else ouvrirListe(col);
+    }
+  });
+  tab.addEventListener("keydown",function(e){onTabKeydown(e,col)});
+
   var x=document.createElement("button");
-  x.textContent="×";x.title="fermer la colonne";
-  x.addEventListener("click",function(){
+  x.type="button";x.textContent="×";x.title="fermer la colonne";
+  x.setAttribute("aria-label","fermer la colonne");
+  x.addEventListener("click",function(e){
+    e.stopPropagation();
+    fermerListe(col);
+    if(col.liste&&col.liste.parentNode)col.liste.parentNode.removeChild(col.liste);
     cols=cols.filter(function(c){return c!==col});ecrire();dessiner();
   });
-  h.appendChild(sel);h.appendChild(x);
+  row1.appendChild(tab);row1.appendChild(x);
+
+  // Seconde ligne (t-57) : progression par phase + alertes, reçues du panneau par message
+  // (voir peindreProgres()). Masquée par défaut -- une colonne fraîchement créée n'a encore
+  // rien reçu -- et reconstruite à chaque message, jamais construite ici une fois pour
+  // toutes : le nombre de phases varie d'un chantier à l'autre.
+  var row2=document.createElement("div");row2.className="trow2";row2.hidden=true;
+  var tsegs=document.createElement("span");tsegs.className="tsegs";
+  var twarn=document.createElement("button");
+  twarn.type="button";twarn.className="tchip";twarn.hidden=true;
+  twarn.addEventListener("click",function(){envoyerAuPanneau(col,"warn")});
+  var tdemande=document.createElement("button");
+  tdemande.type="button";tdemande.className="tchip";tdemande.hidden=true;
+  tdemande.addEventListener("click",function(){envoyerAuPanneau(col,"ask")});
+  row2.appendChild(tsegs);row2.appendChild(twarn);row2.appendChild(tdemande);
+
+  // row2 DANS l'onglet, plus sous lui : le bandeau ne montre plus deux blocs separes
+  // (selecteur puis progression) mais un seul objet qui porte tout l'etat du chantier.
+  tab.appendChild(row2);
+  h.appendChild(row1);
+
+  // Le popover vit hors de la colonne, dans <body> : #cols défile horizontalement
+  // (overflow-x:auto), qui force aussi le clip vertical -- une liste posée dedans se
+  // couperait dès qu'elle dépasse la hauteur visible de la colonne.
+  var ul=document.createElement("ul");
+  ul.id="tablist-"+col.uid;ul.className="tablist";ul.hidden=true;
+  ul.setAttribute("role","listbox");
+  ul.setAttribute("aria-label","chantier de la colonne");
+  document.body.appendChild(ul);
+
   var f=document.createElement("iframe");
   f.setAttribute("title","carte du chantier");
   d.appendChild(h);d.appendChild(f);
-  col.node=d;col.sel=sel;col.frame=f;
+  col.node=d;col.tab=tab;col.dot=dot;col.nom=nom;col.trest=trest;col.teta=teta;col.tpct=tpct;
+  col.trow2=row2;col.tsegs=tsegs;col.twarn=twarn;col.tdemande=tdemande;
+  col.liste=ul;col.frame=f;col.listeOuverte=false;col.optionsId=[];col.optionsMap={};
   return d;
+}
+
+// Relaie vers le panneau (l'iframe) le clic sur une pastille d'alerte de l'onglet : le
+// calque #warn/#ask vit dans CETTE fenêtre-là, jamais dans le mur (voir _JS), donc le mur
+// ne fait que demander de l'ouvrir plutôt que de le dupliquer.
+function envoyerAuPanneau(col,quoi){
+  if(!col.frame||!col.frame.contentWindow)return;
+  try{col.frame.contentWindow.postMessage({ordoOuvrir:quoi},window.location.origin)}catch(e){}
 }
 
 function dessiner(){
@@ -2723,7 +3501,7 @@ function dessiner(){
     // yeux. Une nouvelle colonne s'ajoute a la fin, point.
     if(!col.node)hote.appendChild(creer(col));
     vivants[col.uid]=1;
-    options(col);
+    peindreTab(col);optionsListe(col);
     // La colonne entiere se teinte quand son chantier attend un arbitrage. Le calque, lui,
     // vit DANS la colonne : sur un mur de six colonnes en plein ecran, il faut d'abord
     // savoir laquelle regarder.
@@ -2817,11 +3595,6 @@ function remplirQuota(q){
 function battement(){
   fetch("/api/state").then(function(r){return r.json()}).then(function(etat){
     campagnes=etat.campaigns||[];
-    var live=campagnes.filter(function(c){return c.running}).length;
-    var t=document.getElementById("live");
-    t.textContent=campagnes.length+" chantier"+(campagnes.length>1?"s":"")+" · "+
-      (live?live+" avec une exécutante":"aucune exécutante");
-    t.className="tag"+(live?" live":"");
     var pb=document.getElementById("pbs");
     pb.hidden=!etat.problems.length;
     if(etat.problems.length)pb.textContent=etat.problems.length+" home illisible";
@@ -2835,6 +3608,27 @@ function battement(){
     dessiner();
   }).catch(function(){pulse(false)});
 }
+
+// Reçoit ce que le panneau vient d'afficher (voir annoncerOnglet() dans _JS) : jamais
+// recalculé côté mur, juste reporté sur l'onglet. e.source identifie la colonne sans
+// ambiguïté, même si deux colonnes montrent par erreur le même chantier.
+window.addEventListener("message",function(e){
+  if(e.origin!==window.location.origin)return;
+  var msg=e.data;
+  if(!msg||!msg.ordoOnglet)return;
+  for(var i=0;i<cols.length;i++){
+    if(cols[i].frame&&cols[i].frame.contentWindow===e.source){
+      cols[i].tabData=msg;peindreTab(cols[i]);break;
+    }
+  }
+});
+// Un clic hors de l'onglet ou de sa liste referme le popover ouvert -- comportement
+// attendu de tout menu déroulant, y compris natif.
+document.addEventListener("click",function(e){
+  if(!listeActive)return;
+  if(listeActive.tab.contains(e.target)||listeActive.liste.contains(e.target))return;
+  fermerListe(listeActive);
+});
 
 document.getElementById("plus").addEventListener("click",ajouter);
 document.getElementById("full").addEventListener("click",function(){
@@ -2871,18 +3665,26 @@ def page(poll: int = POLL_S) -> str:
 <div id="wtop">
   <span id="mark" class="m">ORDO</span>
   <span id="pulse" title="battement du serveur"></span>
-  <span class="tag" id="live"></span>
   <span id="quota" hidden></span>
   <span class="tag err" id="pbs" hidden></span>
   <span class="tag ask" id="asks" hidden></span>
   <span id="lgd">
-    <span class="item"><span class="sw" style="background:#46a35a"></span>fait</span>
-    <span class="item"><span class="sw" style="background:#d3a03a"></span>en cours</span>
-    <span class="item"><span class="sw" style="background:#5aa2f0"></span>lancable</span>
-    <span class="item"><span class="sw" style="background:#4a5361"></span>en attente</span>
+    <span class="item"><span class="sw" style="background:var(--done)"></span>fait</span>
+    <span class="item"><span class="sw" style="background:var(--running)"></span>en cours</span>
+    <span class="item"><span class="sw" style="background:var(--finishing)"></span>rédaction</span>
+    <span class="item"><span class="sw" style="background:var(--ready)"></span>lançable</span>
+    <span class="item"><span class="sw" style="background:var(--queued)"></span>en attente</span>
+    <span class="lsep"></span>
+    <span class="item"><span class="sw rond" style="background:var(--m-haiku)"></span>haiku</span>
+    <span class="item"><span class="sw rond" style="background:var(--m-sonnet)"></span>sonnet</span>
+    <span class="item"><span class="sw rond" style="background:var(--m-opus)"></span>opus</span>
   </span>
-  <button class="pill" id="plus" title="ajouter une colonne">+ colonne</button>
-  <button class="pill" id="full" title="plein ecran">plein ecran</button>
+  <button class="icon-btn" id="plus" title="ajouter une colonne" aria-label="ajouter une colonne">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+  </button>
+  <button class="icon-btn" id="full" title="plein écran" aria-label="plein écran">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+  </button>
 </div>
 <div id="cols">
   <div id="vide" hidden>aucune colonne. « + colonne » en ouvre une.</div>

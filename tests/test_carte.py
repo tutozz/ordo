@@ -3172,7 +3172,7 @@ class TestPastilleDeModeleSurLaCase(CarteTestCase):
         # Régression : .rid.haiku/.sonnet/.opus (brief t-46) ne doivent plus exister --
         # la teinte vit uniquement sur .mdot désormais, jamais recalculée deux fois.
         page = self._page()
-        for modele in ("haiku", "sonnet", "opus"):
+        for modele in ("haiku", "sonnet", "opus", "fable"):
             self.assertNotIn(f".rid.{modele}{{color:var(--m-{modele})}}", page)
 
     def test_une_pastille_ronde_reprend_les_teintes_du_modele_sur_la_case(self):
@@ -3195,13 +3195,14 @@ class TestPastilleDeModeleSurLaCase(CarteTestCase):
         self.assertIn('mdot.title=titreModele;', bloc)
 
     def test_aucune_pastille_pour_un_modele_herite_ou_absent(self):
-        # c9, point de prudence du brief : {haiku:1,sonnet:1,opus:1}[t.model] est
+        # c9, point de prudence du brief : {haiku:1,sonnet:1,opus:1,fable:1}[t.model] est
         # undefined pour "herite", "defaut" et l'absence de modèle -- AUCUNE pastille ne
         # se construit alors, pas une pastille grise. La construction du .mdot est sous
         # la garde `if(mconnu)`, jamais posée inconditionnellement.
         page = self._page()
         bloc = page[page.index("function rowNode(t){"):page.index("function detailNode(t){")]
-        self.assertIn('var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";', bloc)
+        self.assertIn(
+            'var mconnu={haiku:1,sonnet:1,opus:1,fable:1}[t.model]?" "+t.model:"";', bloc)
         garde = bloc.index("if(mconnu){")
         construction = bloc.index('var mdot=el("span","mdot"+mconnu);')
         self.assertLess(garde, construction)
@@ -3215,12 +3216,12 @@ class TestPastilleDeModeleSurLaCase(CarteTestCase):
         self.assertIn("rid.title=titreModele", bloc)
 
     def test_aucune_classe_de_teinte_pour_un_modele_herite_ou_absent(self):
-        # c9 : {haiku:1,sonnet:1,opus:1}[t.model] est undefined pour "herite", "defaut" et
-        # l'absence de modèle -- mconnu reste vide dans ces trois cas, jamais une sixième
-        # teinte inventée pour "on ne sait pas".
+        # c9 : {haiku:1,sonnet:1,opus:1,fable:1}[t.model] est undefined pour "herite",
+        # "defaut" et l'absence de modèle -- mconnu reste vide dans ces trois cas, jamais
+        # une sixième teinte inventée pour "on ne sait pas".
         page = self._page()
         self.assertIn(
-            'var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";', page)
+            'var mconnu={haiku:1,sonnet:1,opus:1,fable:1}[t.model]?" "+t.model:"";', page)
 
 
 class TestPastilleDeModeleDansLeDetail(CarteTestCase):
@@ -3240,8 +3241,15 @@ class TestPastilleDeModeleDansLeDetail(CarteTestCase):
 
     def test_la_pastille_du_detail_partage_les_memes_teintes_que_lidentifiant(self):
         page = self._page()
-        for modele in ("haiku", "sonnet", "opus"):
+        for modele in ("haiku", "sonnet", "opus", "fable"):
             self.assertIn(f".mdot.{modele}{{background:var(--m-{modele})}}", page)
+
+    def test_la_pastille_de_fable_ne_disparait_pas_silencieusement(self):
+        # Garde-fou dédié : fable est le modèle arrivé le plus récemment, et une
+        # régression qui retire sa règle ne doit pas pouvoir se cacher derrière le test
+        # générique ci-dessus si la liste que celui-ci parcourt venait à être modifiée.
+        page = self._page()
+        self.assertIn(".mdot.fable{background:var(--m-fable)}", page)
 
 
 class TestLegendeDesEtatsEtDesModeles(CarteTestCase):
@@ -3269,7 +3277,7 @@ class TestLegendeDesEtatsEtDesModeles(CarteTestCase):
         bloc = re.search(r'<div id="legend">.*?</div>', page, re.S).group(0)
         self.assertNotIn("#", bloc.split("legend")[-1].replace('id="legend"', ""))
         for var in ("--done", "--running", "--finishing", "--ready", "--queued",
-                    "--m-haiku", "--m-sonnet", "--m-opus"):
+                    "--m-haiku", "--m-sonnet", "--m-opus", "--m-fable"):
             self.assertIn(f"var({var})", bloc)
 
     def test_la_legende_des_modeles_suit_celle_des_etats_avec_un_separateur(self):
@@ -3281,7 +3289,7 @@ class TestLegendeDesEtatsEtDesModeles(CarteTestCase):
 
     def test_les_pastilles_de_modele_sont_rondes_pour_ne_pas_se_confondre_avec_les_etats(self):
         page = self._page()
-        for modele in ("haiku", "sonnet", "opus"):
+        for modele in ("haiku", "sonnet", "opus", "fable"):
             self.assertIn(f'<span class="sw rond" style="background:var(--m-{modele})">'
                           f'</span>{modele}</span>', page)
 
@@ -3311,11 +3319,11 @@ class TestTeintesDeModeleNeCollisionnentPasAvecLEtat(CarteTestCase):
         return dict(re.findall(motif, carte._CSS))
 
     def _modeles(self) -> dict[str, str]:
-        motif = r"--m-(haiku|sonnet|opus):(#[0-9a-fA-F]{6})"
+        motif = r"--m-(haiku|sonnet|opus|fable):(#[0-9a-fA-F]{6})"
         return dict(re.findall(motif, carte._CSS))
 
-    def test_les_trois_teintes_de_modele_sont_definies(self):
-        self.assertEqual(set(self._modeles()), {"haiku", "sonnet", "opus"})
+    def test_les_quatre_teintes_de_modele_sont_definies(self):
+        self.assertEqual(set(self._modeles()), {"haiku", "sonnet", "opus", "fable"})
 
     def test_aucune_teinte_de_modele_ne_collisionne_avec_une_couleur_detat(self):
         etats = self._etats()

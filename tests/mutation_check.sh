@@ -490,6 +490,24 @@ run_case "CARTE5" "renommer une phase n'efface pas son explication" \
     "$LIB_DIR/chantier.py" "$S" "$R"
 
 # ---------------------------------------------------------------------------
+# CARTE6 -- la liste des modeles connus du rendu est dupliquee en deux tables
+# JavaScript jumelles, rowNode() et detailNode(). Mutation : "fable" retire de
+# la table de rowNode. Un modele retire de l'une des deux sans toucher l'autre
+# ferait disparaitre sa pastille sur la case compacte sans que rien ne le
+# signale, puisque la case depliee garderait la sienne.
+# ---------------------------------------------------------------------------
+S="$WORKDIR/sc6"; R="$WORKDIR/rc6"
+cat >"$S" <<'ORDO_EOF'
+  var mconnu={haiku:1,sonnet:1,opus:1,fable:1}[t.model]?" "+t.model:"";
+ORDO_EOF
+cat >"$R" <<'ORDO_EOF'
+  var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
+ORDO_EOF
+run_case "CARTE6" "un modele retire de la table de rowNode perd sa pastille" \
+    "tests.test_carte.TestPastilleDeModeleSurLaCase.test_aucune_classe_de_teinte_pour_un_modele_herite_ou_absent" \
+    "$LIB_DIR/carte.py" "$S" "$R"
+
+# ---------------------------------------------------------------------------
 # SERV1 -- un port ouvert ne suffit pas a conclure qu'Ordo tourne. Mutation : la
 # reponse n'est plus lue, seule la connexion compte. Un port pris par un autre
 # programme ferait alors renoncer a demarrer le serveur, et la page ne s'ouvrirait

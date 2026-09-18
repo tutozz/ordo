@@ -989,7 +989,7 @@ _CSS = """
 --queued:#4a5361;--blocked:#e05252;--cancelled:#333941;--up:#5fa96f;--down:#5aa2f0;
 --accent:#8cc0f7;--lien:#2f6ba8;--relu:#3f5d80;--badge:#171b21;
 --m-haiku:#addb76;--m-haiku-bd:#4a6529;--m-sonnet:#76dbcd;--m-sonnet-bd:#29655d;
---m-opus:#db76cc;--m-opus-bd:#65295c}
+--m-opus:#db76cc;--m-opus-bd:#65295c;--m-fable:#e9acc6;--m-fable-bd:#652943}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;
 font:12.5px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -1167,6 +1167,7 @@ vertical-align:middle;margin-right:4px;background:var(--dim3)}
 .mdot.haiku{background:var(--m-haiku)}
 .mdot.sonnet{background:var(--m-sonnet)}
 .mdot.opus{background:var(--m-opus)}
+.mdot.fable{background:var(--m-fable)}
 /* Trait plein quand le modèle a réellement tourné, pointillé quand ce n'est encore
    qu'une prévision du routage : la différence entre un fait et un pronostic doit se voir
    sans lire le mot (même geste que l'ancien badge, avant qu'il ne se scinde en identifiant
@@ -1447,6 +1448,7 @@ _LEGENDE = """<div id="legend">
   <span class="item"><span class="sw rond" style="background:var(--m-haiku)"></span>haiku</span>
   <span class="item"><span class="sw rond" style="background:var(--m-sonnet)"></span>sonnet</span>
   <span class="item"><span class="sw rond" style="background:var(--m-opus)"></span>opus</span>
+  <span class="item"><span class="sw rond" style="background:var(--m-fable)"></span>fable</span>
   <span style="margin-left:auto" id="foot"></span>
 </div>"""
 
@@ -1636,7 +1638,7 @@ function rowNode(t){
   // grise par défaut -- le point de prudence du brief. L'infobulle qui donnait le modèle
   // en clair suit la teinte : sur la pastille quand elle existe, retombe sur
   // l'identifiant sinon, pour ne jamais perdre l'information d'un modèle non reconnu.
-  var mconnu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
+  var mconnu={haiku:1,sonnet:1,opus:1,fable:1}[t.model]?" "+t.model:"";
   var rid=el("span","rid",t.id);
   if(t.model){
     var titreModele=t.model+" — "+(t.modelPredit?"prévu : ":"")+(t.modelWhy||"");
@@ -1914,7 +1916,7 @@ function detailNode(t){
       // de sa pastille (retouche de l'humain). Même garde-fou de classe qu'au .rid : la
       // table est la seule source de la teinte, jamais un nom de classe pris tel quel
       // depuis un --model tapé à la main.
-      var connu={haiku:1,sonnet:1,opus:1}[t.model]?" "+t.model:"";
+      var connu={haiku:1,sonnet:1,opus:1,fable:1}[t.model]?" "+t.model:"";
       var md=el("span","mdl m"+(t.modelPredit?" predit":""));
       md.appendChild(el("span","mdot"+connu));
       md.appendChild(document.createTextNode(t.model));
@@ -3678,6 +3680,7 @@ def page(poll: int = POLL_S) -> str:
     <span class="item"><span class="sw rond" style="background:var(--m-haiku)"></span>haiku</span>
     <span class="item"><span class="sw rond" style="background:var(--m-sonnet)"></span>sonnet</span>
     <span class="item"><span class="sw rond" style="background:var(--m-opus)"></span>opus</span>
+    <span class="item"><span class="sw rond" style="background:var(--m-fable)"></span>fable</span>
   </span>
   <button class="icon-btn" id="plus" title="ajouter une colonne" aria-label="ajouter une colonne">
     <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>

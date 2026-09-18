@@ -7,6 +7,11 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- The model pastille (`.mdot`) now knows **`fable`**: haiku, sonnet and opus already had a
+  hue, fable rendered none. Its tint (`#e9acc6`) sits in the only hue window still clear of
+  every state and model color, 25.5° from its nearest neighbour (opus) — and now also 13
+  points of lightness apart from opus, since hue alone collapses for red-green deficient
+  vision.
 - Ordo now **compacts an executor's context** once its session passes 75 turns
   (`ORDO_COMPACT_EVERY`, 0 disables). The number comes from a measurement, not a hunch:
   across sixty real transcripts of two live campaigns, every token entering a session is
